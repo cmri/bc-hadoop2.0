@@ -1,0 +1,195 @@
+From 684dfe2418bf0eb385dea031a57eb428f789bcb8 Mon Sep 17 00:00:00 2001
+From: Patrick D. Hunt <phunt@apache.org>
+Date: Fri, 25 Jan 2013 01:34:19 +0000
+Subject: [PATCH 13/19] ZOOKEEPER-1495. ZK client hangs when using a function not available on the server. (Skye W-M via phunt)
+
+git-svn-id: https://svn.apache.org/repos/asf/zookeeper/branches/branch-3.4@1438291 13f79535-47bb-0310-9956-ffa450edef68
+---
+ .../server/UnimplementedRequestProcessor.java      |   48 ++++++++++++++++++++
+ .../apache/zookeeper/server/ZooKeeperServer.java   |    4 +-
+ .../org/apache/zookeeper/TestableZooKeeper.java    |    9 ++++
+ .../test/org/apache/zookeeper/test/ClientTest.java |   46 ++++++++++++++++---
+ 4 files changed, 99 insertions(+), 8 deletions(-)
+ create mode 100644 src/java/main/org/apache/zookeeper/server/UnimplementedRequestProcessor.java
+
+diff --git a/src/java/main/org/apache/zookeeper/server/UnimplementedRequestProcessor.java b/src/java/main/org/apache/zookeeper/server/UnimplementedRequestProcessor.java
+new file mode 100644
+index 0000000..aa58e63
+--- /dev/null
++++ b/src/java/main/org/apache/zookeeper/server/UnimplementedRequestProcessor.java
+@@ -0,0 +1,48 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.zookeeper.server;
++
++import java.io.IOException;
++
++import org.apache.zookeeper.KeeperException;
++import org.apache.zookeeper.proto.ReplyHeader;
++
++/**
++ * Manages the unknown requests (i.e. unknown OpCode), by:
++ * - sending back the KeeperException.UnimplementedException() error code to the client
++ * - closing the connection.
++ */
++public class UnimplementedRequestProcessor implements RequestProcessor {
++
++    public void processRequest(Request request) throws RequestProcessorException {
++        KeeperException ke = new KeeperException.UnimplementedException();
++        request.setException(ke);
++        ReplyHeader rh = new ReplyHeader(request.cxid, request.zxid, ke.code().intValue());
++        try {
++            request.cnxn.sendResponse(rh, null, "response");
++        } catch (IOException e) {
++            throw new RequestProcessorException("Can't send the response", e);
++        }
++
++        request.cnxn.sendCloseSession();
++    }
++
++    public void shutdown() {
++    }
++}
+diff --git a/src/java/main/org/apache/zookeeper/server/ZooKeeperServer.java b/src/java/main/org/apache/zookeeper/server/ZooKeeperServer.java
+index 98ed7dc..a5ebb71 100644
+--- a/src/java/main/org/apache/zookeeper/server/ZooKeeperServer.java
++++ b/src/java/main/org/apache/zookeeper/server/ZooKeeperServer.java
+@@ -650,8 +650,8 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
+                     incInProcess();
+                 }
+             } else {
+-                LOG.warn("Dropping packet at server of type " + si.type);
+-                // if invalid packet drop the packet.
++                LOG.warn("Received packet at server of unknown type " + si.type);
++                new UnimplementedRequestProcessor().processRequest(si);
+             }
+         } catch (MissingSessionException e) {
+             if (LOG.isDebugEnabled()) {
+diff --git a/src/java/test/org/apache/zookeeper/TestableZooKeeper.java b/src/java/test/org/apache/zookeeper/TestableZooKeeper.java
+index 092eb4b..dd6e246 100644
+--- a/src/java/test/org/apache/zookeeper/TestableZooKeeper.java
++++ b/src/java/test/org/apache/zookeeper/TestableZooKeeper.java
+@@ -22,6 +22,10 @@ import java.io.IOException;
+ import java.net.SocketAddress;
+ import java.util.List;
+ 
++import org.apache.jute.Record;
++import org.apache.zookeeper.proto.ReplyHeader;
++import org.apache.zookeeper.proto.RequestHeader;
++
+ public class TestableZooKeeper extends ZooKeeper {
+ 
+     public TestableZooKeeper(String host, int sessionTimeout,
+@@ -99,4 +103,9 @@ public class TestableZooKeeper extends ZooKeeper {
+     public long testableLastZxid() {
+         return cnxn.getLastZxid();
+     }
++
++    public ReplyHeader submitRequest(RequestHeader h, Record request,
++            Record response, WatchRegistration watchRegistration) throws InterruptedException {
++        return cnxn.submitRequest(h, request, response, watchRegistration);
++    }
+ }
+diff --git a/src/java/test/org/apache/zookeeper/test/ClientTest.java b/src/java/test/org/apache/zookeeper/test/ClientTest.java
+index 84d4843..d2424e1 100644
+--- a/src/java/test/org/apache/zookeeper/test/ClientTest.java
++++ b/src/java/test/org/apache/zookeeper/test/ClientTest.java
+@@ -18,6 +18,8 @@
+ 
+ package org.apache.zookeeper.test;
+ 
++import static org.junit.Assert.fail;
++
+ import java.io.IOException;
+ import java.lang.management.ManagementFactory;
+ import java.lang.management.OperatingSystemMXBean;
+@@ -26,27 +28,30 @@ import java.util.Collections;
+ import java.util.List;
+ import java.util.concurrent.LinkedBlockingQueue;
+ import java.util.concurrent.TimeUnit;
+-import java.util.logging.Level;
+ 
+-import org.slf4j.Logger;
+-import org.slf4j.LoggerFactory;
+ import org.apache.zookeeper.CreateMode;
+ import org.apache.zookeeper.KeeperException;
+-import org.apache.zookeeper.TestableZooKeeper;
+-import org.apache.zookeeper.WatchedEvent;
+-import org.apache.zookeeper.ZooKeeper;
+ import org.apache.zookeeper.KeeperException.Code;
+ import org.apache.zookeeper.KeeperException.InvalidACLException;
++import org.apache.zookeeper.TestableZooKeeper;
++import org.apache.zookeeper.WatchedEvent;
+ import org.apache.zookeeper.Watcher.Event.EventType;
+ import org.apache.zookeeper.Watcher.Event.KeeperState;
+ import org.apache.zookeeper.ZooDefs.Ids;
+ import org.apache.zookeeper.ZooDefs.Perms;
++import org.apache.zookeeper.ZooKeeper;
+ import org.apache.zookeeper.data.ACL;
+ import org.apache.zookeeper.data.Id;
+ import org.apache.zookeeper.data.Stat;
++import org.apache.zookeeper.proto.ExistsRequest;
++import org.apache.zookeeper.proto.ExistsResponse;
++import org.apache.zookeeper.proto.ReplyHeader;
++import org.apache.zookeeper.proto.RequestHeader;
+ import org.apache.zookeeper.server.PrepRequestProcessor;
+ import org.junit.Assert;
+ import org.junit.Test;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
+ 
+ import com.sun.management.UnixOperatingSystemMXBean;
+ 
+@@ -754,4 +759,33 @@ public class ClientTest extends ClientBase {
+         	LOG.info(logmsg,Long.valueOf(currentCount),Long.valueOf(initialFdCount));
+         }
+     }
++
++
++    /**
++     * We create a perfectly valid 'exists' request, except that the opcode is wrong.
++     * @return
++     * @throws Exception
++     */
++    @Test
++    public void testNonExistingOpCode() throws Exception  {
++        TestableZooKeeper zk = createClient();
++
++        final String path = "/m1";
++
++        RequestHeader h = new RequestHeader();
++        h.setType(888);  // This code does not exists
++        ExistsRequest request = new ExistsRequest();
++        request.setPath(path);
++        request.setWatch(false);
++        ExistsResponse response = new ExistsResponse();
++        ReplyHeader r = zk.submitRequest(h, request, response, null);
++
++        Assert.assertEquals(r.getErr(), Code.UNIMPLEMENTED.intValue());
++
++        try {
++            zk.exists("/m1", false);
++            fail("The connection should have been closed");
++        } catch (KeeperException.ConnectionLossException expected) {
++        }
++    }
+ }
+-- 
+1.7.0.4
+

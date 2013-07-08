@@ -1,0 +1,859 @@
+From 8b5893da0cc69c07ba31ab9ee9dd1c094390954c Mon Sep 17 00:00:00 2001
+From: Henry Robinson <henry@apache.org>
+Date: Tue, 6 Mar 2012 08:20:49 +0000
+Subject: [PATCH 04/19] ZOOKEEPER-1161. Provide an option for disabling auto-creation of the data directory
+
+Reason: New Feature
+Author: Patrick Hunt
+Ref: CDH-4394
+---
+ bin/zkServer-initialize.sh                         |  146 +++++++++++++
+ bin/zkServer.sh                                    |   31 +++-
+ .../documentation/content/xdocs/zookeeperAdmin.xml |   58 +++++
+ .../zookeeper/server/ZooKeeperServerMain.java      |    9 +-
+ .../server/persistence/FileTxnSnapLog.java         |   52 ++++-
+ .../zookeeper/server/quorum/QuorumPeerMain.java    |    5 +
+ src/java/test/bin/test-scripts.sh                  |  223 ++++++++++++++++++++
+ .../org/apache/zookeeper/test/LoadFromLogTest.java |   72 +++++--
+ 8 files changed, 567 insertions(+), 29 deletions(-)
+ create mode 100755 bin/zkServer-initialize.sh
+ create mode 100755 src/java/test/bin/test-scripts.sh
+
+diff --git a/bin/zkServer-initialize.sh b/bin/zkServer-initialize.sh
+new file mode 100755
+index 0000000..bce244e
+--- /dev/null
++++ b/bin/zkServer-initialize.sh
+@@ -0,0 +1,146 @@
++#!/usr/bin/env bash
++
++# Licensed to the Apache Software Foundation (ASF) under one or more
++# contributor license agreements.  See the NOTICE file distributed with
++# this work for additional information regarding copyright ownership.
++# The ASF licenses this file to You under the Apache License, Version 2.0
++# (the "License"); you may not use this file except in compliance with
++# the License.  You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++#
++# If this scripted is run out of /usr/bin or some other system bin directory
++# it should be linked to and not copied. Things like java jar files are found
++# relative to the canonical path of this script.
++#
++
++# use POSIX interface, symlink is followed automatically
++ZOOBIN="${BASH_SOURCE-$0}"
++ZOOBIN=`dirname ${ZOOBIN}`
++ZOOBINDIR=`cd ${ZOOBIN}; pwd`
++
++if [ -e "$ZOOBIN/../libexec/zkEnv.sh" ]; then
++  . "$ZOOBINDIR"/../libexec/zkEnv.sh
++else
++  . "$ZOOBINDIR"/zkEnv.sh
++fi
++
++usage() {
++  # the configfile will be properly formatted as long as the
++  # configfile path is less then 40 chars, otw the line will look a
++  # bit weird, but otherwise it's fine
++  printf "usage: $0 <parameters>
++  Optional parameters:
++     -h                                                    Display this message
++     --help                                                Display this message
++     --configfile=%-40s ZooKeeper config file
++     --myid=#                                              Set the myid to be used, if any (1-255)
++     --force                                               Force creation of the data/txnlog dirs
++" "$ZOOCFG"
++  exit 1
++}
++
++OPTS=$(getopt \
++  -n $0 \
++  -o 'h' \
++  -l 'help' \
++  -l 'configfile:' \
++  -l 'myid:' \
++  -l 'force' \
++  -- "$@")
++
++if [ $? != 0 ] ; then
++    usage
++    exit 1
++fi
++
++initialize() {
++    if [ ! -e "$ZOOCFG" ]; then
++        echo "Unable to find config file at $ZOOCFG"
++        exit 1
++    fi
++
++    ZOO_DATADIR=$(grep "^[[:space:]]*dataDir" "$ZOOCFG" | sed -e 's/.*=//')
++    ZOO_DATALOGDIR=$(grep "^[[:space:]]*dataLogDir" "$ZOOCFG" | sed -e 's/.*=//')
++
++    if [ -z "$ZOO_DATADIR" ]; then
++        echo "Unable to determine dataDir from $ZOOCFG"
++        exit 1
++    fi
++
++    if [ $FORCE ]; then
++        echo "Force enabled, data/txnlog directories will be re-initialized"
++    else
++        # we create if version-2 exists (ie real data), not the
++        # parent. See comments in following section for more insight
++        if [ -d "$ZOO_DATADIR/version-2" ]; then
++            echo "ZooKeeper data directory already exists at $ZOO_DATADIR (or use --force to force re-initialization)"
++            exit 1
++        fi
++
++        if [ -n "$ZOO_DATALOGDIR" ] && [ -d "$ZOO_DATALOGDIR/version-2" ]; then
++            echo "ZooKeeper txnlog directory already exists at $ZOO_DATALOGDIR (or use --force to force re-initialization)"
++            exit 1
++        fi
++    fi
++
++    # remove the child files that we're (not) interested in, not the
++    # parent. this allows for parent to be installed separately, and
++    # permissions to be set based on overarching requirements. by
++    # default we'll use the permissions of the user running this
++    # script for the files contained by the parent. note also by using
++    # -p the parent(s) will be created if it doesn't already exist
++    rm -rf "$ZOO_DATADIR/myid" 2>/dev/null >/dev/null
++    rm -rf "$ZOO_DATADIR/version-2" 2>/dev/null >/dev/null
++    mkdir -p "$ZOO_DATADIR/version-2"
++
++    if [ -n "$ZOO_DATALOGDIR" ]; then
++        rm -rf "$ZOO_DATALOGDIR/myid" 2>/dev/null >/dev/null
++        rm -rf "$ZOO_DATALOGDIR/version-2" 2>/dev/null >/dev/null
++        mkdir -p "$ZOO_DATALOGDIR/version-2"
++    fi
++
++    if [ $MYID ]; then
++        echo "Using myid of $MYID"
++        echo $MYID > "$ZOO_DATADIR/myid"
++    else
++        echo "No myid provided, be sure to specify it in $ZOO_DATADIR/myid if using non-standalone"
++    fi
++}
++
++eval set -- "${OPTS}"
++while true; do
++  case "$1" in
++    --configfile)
++      ZOOCFG=$2; shift 2
++      ;;
++    --myid)
++      MYID=$2; shift 2
++      ;;
++    --force)
++      FORCE=1; shift 1
++      ;;
++    -h)
++      usage
++      ;; 
++    --help)
++      usage
++      ;; 
++    --)
++      initialize
++      break
++      ;;
++    *)
++      echo "Unknown option: $1"
++      usage
++      exit 1 
++      ;;
++  esac
++done 
+diff --git a/bin/zkServer.sh b/bin/zkServer.sh
+index aa6cbaa..083bd48 100755
+--- a/bin/zkServer.sh
++++ b/bin/zkServer.sh
+@@ -53,7 +53,7 @@ else
+   . "$ZOOBINDIR"/zkEnv.sh
+ fi
+ 
+-if [ "x$SERVER_JVMFLAGS"  != "x" ]
++if [ "x$SERVER_JVMFLAGS" != "x" ]
+ then
+     JVMFLAGS="$SERVER_JVMFLAGS $JVMFLAGS"
+ fi
+@@ -80,8 +80,25 @@ fi
+ 
+ echo "Using config: $ZOOCFG" >&2
+ 
+-if [ -z $ZOOPIDFILE ]; then
+-    ZOO_DATADIR=$(grep "^[[:space:]]*dataDir" "$ZOOCFG" | sed -e 's/.*=//')
++ZOO_DATADIR=$(grep "^[[:space:]]*dataDir" "$ZOOCFG" | sed -e 's/.*=//')
++ZOO_DATALOGDIR=$(grep "^[[:space:]]*dataLogDir" "$ZOOCFG" | sed -e 's/.*=//')
++
++# iff autocreate is turned off and the datadirs don't exist fail
++# immediately as we can't create the PID file, etc..., anyway.
++if [ -n "$ZOO_DATADIR_AUTOCREATE_DISABLE" ]; then
++    if [ ! -d "$ZOO_DATADIR/version-2" ]; then
++        echo "ZooKeeper data directory is missing at $ZOO_DATADIR fix the path or run initialize"
++        exit 1
++    fi
++
++    if [ -n "$ZOO_DATALOGDIR" ] && [ ! -d "$ZOO_DATALOGDIR/version-2" ]; then
++        echo "ZooKeeper txnlog directory is missing at $ZOO_DATALOGDIR fix the path or run initialize"
++        exit 1
++    fi
++    ZOO_DATADIR_AUTOCREATE="-Dzookeeper.datadir.autocreate=false"
++fi
++
++if [ -z "$ZOOPIDFILE" ]; then
+     if [ ! -d "$ZOO_DATADIR" ]; then
+         mkdir -p "$ZOO_DATADIR"
+     fi
+@@ -106,7 +123,8 @@ start)
+          exit 0
+       fi
+     fi
+-    nohup $JAVA "-Dzookeeper.log.dir=${ZOO_LOG_DIR}" "-Dzookeeper.root.logger=${ZOO_LOG4J_PROP}" \
++    nohup $JAVA $ZOO_DATADIR_AUTOCREATE "-Dzookeeper.log.dir=${ZOO_LOG_DIR}" \
++    "-Dzookeeper.root.logger=${ZOO_LOG4J_PROP}" \
+     -cp "$CLASSPATH" $JVMFLAGS $ZOOMAIN "$ZOOCFG" > "$_ZOO_DAEMON_OUT" 2>&1 < /dev/null &
+     if [ $? -eq 0 ]
+     then
+@@ -128,11 +146,12 @@ start-foreground)
+     if [ "${ZOO_NOEXEC}" != "" ]; then
+       ZOO_CMD="$JAVA"
+     fi
+-    $ZOO_CMD "-Dzookeeper.log.dir=${ZOO_LOG_DIR}" "-Dzookeeper.root.logger=${ZOO_LOG4J_PROP}" \
++    $ZOO_CMD $ZOO_DATADIR_AUTOCREATE "-Dzookeeper.log.dir=${ZOO_LOG_DIR}" \
++    "-Dzookeeper.root.logger=${ZOO_LOG4J_PROP}" \
+     -cp "$CLASSPATH" $JVMFLAGS $ZOOMAIN "$ZOOCFG"
+     ;;
+ print-cmd)
+-    echo "$JAVA -Dzookeeper.log.dir=\"${ZOO_LOG_DIR}\" -Dzookeeper.root.logger=\"${ZOO_LOG4J_PROP}\" -cp \"$CLASSPATH\" $JVMFLAGS $ZOOMAIN \"$ZOOCFG\" > \"$_ZOO_DAEMON_OUT\" 2>&1 < /dev/null"
++    echo "$JAVA $ZOO_DATADIR_AUTOCREATE -Dzookeeper.log.dir=\"${ZOO_LOG_DIR}\" -Dzookeeper.root.logger=\"${ZOO_LOG4J_PROP}\" -cp \"$CLASSPATH\" $JVMFLAGS $ZOOMAIN \"$ZOOCFG\" > \"$_ZOO_DAEMON_OUT\" 2>&1 < /dev/null"
+     ;;
+ stop)
+     echo -n "Stopping zookeeper ... "
+diff --git a/src/docs/src/documentation/content/xdocs/zookeeperAdmin.xml b/src/docs/src/documentation/content/xdocs/zookeeperAdmin.xml
+index 48c1f08..47190a8 100644
+--- a/src/docs/src/documentation/content/xdocs/zookeeperAdmin.xml
++++ b/src/docs/src/documentation/content/xdocs/zookeeperAdmin.xml
+@@ -1113,6 +1113,64 @@ server.3=zoo3:2888:3888</programlisting>
+       </section>
+ 
+       <section>
++        <title>Disabling data directory autocreation</title>
++
++        <para><emphasis role="bold">New in 3.5:</emphasis> The default
++        behavior of a ZooKeeper server is to automatically create the
++        data directory (specified in the configuration file) when
++        started if that directory does not already exist. This can be
++        inconvenient and even dangerous in some cases. Take the case
++        where a configuration change is made to a running server,
++        wherein the <emphasis role="bold">dataDir</emphasis> parameter
++        is accidentally changed. When the ZooKeeper server is
++        restarted it will create this non-existent directory and begin
++        serving - with an empty znode namespace. This scenario can
++        result in an effective "split brain" situation (i.e. data in
++        both the new invalid directory and the original valid data
++        store). As such is would be good to have an option to turn off
++        this autocreate behavior. In general for production
++        environments this should be done, unfortunately however the
++        default legacy behavior cannot be changed at this point and
++        therefore this must be done on a case by case basis. This is
++        left to users and to packagers of ZooKeeper distributions.
++        </para>
++
++        <para>When running <emphasis
++        role="bold">zkServer.sh</emphasis> autocreate can be disabled
++        by setting the environment variable <emphasis
++        role="bold">ZOO_DATADIR_AUTOCREATE_DISABLE</emphasis> to 1.
++        When running ZooKeeper servers directly from class files this
++        can be accomplished by setting <emphasis
++        role="bold">zookeeper.datadir.autocreate=false</emphasis> on
++        the java command line, i.e. <emphasis
++        role="bold">-Dzookeeper.datadir.autocreate=false</emphasis>
++        </para>
++
++        <para>When this feature is disabled, and the ZooKeeper server
++        determines that the required directories do not exist it will
++        generate an error and refuse to start.
++        </para>
++
++        <para>A new script <emphasis
++        role="bold">zkServer-initialize.sh</emphasis> is provided to
++        support this new feature. If autocreate is disabled it is
++        necessary for the user to first install ZooKeeper, then create
++        the data directory (and potentially txnlog directory), and
++        then start the server. Otherwise as mentioned in the previous
++        paragraph the server will not start. Running <emphasis
++        role="bold">zkServer-initialize.sh</emphasis> will create the
++        required directories, and optionally setup the myid file
++        (optional command line parameter). This script can be used
++        even if the autocreate feature itself is not used, and will
++        likely be of use to users as this (setup, including creation
++        of the myid file) has been an issue for users in the past.
++        Note that this script ensures the data directories exist only,
++        it does not create a config file, but rather requires a config
++        file to be available in order to execute.
++        </para>
++      </section>
++
++      <section>
+         <title>Communication using the Netty framework</title>
+ 
+         <para><emphasis role="bold">New in
+diff --git a/src/java/main/org/apache/zookeeper/server/ZooKeeperServerMain.java b/src/java/main/org/apache/zookeeper/server/ZooKeeperServerMain.java
+index 52d3820..48bc2c5 100644
+--- a/src/java/main/org/apache/zookeeper/server/ZooKeeperServerMain.java
++++ b/src/java/main/org/apache/zookeeper/server/ZooKeeperServerMain.java
+@@ -23,11 +23,12 @@ import java.io.IOException;
+ 
+ import javax.management.JMException;
+ 
+-import org.slf4j.Logger;
+-import org.slf4j.LoggerFactory;
+ import org.apache.zookeeper.jmx.ManagedUtil;
+ import org.apache.zookeeper.server.persistence.FileTxnSnapLog;
++import org.apache.zookeeper.server.persistence.FileTxnSnapLog.DatadirException;
+ import org.apache.zookeeper.server.quorum.QuorumPeerConfig.ConfigException;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
+ 
+ /**
+  * This class starts and runs a standalone ZooKeeperServer.
+@@ -59,6 +60,10 @@ public class ZooKeeperServerMain {
+             LOG.error("Invalid config, exiting abnormally", e);
+             System.err.println("Invalid config, exiting abnormally");
+             System.exit(2);
++        } catch (DatadirException e) {
++            LOG.error("Unable to access datadir, exiting abnormally", e);
++            System.err.println("Unable to access datadir, exiting abnormally");
++            System.exit(3);
+         } catch (Exception e) {
+             LOG.error("Unexpected exception, exiting abnormally", e);
+             System.exit(1);
+diff --git a/src/java/main/org/apache/zookeeper/server/persistence/FileTxnSnapLog.java b/src/java/main/org/apache/zookeeper/server/persistence/FileTxnSnapLog.java
+index 50486c9..e80d776 100644
+--- a/src/java/main/org/apache/zookeeper/server/persistence/FileTxnSnapLog.java
++++ b/src/java/main/org/apache/zookeeper/server/persistence/FileTxnSnapLog.java
+@@ -57,7 +57,12 @@ public class FileTxnSnapLog {
+     public final static String version = "version-";
+     
+     private static final Logger LOG = LoggerFactory.getLogger(FileTxnSnapLog.class);
+-    
++
++    public static final String ZOOKEEPER_DATADIR_AUTOCREATE =
++            "zookeeper.datadir.autocreate";
++
++    public static final String ZOOKEEPER_DATADIR_AUTOCREATE_DEFAULT = "true";
++
+     /**
+      * This listener helps
+      * the external apis calling
+@@ -80,15 +85,40 @@ public class FileTxnSnapLog {
+ 
+         this.dataDir = new File(dataDir, version + VERSION);
+         this.snapDir = new File(snapDir, version + VERSION);
++
++        // by default create snap/log dirs, but otherwise complain instead
++        // See ZOOKEEPER-1161 for more details
++        boolean enableAutocreate = Boolean.valueOf(
++                System.getProperty(ZOOKEEPER_DATADIR_AUTOCREATE,
++                        ZOOKEEPER_DATADIR_AUTOCREATE_DEFAULT));
++
+         if (!this.dataDir.exists()) {
++            if (!enableAutocreate) {
++                throw new DatadirException("Missing data directory "
++                        + this.dataDir
++                        + ", automatic data directory creation is disabled ("
++                        + ZOOKEEPER_DATADIR_AUTOCREATE
++                        + " is false). Please create this directory manually.");
++            }
++
+             if (!this.dataDir.mkdirs()) {
+-                throw new IOException("Unable to create data directory "
++                throw new DatadirException("Unable to create data directory "
+                         + this.dataDir);
+             }
+         }
+         if (!this.snapDir.exists()) {
++            // by default create this directory, but otherwise complain instead
++            // See ZOOKEEPER-1161 for more details
++            if (!enableAutocreate) {
++                throw new DatadirException("Missing snap directory "
++                        + this.snapDir
++                        + ", automatic data directory creation is disabled ("
++                        + ZOOKEEPER_DATADIR_AUTOCREATE
++                        + " is false). Please create this directory manually.");
++            }
++
+             if (!this.snapDir.mkdirs()) {
+-                throw new IOException("Unable to create snap directory "
++                throw new DatadirException("Unable to create snap directory "
+                         + this.snapDir);
+             }
+         }
+@@ -199,11 +229,11 @@ public class FileTxnSnapLog {
+         }
+ 
+         /**
+-         * This should never happen. A NONODE can never show up in the 
++         * This should never happen. A NONODE can never show up in the
+          * transaction logs. This is more indicative of a corrupt transaction
+          * log. Refer ZOOKEEPER-1333 for more info.
+          */
+-        if (rc.err != Code.OK.intValue()) {          
++        if (rc.err != Code.OK.intValue()) {
+             if (hdr.getType() == OpCode.create && rc.err == Code.NONODE.intValue()) {
+                 int lastSlash = rc.path.lastIndexOf('/');
+                 String parentName = rc.path.substring(0, lastSlash);
+@@ -240,7 +270,7 @@ public class FileTxnSnapLog {
+         LOG.info("Snapshotting: 0x{} to {}", Long.toHexString(lastZxid),
+                 snapshotFile);
+         snapLog.serialize(dataTree, sessionsWithTimeouts, snapshotFile);
+-        
++
+     }
+ 
+     /**
+@@ -338,4 +368,14 @@ public class FileTxnSnapLog {
+         txnLog.close();
+         snapLog.close();
+     }
++
++    @SuppressWarnings("serial")
++    public static class DatadirException extends IOException {
++        public DatadirException(String msg) {
++            super(msg);
++        }
++        public DatadirException(String msg, Exception e) {
++            super(msg, e);
++        }
++    }
+ }
+diff --git a/src/java/main/org/apache/zookeeper/server/quorum/QuorumPeerMain.java b/src/java/main/org/apache/zookeeper/server/quorum/QuorumPeerMain.java
+index 4ffb24b..029fa96 100644
+--- a/src/java/main/org/apache/zookeeper/server/quorum/QuorumPeerMain.java
++++ b/src/java/main/org/apache/zookeeper/server/quorum/QuorumPeerMain.java
+@@ -30,6 +30,7 @@ import org.apache.zookeeper.server.ZKDatabase;
+ import org.apache.zookeeper.server.DatadirCleanupManager;
+ import org.apache.zookeeper.server.ZooKeeperServerMain;
+ import org.apache.zookeeper.server.persistence.FileTxnSnapLog;
++import org.apache.zookeeper.server.persistence.FileTxnSnapLog.DatadirException;
+ import org.apache.zookeeper.server.quorum.QuorumPeerConfig.ConfigException;
+ 
+ /**
+@@ -85,6 +86,10 @@ public class QuorumPeerMain {
+             LOG.error("Invalid config, exiting abnormally", e);
+             System.err.println("Invalid config, exiting abnormally");
+             System.exit(2);
++        } catch (DatadirException e) {
++            LOG.error("Unable to access datadir, exiting abnormally", e);
++            System.err.println("Unable to access datadir, exiting abnormally");
++            System.exit(3);
+         } catch (Exception e) {
+             LOG.error("Unexpected exception, exiting abnormally", e);
+             System.exit(1);
+diff --git a/src/java/test/bin/test-scripts.sh b/src/java/test/bin/test-scripts.sh
+new file mode 100755
+index 0000000..ad175ba
+--- /dev/null
++++ b/src/java/test/bin/test-scripts.sh
+@@ -0,0 +1,223 @@
++#!/usr/bin/env bash
++
++# Licensed to the Apache Software Foundation (ASF) under one or more
++# contributor license agreements.  See the NOTICE file distributed with
++# this work for additional information regarding copyright ownership.
++# The ASF licenses this file to You under the Apache License, Version 2.0
++# (the "License"); you may not use this file except in compliance with
++# the License.  You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++ZKS=bin/zkServer.sh
++ZKSI=bin/zkServer-initialize.sh
++
++if [ ! -d "conf" ]; then
++    echo "run this from the toplevel directory"
++    exit 1
++fi
++
++if [ ! `ls build/zookeeper*.jar` ]; then
++    echo "first compile the zk jar file"
++    exit 1
++fi
++
++DATADIR=test-scripts_datadir
++DATALOGDIR=test-scripts_datalogdir
++
++case "`uname`" in
++    CYGWIN*) cygwin=true ;;
++    *) cygwin=false ;;
++esac
++
++if $cygwin
++then
++    ZOOCFG=`cygpath -wp "$ZOOCFG"`
++    # cygwin has a "kill" in the shell itself, gets confused
++    KILL=/bin/kill
++else
++    KILL=kill
++fi
++
++fail() {
++    # don't run clear_tmp to allow debugging
++    echo "FAIL $1"
++    $KILL -9 $(cat "$ZOOPIDFILE")
++    $KILL -9 $$
++}
++
++#generate a minimal config
++genconfig1() {
++    cat > test-scripts.cfg <<EOF
++tickTime=2000
++initLimit=10
++syncLimit=5
++dataDir=$DATADIR
++clientPort=19181
++EOF
++}
++
++genconfig2() {
++    genconfig1
++    cat >> test-scripts.cfg <<EOF
++dataLogDir=$DATALOGDIR
++EOF
++}
++
++export ZOOCFGDIR=`pwd`
++export ZOOCFG="test-scripts.cfg"
++export CLASSPATH=$ZOOCFGDIR/conf
++
++#clear out the clutter generated by scripts
++clear_tmp() {
++    rm -f test-scripts.cfg
++    rm -fr $DATADIR
++    rm -fr $DATALOGDIR
++    rm -f zookeeper.out
++}
++
++start() {
++    $CONFIG
++    #ensure not already running
++    $ZKS status && (echo "already running"; fail $LINENO)
++    export ZOOPIDFILE="$DATADIR/zookeeper_server.pid"
++
++    $ZKS start
++}
++
++stop() {
++    $ZKS stop
++}
++
++CONFIG=genconfig1
++
++clear_tmp
++start
++ls $DATADIR || fail $LINENO
++ls $DATALOGDIR && fail $LINENO
++stop
++
++CONFIG=genconfig2
++
++clear_tmp
++start
++ls $DATADIR || fail $LINENO
++
++# zk actually checks for this to exist, but doesn't create
++ls $DATALOGDIR && fail $LINENO
++
++clear_tmp
++mkdir -p "$DATALOGDIR"
++start
++ls $DATADIR || fail $LINENO
++ls $DATALOGDIR || fail $LINENO
++stop
++
++#
++# verify autocreate diabled
++#
++export ZOO_DATADIR_AUTOCREATE_DISABLE=1
++
++CONFIG=genconfig1
++
++clear_tmp
++start
++[ $? -eq 1 ] || fail $LINENO
++ls $DATADIR && fail $LINENO
++ls $DATALOGDIR && fail $LINENO
++
++CONFIG=genconfig2
++
++clear_tmp
++mkdir -p "$DATADIR/version-2"
++start
++[ $? -eq 1 ] || fail $LINENO
++ls $DATALOGDIR && fail $LINENO
++
++CONFIG=genconfig1
++
++clear_tmp
++mkdir -p "$DATADIR/version-2"
++start
++[ $? -eq 0 ] || fail $LINENO
++stop
++
++CONFIG=genconfig2
++
++clear_tmp
++mkdir -p "$DATADIR/version-2"
++mkdir -p "$DATALOGDIR/version-2"
++start
++[ $? -eq 0 ] || fail $LINENO
++stop
++
++#
++# validate the initialize script
++#
++
++CONFIG=genconfig1
++
++clear_tmp
++$CONFIG
++
++$ZKSI --configfile "$ZOOCFGDIR/$ZOOCFG"
++ls $DATADIR || fail $LINENO
++
++#ensure not already running
++$ZKS status && (echo "already running"; fail $LINENO)
++export ZOOPIDFILE="$DATADIR/zookeeper_server.pid"
++
++$ZKS start
++[ $? -eq 0 ] || fail $LINENO
++stop
++
++
++CONFIG=genconfig2
++
++clear_tmp
++$CONFIG
++
++$ZKSI --configfile "$ZOOCFGDIR/$ZOOCFG"
++ls $DATADIR || fail $LINENO
++ls $DATALOGDIR || fail $LINENO
++
++#ensure not already running
++$ZKS status && (echo "already running"; fail $LINENO)
++export ZOOPIDFILE="$DATADIR/zookeeper_server.pid"
++
++$ZKS start
++[ $? -eq 0 ] || fail $LINENO
++stop
++
++
++## validate force
++CONFIG=genconfig1
++
++clear_tmp
++$CONFIG
++
++$ZKSI --configfile "$ZOOCFGDIR/$ZOOCFG" || fail $LINENO
++ls $DATADIR || fail $LINENO
++$ZKSI --configfile "$ZOOCFGDIR/$ZOOCFG" && fail $LINENO
++$ZKSI --force --configfile "$ZOOCFGDIR/$ZOOCFG" || fail $LINENO
++
++#ensure not already running
++$ZKS status && (echo "already running"; fail $LINENO)
++export ZOOPIDFILE="$DATADIR/zookeeper_server.pid"
++
++$ZKS start
++[ $? -eq 0 ] || fail $LINENO
++stop
++
++$ZKSI --force --myid=1 --configfile "$ZOOCFGDIR/$ZOOCFG" || fail $LINENO
++
++
++#done, cleanup and exit
++clear_tmp
++echo "SUCCESS"
+diff --git a/src/java/test/org/apache/zookeeper/test/LoadFromLogTest.java b/src/java/test/org/apache/zookeeper/test/LoadFromLogTest.java
+index aefc0eb..f9f6871 100644
+--- a/src/java/test/org/apache/zookeeper/test/LoadFromLogTest.java
++++ b/src/java/test/org/apache/zookeeper/test/LoadFromLogTest.java
+@@ -21,6 +21,7 @@ package org.apache.zookeeper.test;
+ import java.io.ByteArrayOutputStream;
+ import java.io.File;
+ import java.io.FileInputStream;
++import java.io.IOException;
+ import java.nio.ByteBuffer;
+ import java.util.ArrayList;
+ import java.util.List;
+@@ -63,7 +64,7 @@ public class LoadFromLogTest extends ZKTestCase implements  Watcher {
+     protected static final Logger LOG = LoggerFactory.getLogger(LoadFromLogTest.class);
+ 
+     // setting up the quorum has a transaction overhead for creating and closing the session
+-    private static final int TRANSACTION_OVERHEAD = 2;	
++    private static final int TRANSACTION_OVERHEAD = 2;
+     private static final int TOTAL_TRANSACTIONS = NUM_MESSAGES + TRANSACTION_OVERHEAD;
+     private volatile boolean connected;
+ 
+@@ -113,7 +114,7 @@ public class LoadFromLogTest extends ZKTestCase implements  Watcher {
+             Assert.assertTrue("excepting next transaction. expected=" + expectedZxid + ", retreived=" + hdr.getZxid(), (hdr.getZxid() == expectedZxid));
+             lastZxid = hdr.getZxid();
+         }while(itr.next());
+-	
++
+         Assert.assertTrue("processed all transactions. " + expectedZxid + " == " + TOTAL_TRANSACTIONS, (expectedZxid == TOTAL_TRANSACTIONS));
+     }
+ 
+@@ -122,7 +123,7 @@ public class LoadFromLogTest extends ZKTestCase implements  Watcher {
+ 
+     public void process(WatchedEvent event) {
+     	switch (event.getType()) {
+-    	case None:   
++    	case None:
+     		switch (event.getState()) {
+     		case SyncConnected:
+     			connected = true;
+@@ -130,7 +131,7 @@ public class LoadFromLogTest extends ZKTestCase implements  Watcher {
+     		case Disconnected:
+     			connected = false;
+     			break;
+-    		default:   
++    		default:
+     			break;
+     		}
+         	break;
+@@ -163,11 +164,11 @@ public class LoadFromLogTest extends ZKTestCase implements  Watcher {
+         LOG.info("Attempting to create " + "/test/" + (count - 1));
+         doOp(logFile, OpCode.create, "/test/" + (count - 1), dt, zk,
+                 zk.stat.getCversion() + 1);
+-        
++
+         LOG.info("Attempting to create " + "/test/" + (count - 1));
+         doOp(logFile, OpCode.multi, "/test/" + (count - 1), dt, zk,
+                 zk.stat.getCversion() + 1);
+-        
++
+         LOG.info("Attempting to create " + "/test/" + (count - 1));
+         doOp(logFile, OpCode.multi, "/test/" + (count - 1), dt, zk,
+                 -1);
+@@ -210,7 +211,7 @@ public class LoadFromLogTest extends ZKTestCase implements  Watcher {
+         else if (type == OpCode.multi) {
+             txnHeader = new TxnHeader(0xabcd, 0x123, prevPzxid + 1,
+                     System.currentTimeMillis(), OpCode.create);
+-            txn = new CreateTxn(path, new byte[0], null, false, cversion);                       
++            txn = new CreateTxn(path, new byte[0], null, false, cversion);
+             ArrayList txnList = new ArrayList();
+             ByteArrayOutputStream baos = new ByteArrayOutputStream();
+             BinaryOutputArchive boa = BinaryOutputArchive.getArchive(baos);
+@@ -260,10 +261,10 @@ public class LoadFromLogTest extends ZKTestCase implements  Watcher {
+         Assert.assertTrue("Missing magic number ",
+               header.getMagic() == FileTxnLog.TXNLOG_MAGIC);
+     }
+-    
++
+     /**
+      * Test we can restore the snapshot that has data ahead of the zxid
+-     * of the snapshot file. 
++     * of the snapshot file.
+      */
+     @Test
+     public void testRestore() throws Exception {
+@@ -347,7 +348,7 @@ public class LoadFromLogTest extends ZKTestCase implements  Watcher {
+ 			}
+ 
+ 		}
+-		// Verify correctness of data and whether sequential znode creation 
++		// Verify correctness of data and whether sequential znode creation
+ 		// proceeds correctly after this point
+ 		String[] children;
+ 		String path;
+@@ -367,10 +368,10 @@ public class LoadFromLogTest extends ZKTestCase implements  Watcher {
+ 				(children.length == NUM_MESSAGES));
+ 		f.shutdown();
+ 	}
+-    
++
+     /**
+      * Test we can restore a snapshot that has errors and data ahead of the zxid
+-     * of the snapshot file. 
++     * of the snapshot file.
+      */
+     @Test
+     public void testRestoreWithTransactionErrors() throws Exception {
+@@ -419,7 +420,7 @@ public class LoadFromLogTest extends ZKTestCase implements  Watcher {
+                 zks.getZKDatabase().getDataTreeLastProcessedZxid() - 10);
+         LOG.info("Set lastProcessedZxid to "
+                 + zks.getZKDatabase().getDataTreeLastProcessedZxid());
+-        
++
+         // Force snapshot and restore
+         zks.takeSnapshot();
+         zks.shutdown();
+@@ -431,7 +432,48 @@ public class LoadFromLogTest extends ZKTestCase implements  Watcher {
+         f.startup(zks);
+         Assert.assertTrue("waiting for server being up ", ClientBase
+                 .waitForServerUp(HOSTPORT, CONNECTION_TIMEOUT));
+-        
++
+         f.shutdown();
+     }
+-}
+\ No newline at end of file
++
++    /**
++     * Verify snap/log dir create with/without autocreate enabled.
++     */
++    @Test
++    public void testDatadirAutocreate() throws Exception {
++        ClientBase.setupTestEnv();
++
++        // first verify the default (autocreate on) works
++        File tmpDir = ClientBase.createTmpDir();
++        ZooKeeperServer zks = new ZooKeeperServer(tmpDir, tmpDir, 3000);
++        final int PORT = Integer.parseInt(HOSTPORT.split(":")[1]);
++        ServerCnxnFactory f = ServerCnxnFactory.createFactory(PORT, -1);
++        f.startup(zks);
++        Assert.assertTrue("waiting for server being up ", ClientBase
++                .waitForServerUp(HOSTPORT, CONNECTION_TIMEOUT));
++        zks.shutdown();
++        f.shutdown();
++        Assert.assertTrue("waiting for server being down ", ClientBase
++                .waitForServerDown(HOSTPORT, CONNECTION_TIMEOUT));
++
++        try {
++            // now verify autocreate off works
++            System.setProperty(FileTxnSnapLog.ZOOKEEPER_DATADIR_AUTOCREATE, "false");
++
++            tmpDir = ClientBase.createTmpDir();
++            zks = new ZooKeeperServer(tmpDir, tmpDir, 3000);
++            f = ServerCnxnFactory.createFactory(PORT, -1);
++            f.startup(zks);
++            Assert.assertTrue("waiting for server being up ", ClientBase
++                    .waitForServerUp(HOSTPORT, CONNECTION_TIMEOUT));
++
++            Assert.fail("Server should not have started without datadir");
++        } catch (IOException e) {
++            LOG.info("Server failed to start - correct behavior " + e);
++        } finally {
++            System.setProperty(FileTxnSnapLog.ZOOKEEPER_DATADIR_AUTOCREATE,
++                FileTxnSnapLog.ZOOKEEPER_DATADIR_AUTOCREATE_DEFAULT);
++        }
++    }
++
++}
+-- 
+1.7.0.4
+
