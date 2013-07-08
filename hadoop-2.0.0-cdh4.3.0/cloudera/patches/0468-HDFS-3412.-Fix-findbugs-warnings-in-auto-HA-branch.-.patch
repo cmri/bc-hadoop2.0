@@ -1,0 +1,374 @@
+From dfef183e72779173b9543436fb95fcfd96cfb8ae Mon Sep 17 00:00:00 2001
+From: Todd Lipcon <todd@apache.org>
+Date: Tue, 15 May 2012 18:16:49 +0000
+Subject: [PATCH 0468/1357] HDFS-3412. Fix findbugs warnings in auto-HA branch. Contributed by Todd Lipcon.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-3042@1338817 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 681018b2b99d971acb73318fcde3dfbf0a2e1321)
+---
+ .../dev-support/findbugsExcludeFile.xml            |    4 +
+ .../org/apache/hadoop/ha/ZKFailoverController.java |   38 ++++++------
+ .../java/org/apache/hadoop/ha/MiniZKFCCluster.java |   11 +---
+ .../apache/hadoop/ha/TestZKFailoverController.java |    6 +-
+ .../hadoop/hdfs/tools/DFSZKFailoverController.java |   64 ++++++++++----------
+ .../namenode/ha/TestDFSZKFailoverController.java   |    4 +-
+ 6 files changed, 63 insertions(+), 64 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/dev-support/findbugsExcludeFile.xml b/hadoop-common-project/hadoop-common/dev-support/findbugsExcludeFile.xml
+index 5212b33..0244955 100644
+--- a/hadoop-common-project/hadoop-common/dev-support/findbugsExcludeFile.xml
++++ b/hadoop-common-project/hadoop-common/dev-support/findbugsExcludeFile.xml
+@@ -290,6 +290,10 @@
+       <!-- protobuf generated code -->
+       <Class name="~org\.apache\.hadoop\.ha\.proto\.HAServiceProtocolProtos.*"/>
+     </Match>
++    <Match>
++      <!-- protobuf generated code -->
++      <Class name="~org\.apache\.hadoop\.ha\.proto\.ZKFCProtocolProtos.*"/>
++    </Match>
+ 
+     <!--
+        Manually checked, misses child thread manually syncing on parent's intrinsic lock.
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ha/ZKFailoverController.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ha/ZKFailoverController.java
+index ea386ae..c02fe0d 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ha/ZKFailoverController.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ha/ZKFailoverController.java
+@@ -44,7 +44,6 @@ import org.apache.hadoop.security.SecurityUtil;
+ import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.security.authorize.PolicyProvider;
+ import org.apache.hadoop.util.StringUtils;
+-import org.apache.hadoop.util.Tool;
+ import org.apache.zookeeper.KeeperException;
+ import org.apache.zookeeper.ZooDefs.Ids;
+ import org.apache.hadoop.util.ToolRunner;
+@@ -56,7 +55,7 @@ import com.google.common.base.Throwables;
+ import com.google.common.util.concurrent.ThreadFactoryBuilder;
+ 
+ @InterfaceAudience.LimitedPrivate("HDFS")
+-public abstract class ZKFailoverController implements Tool {
++public abstract class ZKFailoverController {
+ 
+   static final Log LOG = LogFactory.getLog(ZKFailoverController.class);
+   
+@@ -93,15 +92,14 @@ public abstract class ZKFailoverController implements Tool {
+   /** Cannot connect to ZooKeeper */
+   static final int ERR_CODE_NO_ZK = 6;
+   
+-  private Configuration conf;
++  protected Configuration conf;
+   private String zkQuorum;
++  protected final HAServiceTarget localTarget;
+ 
+   private HealthMonitor healthMonitor;
+   private ActiveStandbyElector elector;
+   protected ZKFCRpcServer rpcServer;
+ 
+-  private HAServiceTarget localTarget;
+-
+   private State lastHealthState = State.INITIALIZING;
+ 
+   /** Set if a fatal error occurs */
+@@ -123,15 +121,13 @@ public abstract class ZKFailoverController implements Tool {
+   private ActiveAttemptRecord lastActiveAttemptRecord;
+   private Object activeAttemptRecordLock = new Object();
+ 
+-  @Override
+-  public void setConf(Configuration conf) {
++  protected ZKFailoverController(Configuration conf, HAServiceTarget localTarget) {
++    this.localTarget = localTarget;
+     this.conf = conf;
+-    localTarget = getLocalTarget();
+   }
+   
+ 
+   protected abstract byte[] targetToData(HAServiceTarget target);
+-  protected abstract HAServiceTarget getLocalTarget();
+   protected abstract HAServiceTarget dataToTarget(byte[] data);
+   protected abstract void loginAsFCUser() throws IOException;
+   protected abstract void checkRpcAdminAccess()
+@@ -147,12 +143,10 @@ public abstract class ZKFailoverController implements Tool {
+    */
+   protected abstract String getScopeInsideParentNode();
+ 
+-  @Override
+-  public Configuration getConf() {
+-    return conf;
++  public HAServiceTarget getLocalTarget() {
++    return localTarget;
+   }
+-
+-  @Override
++  
+   public int run(final String[] args) throws Exception {
+     if (!localTarget.isAutoFailoverEnabled()) {
+       LOG.fatal("Automatic failover is not enabled for " + localTarget + "." +
+@@ -796,9 +790,15 @@ public abstract class ZKFailoverController implements Tool {
+    * by the HealthMonitor.
+    */
+   @VisibleForTesting
+-  State getLastHealthState() {
++  synchronized State getLastHealthState() {
+     return lastHealthState;
+   }
++
++  private synchronized void setLastHealthState(HealthMonitor.State newState) {
++    LOG.info("Local service " + localTarget +
++        " entered state: " + newState);
++    lastHealthState = newState;
++  }
+   
+   @VisibleForTesting
+   ActiveStandbyElector getElectorForTests() {
+@@ -840,7 +840,9 @@ public abstract class ZKFailoverController implements Tool {
+     
+     @Override
+     public String toString() {
+-      return "Elector callbacks for " + localTarget;
++      synchronized (ZKFailoverController.this) {
++        return "Elector callbacks for " + localTarget;
++      }
+     }
+   }
+   
+@@ -850,9 +852,7 @@ public abstract class ZKFailoverController implements Tool {
+   class HealthCallbacks implements HealthMonitor.Callback {
+     @Override
+     public void enteredState(HealthMonitor.State newState) {
+-      LOG.info("Local service " + localTarget +
+-          " entered state: " + newState);
+-      lastHealthState = newState;
++      setLastHealthState(newState);
+       recheckElectability();
+     }
+   }
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ha/MiniZKFCCluster.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ha/MiniZKFCCluster.java
+index a6040c0..1db7924 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ha/MiniZKFCCluster.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ha/MiniZKFCCluster.java
+@@ -249,8 +249,7 @@ public class MiniZKFCCluster {
+ 
+     public DummyZKFCThread(TestContext ctx, DummyHAService svc) {
+       super(ctx);
+-      this.zkfc = new DummyZKFC(svc);
+-      zkfc.setConf(conf);
++      this.zkfc = new DummyZKFC(conf, svc);
+     }
+ 
+     @Override
+@@ -272,7 +271,8 @@ public class MiniZKFCCluster {
+       SCOPED_PARENT_ZNODE + "/" + ActiveStandbyElector.LOCK_FILENAME;
+     private final DummyHAService localTarget;
+     
+-    public DummyZKFC(DummyHAService localTarget) {
++    public DummyZKFC(Configuration conf, DummyHAService localTarget) {
++      super(conf, localTarget);
+       this.localTarget = localTarget;
+     }
+ 
+@@ -288,11 +288,6 @@ public class MiniZKFCCluster {
+     }
+ 
+     @Override
+-    protected HAServiceTarget getLocalTarget() {
+-      return localTarget;
+-    }
+-
+-    @Override
+     protected void loginAsFCUser() throws IOException {
+     }
+ 
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ha/TestZKFailoverController.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ha/TestZKFailoverController.java
+index 40cfa97..ed44d8a 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ha/TestZKFailoverController.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ha/TestZKFailoverController.java
+@@ -113,13 +113,12 @@ public class TestZKFailoverController extends ClientBaseWithFixes {
+   public void testFormatOneClusterLeavesOtherClustersAlone() throws Exception {
+     DummyHAService svc = cluster.getService(1);
+ 
+-    DummyZKFC zkfcInOtherCluster = new DummyZKFC(cluster.getService(1)) {
++    DummyZKFC zkfcInOtherCluster = new DummyZKFC(conf, cluster.getService(1)) {
+       @Override
+       protected String getScopeInsideParentNode() {
+         return "other-scope";
+       }
+     };
+-    zkfcInOtherCluster.setConf(conf);
+     
+     // Run without formatting the base dir,
+     // should barf
+@@ -581,8 +580,7 @@ public class TestZKFailoverController extends ClientBaseWithFixes {
+   }
+ 
+   private int runFC(DummyHAService target, String ... args) throws Exception {
+-    DummyZKFC zkfc = new DummyZKFC(target);
+-    zkfc.setConf(conf);
++    DummyZKFC zkfc = new DummyZKFC(conf, target);
+     return zkfc.run(args);
+   }
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/tools/DFSZKFailoverController.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/tools/DFSZKFailoverController.java
+index 28f0e9f..b1163d6 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/tools/DFSZKFailoverController.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/tools/DFSZKFailoverController.java
+@@ -34,6 +34,7 @@ import org.apache.hadoop.hdfs.DFSConfigKeys;
+ import org.apache.hadoop.hdfs.DFSUtil;
+ import org.apache.hadoop.hdfs.HAUtil;
+ import org.apache.hadoop.hdfs.HDFSPolicyProvider;
++import org.apache.hadoop.hdfs.HdfsConfiguration;
+ import org.apache.hadoop.hdfs.server.namenode.NameNode;
+ import org.apache.hadoop.hdfs.server.namenode.ha.proto.HAZKInfoProtos.ActiveNodeInfo;
+ import org.apache.hadoop.ipc.Server;
+@@ -42,10 +43,9 @@ import org.apache.hadoop.security.SecurityUtil;
+ import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.security.authorize.AccessControlList;
+ import org.apache.hadoop.security.authorize.PolicyProvider;
++import org.apache.hadoop.util.GenericOptionsParser;
+ import org.apache.hadoop.util.StringUtils;
+-import org.apache.hadoop.util.ToolRunner;
+ 
+-import com.google.common.base.Preconditions;
+ import com.google.protobuf.InvalidProtocolBufferException;
+ 
+ @InterfaceAudience.Private
+@@ -53,9 +53,9 @@ public class DFSZKFailoverController extends ZKFailoverController {
+ 
+   private static final Log LOG =
+     LogFactory.getLog(DFSZKFailoverController.class);
+-  private NNHAServiceTarget localTarget;
+-  private Configuration localNNConf;
+   private AccessControlList adminAcl;
++  /* the same as superclass's localTarget, but with the more specfic NN type */
++  private final NNHAServiceTarget localNNTarget;
+ 
+   @Override
+   protected HAServiceTarget dataToTarget(byte[] data) {
+@@ -67,7 +67,7 @@ public class DFSZKFailoverController extends ZKFailoverController {
+           StringUtils.byteToHexString(data));
+     }
+     NNHAServiceTarget ret = new NNHAServiceTarget(
+-        getConf(), proto.getNameserviceId(), proto.getNamenodeId());
++        conf, proto.getNameserviceId(), proto.getNamenodeId());
+     InetSocketAddress addressFromProtobuf = new InetSocketAddress(
+         proto.getHostname(), proto.getPort());
+     
+@@ -89,15 +89,15 @@ public class DFSZKFailoverController extends ZKFailoverController {
+       .setHostname(addr.getHostName())
+       .setPort(addr.getPort())
+       .setZkfcPort(target.getZKFCAddress().getPort())
+-      .setNameserviceId(localTarget.getNameServiceId())
+-      .setNamenodeId(localTarget.getNameNodeId())
++      .setNameserviceId(localNNTarget.getNameServiceId())
++      .setNamenodeId(localNNTarget.getNameNodeId())
+       .build()
+       .toByteArray();
+   }
+   
+   @Override
+   protected InetSocketAddress getRpcAddressToBindTo() {
+-    int zkfcPort = getZkfcPort(localNNConf);
++    int zkfcPort = getZkfcPort(conf);
+     return new InetSocketAddress(localTarget.getAddress().getAddress(),
+           zkfcPort);
+   }
+@@ -112,10 +112,9 @@ public class DFSZKFailoverController extends ZKFailoverController {
+     return conf.getInt(DFSConfigKeys.DFS_HA_ZKFC_PORT_KEY,
+         DFSConfigKeys.DFS_HA_ZKFC_PORT_DEFAULT);
+   }
+-
+-  @Override
+-  public void setConf(Configuration conf) {
+-    localNNConf = DFSHAAdmin.addSecurityConfiguration(conf);
++  
++  public static DFSZKFailoverController create(Configuration conf) {
++    Configuration localNNConf = DFSHAAdmin.addSecurityConfiguration(conf);
+     String nsId = DFSUtil.getNamenodeNameServiceId(conf);
+ 
+     if (!HAUtil.isHAEnabled(localNNConf, nsId)) {
+@@ -126,47 +125,50 @@ public class DFSZKFailoverController extends ZKFailoverController {
+     NameNode.initializeGenericKeys(localNNConf, nsId, nnId);
+     DFSUtil.setGenericConf(localNNConf, nsId, nnId, ZKFC_CONF_KEYS);
+     
+-    localTarget = new NNHAServiceTarget(localNNConf, nsId, nnId);
+-    
++    NNHAServiceTarget localTarget = new NNHAServiceTarget(
++        localNNConf, nsId, nnId);
++    return new DFSZKFailoverController(localNNConf, localTarget);
++  }
++
++  private DFSZKFailoverController(Configuration conf,
++      NNHAServiceTarget localTarget) {
++    super(conf, localTarget);
++    this.localNNTarget = localTarget;
+     // Setup ACLs
+     adminAcl = new AccessControlList(
+         conf.get(DFSConfigKeys.DFS_ADMIN, " "));
+-    
+-    super.setConf(localNNConf);
+     LOG.info("Failover controller configured for NameNode " +
+-        nsId + "." + nnId);
+-  }
++        localTarget);
++}
+   
+   
+   @Override
+   protected void initRPC() throws IOException {
+     super.initRPC();
+-    localTarget.setZkfcPort(rpcServer.getAddress().getPort());
++    localNNTarget.setZkfcPort(rpcServer.getAddress().getPort());
+   }
+ 
+   @Override
+-  public HAServiceTarget getLocalTarget() {
+-    Preconditions.checkState(localTarget != null,
+-        "setConf() should have already been called");
+-    return localTarget;
+-  }
+-  
+-  @Override
+   public void loginAsFCUser() throws IOException {
+-    InetSocketAddress socAddr = NameNode.getAddress(localNNConf);
+-    SecurityUtil.login(getConf(), DFS_NAMENODE_KEYTAB_FILE_KEY,
++    InetSocketAddress socAddr = NameNode.getAddress(conf);
++    SecurityUtil.login(conf, DFS_NAMENODE_KEYTAB_FILE_KEY,
+         DFS_NAMENODE_USER_NAME_KEY, socAddr.getHostName());
+   }
+   
+   @Override
+   protected String getScopeInsideParentNode() {
+-    return localTarget.getNameServiceId();
++    return localNNTarget.getNameServiceId();
+   }
+ 
+   public static void main(String args[])
+       throws Exception {
+-    System.exit(ToolRunner.run(
+-        new DFSZKFailoverController(), args));
++    
++    GenericOptionsParser parser = new GenericOptionsParser(
++        new HdfsConfiguration(), args);
++    DFSZKFailoverController zkfc = DFSZKFailoverController.create(
++        parser.getConfiguration());
++    
++    System.exit(zkfc.run(parser.getRemainingArgs()));
+   }
+ 
+   @Override
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestDFSZKFailoverController.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestDFSZKFailoverController.java
+index 29d9df5..98ec33e 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestDFSZKFailoverController.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestDFSZKFailoverController.java
+@@ -203,8 +203,8 @@ public class TestDFSZKFailoverController extends ClientBaseWithFixes {
+ 
+     public ZKFCThread(TestContext ctx, int idx) {
+       super(ctx);
+-      this.zkfc = new DFSZKFailoverController();
+-      zkfc.setConf(cluster.getConfiguration(idx));
++      this.zkfc = DFSZKFailoverController.create(
++          cluster.getConfiguration(idx));
+     }
+ 
+     @Override
+-- 
+1.7.0.4
+

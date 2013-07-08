@@ -1,0 +1,507 @@
+From 9c3fa7abc1c18a7a0a1281a4924302de75197d8a Mon Sep 17 00:00:00 2001
+From: Jonathan Turner Eagles <jeagles@apache.org>
+Date: Mon, 20 Aug 2012 18:32:13 +0000
+Subject: [PATCH 0461/1357] MAPREDUCE-4323. NM leaks filesystems (Jason Lowe via jeagles)
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1375164 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 558f55be8d7a70d196306241a2e126de8c01c896)
+---
+ .../localizer/ContainerLocalizer.java              |   21 ++-
+ .../logaggregation/LogAggregationService.java      |   28 +++-
+ .../localizer/TestContainerLocalizer.java          |  163 +++++++++++++-------
+ .../logaggregation/TestLogAggregationService.java  |   75 ++++++++-
+ 4 files changed, 207 insertions(+), 80 deletions(-)
+
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/localizer/ContainerLocalizer.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/localizer/ContainerLocalizer.java
+index f57739d..56bca70 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/localizer/ContainerLocalizer.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/localizer/ContainerLocalizer.java
+@@ -43,6 +43,7 @@ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileContext;
++import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.FileUtil;
+ import org.apache.hadoop.fs.LocalDirAllocator;
+ import org.apache.hadoop.fs.Path;
+@@ -175,10 +176,14 @@ public class ContainerLocalizer {
+       e.printStackTrace(System.out);
+       return -1;
+     } finally {
+-      if (exec != null) {
+-        exec.shutdownNow();
++      try {
++        if (exec != null) {
++          exec.shutdownNow();
++        }
++        LocalDirAllocator.removeContext(appCacheDirContextName);
++      } finally {
++        closeFileSystems(ugi);
+       }
+-      LocalDirAllocator.removeContext(appCacheDirContextName);
+     }
+   }
+ 
+@@ -214,7 +219,15 @@ public class ContainerLocalizer {
+     TimeUnit.SECONDS.sleep(duration);
+   }
+ 
+-  private void localizeFiles(LocalizationProtocol nodemanager,
++  protected void closeFileSystems(UserGroupInformation ugi) {
++    try {
++      FileSystem.closeAllForUGI(ugi);
++    } catch (IOException e) {
++      LOG.warn("Failed to close filesystems: ", e);
++    }
++  }
++
++  protected void localizeFiles(LocalizationProtocol nodemanager,
+       CompletionService<Path> cs, UserGroupInformation ugi)
+       throws IOException {
+     while (true) {
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/logaggregation/LogAggregationService.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/logaggregation/LogAggregationService.java
+index d29e6a0..d9b9c14 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/logaggregation/LogAggregationService.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/logaggregation/LogAggregationService.java
+@@ -59,7 +59,6 @@ import org.apache.hadoop.yarn.server.nodemanager.containermanager.loghandler.eve
+ import org.apache.hadoop.yarn.server.nodemanager.containermanager.loghandler.event.LogHandlerEvent;
+ import org.apache.hadoop.yarn.service.AbstractService;
+ 
+-import com.google.common.annotations.VisibleForTesting;
+ import com.google.common.util.concurrent.ThreadFactoryBuilder;
+ 
+ public class LogAggregationService extends AbstractService implements
+@@ -203,7 +202,7 @@ public class LogAggregationService extends AbstractService implements
+     fs.setPermission(path, new FsPermission(fsPerm));
+   }
+ 
+-  private void createAppDir(final String user, final ApplicationId appId,
++  protected void createAppDir(final String user, final ApplicationId appId,
+       UserGroupInformation userUgi) {
+     try {
+       userUgi.doAs(new PrivilegedExceptionAction<Object>() {
+@@ -286,13 +285,12 @@ public class LogAggregationService extends AbstractService implements
+     this.dispatcher.getEventHandler().handle(eventResponse);
+   }
+ 
+-  @VisibleForTesting
+-  public void initAppAggregator(final ApplicationId appId, String user,
++  protected void initAppAggregator(final ApplicationId appId, String user,
+       Credentials credentials, ContainerLogsRetentionPolicy logRetentionPolicy,
+       Map<ApplicationAccessType, String> appAcls) {
+ 
+     // Get user's FileSystem credentials
+-    UserGroupInformation userUgi =
++    final UserGroupInformation userUgi =
+         UserGroupInformation.createRemoteUser(user);
+     if (credentials != null) {
+       for (Token<? extends TokenIdentifier> token : credentials
+@@ -301,9 +299,6 @@ public class LogAggregationService extends AbstractService implements
+       }
+     }
+ 
+-    // Create the app dir
+-    createAppDir(user, appId, userUgi);
+-
+     // New application
+     final AppLogAggregator appLogAggregator =
+         new AppLogAggregatorImpl(this.dispatcher, this.deletionService,
+@@ -313,6 +308,14 @@ public class LogAggregationService extends AbstractService implements
+     if (this.appLogAggregators.putIfAbsent(appId, appLogAggregator) != null) {
+       throw new YarnException("Duplicate initApp for " + appId);
+     }
++    // wait until check for existing aggregator to create dirs
++    try {
++      // Create the app dir
++      createAppDir(user, appId, userUgi);
++    } catch (YarnException e) {
++      closeFileSystems(userUgi);
++      throw e;
++    }
+ 
+ 
+     // TODO Get the user configuration for the list of containers that need log
+@@ -325,12 +328,21 @@ public class LogAggregationService extends AbstractService implements
+           appLogAggregator.run();
+         } finally {
+           appLogAggregators.remove(appId);
++          closeFileSystems(userUgi);
+         }
+       }
+     };
+     this.threadPool.execute(aggregatorWrapper);
+   }
+ 
++  protected void closeFileSystems(final UserGroupInformation userUgi) {
++    try {
++      FileSystem.closeAllForUGI(userUgi);
++    } catch (IOException e) {
++      LOG.warn("Failed to close filesystems: ", e);
++    }
++  }
++
+   // for testing only
+   @Private
+   int getNumAggregators() {
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/localizer/TestContainerLocalizer.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/localizer/TestContainerLocalizer.java
+index 1a7ae24..829eba4 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/localizer/TestContainerLocalizer.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/localizer/TestContainerLocalizer.java
+@@ -19,6 +19,7 @@ package org.apache.hadoop.yarn.server.nodemanager.containermanager.localizer;
+ 
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.fail;
++import static org.mockito.Matchers.any;
+ import static org.mockito.Matchers.anyBoolean;
+ import static org.mockito.Matchers.anyInt;
+ import static org.mockito.Matchers.argThat;
+@@ -27,6 +28,7 @@ import static org.mockito.Matchers.isA;
+ import static org.mockito.Matchers.same;
+ import static org.mockito.Mockito.doNothing;
+ import static org.mockito.Mockito.doReturn;
++import static org.mockito.Mockito.doThrow;
+ import static org.mockito.Mockito.mock;
+ import static org.mockito.Mockito.never;
+ import static org.mockito.Mockito.spy;
+@@ -57,6 +59,7 @@ import org.apache.hadoop.io.Text;
+ import org.apache.hadoop.security.Credentials;
+ import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.security.token.Token;
++import org.apache.hadoop.yarn.YarnException;
+ import org.apache.hadoop.yarn.api.records.LocalResource;
+ import org.apache.hadoop.yarn.api.records.LocalResourceType;
+ import org.apache.hadoop.yarn.api.records.LocalResourceVisibility;
+@@ -76,47 +79,28 @@ public class TestContainerLocalizer {
+   static final Path basedir =
+       new Path("target", TestContainerLocalizer.class.getName());
+ 
++  static final String appUser = "yak";
++  static final String appId = "app_RM_0";
++  static final String containerId = "container_0";
++  static final InetSocketAddress nmAddr =
++      new InetSocketAddress("foobar", 8040);
++
++  private AbstractFileSystem spylfs;
++  private Random random;
++  private List<Path> localDirs;
++  private Path tokenPath;
++  private LocalizationProtocol nmProxy;
++
+   @Test
+-  @SuppressWarnings("unchecked") // mocked generics
+   public void testContainerLocalizerMain() throws Exception {
+-    Configuration conf = new Configuration();
+-    AbstractFileSystem spylfs =
+-      spy(FileContext.getLocalFSFileContext().getDefaultFileSystem());
+-    // don't actually create dirs
+-    doNothing().when(spylfs).mkdir(
+-        isA(Path.class), isA(FsPermission.class), anyBoolean());
+-    FileContext lfs = FileContext.getFileContext(spylfs, conf);
+-    final String user = "yak";
+-    final String appId = "app_RM_0";
+-    final String cId = "container_0";
+-    final InetSocketAddress nmAddr = new InetSocketAddress("foobar", 8040);
+-    final List<Path> localDirs = new ArrayList<Path>();
+-    for (int i = 0; i < 4; ++i) {
+-      localDirs.add(lfs.makeQualified(new Path(basedir, i + "")));
+-    }
+-    RecordFactory mockRF = getMockLocalizerRecordFactory();
+-    ContainerLocalizer concreteLoc = new ContainerLocalizer(lfs, user,
+-        appId, cId, localDirs, mockRF);
+-    ContainerLocalizer localizer = spy(concreteLoc);
+-
+-    // return credential stream instead of opening local file
+-    final Random r = new Random();
+-    long seed = r.nextLong();
+-    r.setSeed(seed);
+-    System.out.println("SEED: " + seed);
+-    DataInputBuffer appTokens = createFakeCredentials(r, 10);
+-    Path tokenPath =
+-      lfs.makeQualified(new Path(
+-            String.format(ContainerLocalizer.TOKEN_FILE_NAME_FMT, cId)));
+-    doReturn(new FSDataInputStream(new FakeFSDataInputStream(appTokens))
+-        ).when(spylfs).open(tokenPath);
++    ContainerLocalizer localizer = setupContainerLocalizerForTest();
+ 
+     // mock heartbeat responses from NM
+-    LocalizationProtocol nmProxy = mock(LocalizationProtocol.class);
+-    LocalResource rsrcA = getMockRsrc(r, LocalResourceVisibility.PRIVATE);
+-    LocalResource rsrcB = getMockRsrc(r, LocalResourceVisibility.PRIVATE);
+-    LocalResource rsrcC = getMockRsrc(r, LocalResourceVisibility.APPLICATION);
+-    LocalResource rsrcD = getMockRsrc(r, LocalResourceVisibility.PRIVATE);
++    LocalResource rsrcA = getMockRsrc(random, LocalResourceVisibility.PRIVATE);
++    LocalResource rsrcB = getMockRsrc(random, LocalResourceVisibility.PRIVATE);
++    LocalResource rsrcC = getMockRsrc(random,
++        LocalResourceVisibility.APPLICATION);
++    LocalResource rsrcD = getMockRsrc(random, LocalResourceVisibility.PRIVATE);
+     when(nmProxy.heartbeat(isA(LocalizerStatus.class)))
+       .thenReturn(new MockLocalizerHeartbeatResponse(LocalizerAction.LIVE,
+             Collections.singletonList(rsrcA)))
+@@ -130,6 +114,7 @@ public class TestContainerLocalizer {
+             Collections.<LocalResource>emptyList()))
+       .thenReturn(new MockLocalizerHeartbeatResponse(LocalizerAction.DIE,
+             null));
++
+     doReturn(new FakeDownload(rsrcA.getResource().getFile(), true)).when(
+         localizer).download(isA(LocalDirAllocator.class), eq(rsrcA),
+         isA(UserGroupInformation.class));
+@@ -142,33 +127,13 @@ public class TestContainerLocalizer {
+     doReturn(new FakeDownload(rsrcD.getResource().getFile(), true)).when(
+         localizer).download(isA(LocalDirAllocator.class), eq(rsrcD),
+         isA(UserGroupInformation.class));
+-    doReturn(nmProxy).when(localizer).getProxy(nmAddr);
+-    doNothing().when(localizer).sleep(anyInt());
+-
+-    // return result instantly for deterministic test
+-    ExecutorService syncExec = mock(ExecutorService.class);
+-    CompletionService<Path> cs = mock(CompletionService.class);
+-    when(cs.submit(isA(Callable.class)))
+-      .thenAnswer(new Answer<Future<Path>>() {
+-          @Override
+-          public Future<Path> answer(InvocationOnMock invoc)
+-              throws Throwable {
+-            Future<Path> done = mock(Future.class);
+-            when(done.isDone()).thenReturn(true);
+-            FakeDownload d = (FakeDownload) invoc.getArguments()[0];
+-            when(done.get()).thenReturn(d.call());
+-            return done;
+-          }
+-        });
+-    doReturn(syncExec).when(localizer).createDownloadThreadPool();
+-    doReturn(cs).when(localizer).createCompletionService(syncExec);
+ 
+     // run localization
+     assertEquals(0, localizer.runLocalization(nmAddr));
+ 
+     // verify created cache
+     for (Path p : localDirs) {
+-      Path base = new Path(new Path(p, ContainerLocalizer.USERCACHE), user);
++      Path base = new Path(new Path(p, ContainerLocalizer.USERCACHE), appUser);
+       Path privcache = new Path(base, ContainerLocalizer.FILECACHE);
+       // $x/usercache/$user/filecache
+       verify(spylfs).mkdir(eq(privcache), isA(FsPermission.class), eq(false));
+@@ -194,11 +159,91 @@ public class TestContainerLocalizer {
+           @Override
+           public boolean matches(Object o) {
+             LocalizerStatus status = (LocalizerStatus) o;
+-            return !cId.equals(status.getLocalizerId());
++            return !containerId.equals(status.getLocalizerId());
+           }
+         }));
+   }
+ 
++  @Test
++  @SuppressWarnings("unchecked") // mocked generics
++  public void testContainerLocalizerClosesFilesystems() throws Exception {
++    // verify filesystems are closed when localizer doesn't fail
++    ContainerLocalizer localizer = setupContainerLocalizerForTest();
++    doNothing().when(localizer).localizeFiles(any(LocalizationProtocol.class),
++        any(CompletionService.class), any(UserGroupInformation.class));
++    verify(localizer, never()).closeFileSystems(
++        any(UserGroupInformation.class));
++    localizer.runLocalization(nmAddr);
++    verify(localizer).closeFileSystems(any(UserGroupInformation.class));
++
++    // verify filesystems are closed when localizer fails
++    localizer = setupContainerLocalizerForTest();
++    doThrow(new YarnException("Forced Failure")).when(localizer).localizeFiles(
++        any(LocalizationProtocol.class), any(CompletionService.class),
++        any(UserGroupInformation.class));
++    verify(localizer, never()).closeFileSystems(
++        any(UserGroupInformation.class));
++    localizer.runLocalization(nmAddr);
++    verify(localizer).closeFileSystems(any(UserGroupInformation.class));
++  }
++
++  @SuppressWarnings("unchecked") // mocked generics
++  private ContainerLocalizer setupContainerLocalizerForTest()
++      throws Exception {
++    spylfs = spy(FileContext.getLocalFSFileContext().getDefaultFileSystem());
++    // don't actually create dirs
++    doNothing().when(spylfs).mkdir(
++        isA(Path.class), isA(FsPermission.class), anyBoolean());
++
++    Configuration conf = new Configuration();
++    FileContext lfs = FileContext.getFileContext(spylfs, conf);
++    localDirs = new ArrayList<Path>();
++    for (int i = 0; i < 4; ++i) {
++      localDirs.add(lfs.makeQualified(new Path(basedir, i + "")));
++    }
++    RecordFactory mockRF = getMockLocalizerRecordFactory();
++    ContainerLocalizer concreteLoc = new ContainerLocalizer(lfs, appUser,
++        appId, containerId, localDirs, mockRF);
++    ContainerLocalizer localizer = spy(concreteLoc);
++
++    // return credential stream instead of opening local file
++    random = new Random();
++    long seed = random.nextLong();
++    System.out.println("SEED: " + seed);
++    random.setSeed(seed);
++    DataInputBuffer appTokens = createFakeCredentials(random, 10);
++    tokenPath =
++      lfs.makeQualified(new Path(
++            String.format(ContainerLocalizer.TOKEN_FILE_NAME_FMT,
++                containerId)));
++    doReturn(new FSDataInputStream(new FakeFSDataInputStream(appTokens))
++        ).when(spylfs).open(tokenPath);
++
++    nmProxy = mock(LocalizationProtocol.class);
++    doReturn(nmProxy).when(localizer).getProxy(nmAddr);
++    doNothing().when(localizer).sleep(anyInt());
++
++    // return result instantly for deterministic test
++    ExecutorService syncExec = mock(ExecutorService.class);
++    CompletionService<Path> cs = mock(CompletionService.class);
++    when(cs.submit(isA(Callable.class)))
++      .thenAnswer(new Answer<Future<Path>>() {
++          @Override
++          public Future<Path> answer(InvocationOnMock invoc)
++              throws Throwable {
++            Future<Path> done = mock(Future.class);
++            when(done.isDone()).thenReturn(true);
++            FakeDownload d = (FakeDownload) invoc.getArguments()[0];
++            when(done.get()).thenReturn(d.call());
++            return done;
++          }
++        });
++    doReturn(syncExec).when(localizer).createDownloadThreadPool();
++    doReturn(cs).when(localizer).createCompletionService(syncExec);
++
++    return localizer;
++  }
++
+   static class HBMatches extends ArgumentMatcher<LocalizerStatus> {
+     final LocalResource rsrc;
+     HBMatches(LocalResource rsrc) {
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/logaggregation/TestLogAggregationService.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/logaggregation/TestLogAggregationService.java
+index 1627804..885855c 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/logaggregation/TestLogAggregationService.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/logaggregation/TestLogAggregationService.java
+@@ -46,6 +46,7 @@ import org.apache.hadoop.fs.UnsupportedFileSystemException;
+ import org.apache.hadoop.io.DataInputBuffer;
+ import org.apache.hadoop.io.DataOutputBuffer;
+ import org.apache.hadoop.security.Credentials;
++import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.yarn.YarnException;
+ import org.apache.hadoop.yarn.api.protocolrecords.StartContainerRequest;
+ import org.apache.hadoop.yarn.api.records.ApplicationAttemptId;
+@@ -126,9 +127,9 @@ public class TestLogAggregationService extends BaseContainerManagerTest {
+     EventHandler<ApplicationEvent> appEventHandler = mock(EventHandler.class);
+     dispatcher.register(ApplicationEventType.class, appEventHandler);
+     
+-    LogAggregationService logAggregationService =
++    LogAggregationService logAggregationService = spy(
+         new LogAggregationService(dispatcher, this.context, this.delSrvc,
+-                                  super.dirsHandler);
++                                  super.dirsHandler));
+     logAggregationService.init(this.conf);
+     logAggregationService.start();
+ 
+@@ -156,7 +157,9 @@ public class TestLogAggregationService extends BaseContainerManagerTest {
+         application1));
+ 
+     logAggregationService.stop();
+-
++    // ensure filesystems were closed
++    verify(logAggregationService).closeFileSystems(
++        any(UserGroupInformation.class));
+     
+     String containerIdStr = ConverterUtils.toString(container11);
+     File containerLogDir = new File(app1LogDir, containerIdStr);
+@@ -380,7 +383,60 @@ public class TestLogAggregationService extends BaseContainerManagerTest {
+   
+   @Test
+   @SuppressWarnings("unchecked")
+-  public void testLogAggregationFailsWithoutKillingNM() throws Exception {
++  public void testLogAggregationInitFailsWithoutKillingNM() throws Exception {
++
++    this.conf.set(YarnConfiguration.NM_LOG_DIRS,
++        localLogDir.getAbsolutePath());
++    this.conf.set(YarnConfiguration.NM_REMOTE_APP_LOG_DIR,
++        this.remoteRootLogDir.getAbsolutePath());
++
++    DrainDispatcher dispatcher = createDispatcher();
++    EventHandler<ApplicationEvent> appEventHandler = mock(EventHandler.class);
++    dispatcher.register(ApplicationEventType.class, appEventHandler);
++
++    LogAggregationService logAggregationService = spy(
++        new LogAggregationService(dispatcher, this.context, this.delSrvc,
++                                  super.dirsHandler));
++    logAggregationService.init(this.conf);
++    logAggregationService.start();
++
++    ApplicationId appId = BuilderUtils.newApplicationId(
++        System.currentTimeMillis(), (int)Math.random());
++    doThrow(new YarnException("KABOOM!"))
++      .when(logAggregationService).initAppAggregator(
++          eq(appId), eq(user), any(Credentials.class),
++          any(ContainerLogsRetentionPolicy.class), anyMap());
++
++    logAggregationService.handle(new LogHandlerAppStartedEvent(appId,
++        this.user, null,
++        ContainerLogsRetentionPolicy.AM_AND_FAILED_CONTAINERS_ONLY,
++        this.acls));
++
++    dispatcher.await();
++    ApplicationEvent expectedEvents[] = new ApplicationEvent[]{
++        new ApplicationFinishEvent(appId,
++            "Application failed to init aggregation: KABOOM!")
++    };
++    checkEvents(appEventHandler, expectedEvents, false,
++        "getType", "getApplicationID", "getDiagnostic");
++    // no filesystems instantiated yet
++    verify(logAggregationService, never()).closeFileSystems(
++        any(UserGroupInformation.class));
++
++    // verify trying to collect logs for containers/apps we don't know about
++    // doesn't blow up and tear down the NM
++    logAggregationService.handle(new LogHandlerContainerFinishedEvent(
++        BuilderUtils.newContainerId(4, 1, 1, 1), 0));
++    dispatcher.await();
++    logAggregationService.handle(new LogHandlerAppFinishedEvent(
++        BuilderUtils.newApplicationId(1, 5)));
++    dispatcher.await();
++  }
++
++  @Test
++  @SuppressWarnings("unchecked")
++  public void testLogAggregationCreateDirsFailsWithoutKillingNM()
++      throws Exception {
+     
+     this.conf.set(YarnConfiguration.NM_LOG_DIRS, localLogDir.getAbsolutePath());
+     this.conf.set(YarnConfiguration.NM_REMOTE_APP_LOG_DIR,
+@@ -399,10 +455,8 @@ public class TestLogAggregationService extends BaseContainerManagerTest {
+     ApplicationId appId = BuilderUtils.newApplicationId(
+         System.currentTimeMillis(), (int)Math.random());
+     doThrow(new YarnException("KABOOM!"))
+-      .when(logAggregationService).initAppAggregator(
+-          eq(appId), eq(user), any(Credentials.class),
+-          any(ContainerLogsRetentionPolicy.class), anyMap());
+-    
++      .when(logAggregationService).createAppDir(any(String.class),
++          any(ApplicationId.class), any(UserGroupInformation.class));
+     logAggregationService.handle(new LogHandlerAppStartedEvent(appId,
+         this.user, null,
+         ContainerLogsRetentionPolicy.AM_AND_FAILED_CONTAINERS_ONLY, this.acls));        
+@@ -413,6 +467,9 @@ public class TestLogAggregationService extends BaseContainerManagerTest {
+     };
+     checkEvents(appEventHandler, expectedEvents, false,
+         "getType", "getApplicationID", "getDiagnostic");
++    // filesystems may have been instantiated
++    verify(logAggregationService).closeFileSystems(
++        any(UserGroupInformation.class));
+ 
+     // verify trying to collect logs for containers/apps we don't know about
+     // doesn't blow up and tear down the NM
+@@ -423,7 +480,7 @@ public class TestLogAggregationService extends BaseContainerManagerTest {
+         BuilderUtils.newApplicationId(1, 5)));
+     dispatcher.await();
+   }
+-  
++
+   private void writeContainerLogs(File appLogDir, ContainerId containerId)
+       throws IOException {
+     // ContainerLogDir should be created
+-- 
+1.7.0.4
+

@@ -1,0 +1,141 @@
+From 02f72f910ae65b5806c96b71ca59cbbffa2c3598 Mon Sep 17 00:00:00 2001
+From: Jason Darrell Lowe <jlowe@apache.org>
+Date: Wed, 10 Oct 2012 21:15:06 +0000
+Subject: [PATCH 0974/1357] HDFS-3224. Bug in check for DN re-registration with different storage ID. Contributed by Jason Lowe
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1396798 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 4ac53c7c243fbd719480c707d9c1d878e617c239)
+---
+ .../server/blockmanagement/DatanodeManager.java    |    3 +-
+ .../hdfs/server/blockmanagement/Host2NodesMap.java |   29 +++++++++++
+ .../hadoop/hdfs/TestDatanodeRegistration.java      |   53 ++++++++++++++++++++
+ 3 files changed, 84 insertions(+), 1 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeManager.java
+index f75bd06..ad7d2f3 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeManager.java
+@@ -584,7 +584,8 @@ public class DatanodeManager {
+         + nodeReg + " storage " + nodeReg.getStorageID());
+ 
+     DatanodeDescriptor nodeS = datanodeMap.get(nodeReg.getStorageID());
+-    DatanodeDescriptor nodeN = getDatanodeByHost(nodeReg.getXferAddr());
++    DatanodeDescriptor nodeN = host2DatanodeMap.getDatanodeByXferAddr(
++        nodeReg.getIpAddr(), nodeReg.getXferPort());
+       
+     if (nodeN != null && nodeN != nodeS) {
+       NameNode.LOG.info("BLOCK* registerDatanode: " + nodeN);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/Host2NodesMap.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/Host2NodesMap.java
+index 082816d..6f9049a 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/Host2NodesMap.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/Host2NodesMap.java
+@@ -159,6 +159,35 @@ class Host2NodesMap {
+     }
+   }
+   
++  /**
++   * Find data node by its transfer address
++   *
++   * @return DatanodeDescriptor if found or null otherwise
++   */
++  public DatanodeDescriptor getDatanodeByXferAddr(String ipAddr,
++      int xferPort) {
++    if (ipAddr==null) {
++      return null;
++    }
++
++    hostmapLock.readLock().lock();
++    try {
++      DatanodeDescriptor[] nodes = map.get(ipAddr);
++      // no entry
++      if (nodes== null) {
++        return null;
++      }
++      for(DatanodeDescriptor containedNode:nodes) {
++        if (xferPort == containedNode.getXferPort()) {
++          return containedNode;
++        }
++      }
++      return null;
++    } finally {
++      hostmapLock.readLock().unlock();
++    }
++  }
++
+   @Override
+   public String toString() {
+     final StringBuilder b = new StringBuilder(getClass().getSimpleName())
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDatanodeRegistration.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDatanodeRegistration.java
+index 2e7879e..08be03d 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDatanodeRegistration.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDatanodeRegistration.java
+@@ -27,6 +27,7 @@ import java.security.Permission;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.hdfs.protocol.DatanodeID;
+ import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
+ import org.apache.hadoop.hdfs.protocol.HdfsConstants;
+ import org.apache.hadoop.hdfs.protocol.HdfsConstants.DatanodeReportType;
+@@ -152,6 +153,58 @@ public class TestDatanodeRegistration {
+   }
+   
+   @Test
++  public void testChangeStorageID() throws Exception {
++    final String DN_IP_ADDR = "127.0.0.1";
++    final String DN_HOSTNAME = "localhost";
++    final int DN_XFER_PORT = 12345;
++    final int DN_INFO_PORT = 12346;
++    final int DN_IPC_PORT = 12347;
++    Configuration conf = new HdfsConfiguration();
++    MiniDFSCluster cluster = null;
++    try {
++      cluster = new MiniDFSCluster.Builder(conf)
++          .numDataNodes(0)
++          .build();
++      InetSocketAddress addr = new InetSocketAddress(
++        "localhost",
++        cluster.getNameNodePort());
++      DFSClient client = new DFSClient(addr, conf);
++      NamenodeProtocols rpcServer = cluster.getNameNodeRpc();
++
++      // register a datanode
++      DatanodeID dnId = new DatanodeID(DN_IP_ADDR, DN_HOSTNAME,
++          "fake-storage-id", DN_XFER_PORT, DN_INFO_PORT, DN_IPC_PORT);
++      long nnCTime = cluster.getNamesystem().getFSImage().getStorage()
++          .getCTime();
++      StorageInfo mockStorageInfo = mock(StorageInfo.class);
++      doReturn(nnCTime).when(mockStorageInfo).getCTime();
++      doReturn(HdfsConstants.LAYOUT_VERSION).when(mockStorageInfo)
++          .getLayoutVersion();
++      DatanodeRegistration dnReg = new DatanodeRegistration(dnId,
++          mockStorageInfo, null, VersionInfo.getVersion());
++      rpcServer.registerDatanode(dnReg);
++
++      DatanodeInfo[] report = client.datanodeReport(DatanodeReportType.ALL);
++      assertEquals("Expected a registered datanode", 1, report.length);
++
++      // register the same datanode again with a different storage ID
++      dnId = new DatanodeID(DN_IP_ADDR, DN_HOSTNAME,
++          "changed-fake-storage-id", DN_XFER_PORT, DN_INFO_PORT, DN_IPC_PORT);
++      dnReg = new DatanodeRegistration(dnId,
++          mockStorageInfo, null, VersionInfo.getVersion());
++      rpcServer.registerDatanode(dnReg);
++
++      report = client.datanodeReport(DatanodeReportType.ALL);
++      assertEquals("Datanode with changed storage ID not recognized",
++          1, report.length);
++    } finally {
++      if (cluster != null) {
++        cluster.shutdown();
++      }
++    }
++  }
++
++  @Test
+   public void testRegistrationWithDifferentSoftwareVersions() throws Exception {
+     Configuration conf = new HdfsConfiguration();
+     conf.set(DFSConfigKeys.DFS_DATANODE_MIN_SUPPORTED_NAMENODE_VERSION_KEY, "3.0.0");
+-- 
+1.7.0.4
+

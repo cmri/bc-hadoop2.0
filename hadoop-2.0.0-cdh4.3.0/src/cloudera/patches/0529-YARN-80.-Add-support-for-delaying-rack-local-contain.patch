@@ -1,0 +1,176 @@
+From dcfe94e0a7bbe16a3bfab098e2bd323ab1b47d90 Mon Sep 17 00:00:00 2001
+From: Arun Murthy <acmurthy@apache.org>
+Date: Fri, 7 Sep 2012 05:10:51 +0000
+Subject: [PATCH 0529/1357] YARN-80. Add support for delaying rack-local containers in CapacityScheduler. Contributed by Arun C. Murthy.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1381872 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit c82897cdfffbdd0e614881781dc624de79285c7e)
+---
+ .../capacity/CapacitySchedulerConfiguration.java   |   12 ++++++++++++
+ .../scheduler/capacity/LeafQueue.java              |   20 +++++++++++++++++---
+ .../src/main/resources/capacity-scheduler.xml      |   11 +++++++++++
+ .../scheduler/capacity/TestLeafQueue.java          |   17 ++++++++++++++---
+ 4 files changed, 54 insertions(+), 6 deletions(-)
+
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/CapacitySchedulerConfiguration.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/CapacitySchedulerConfiguration.java
+index 300dda5..540bfcb 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/CapacitySchedulerConfiguration.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/CapacitySchedulerConfiguration.java
+@@ -115,6 +115,13 @@ public class CapacitySchedulerConfiguration extends Configuration {
+   @Private
+   public static final String ROOT = "root";
+ 
++  @Private 
++  public static final String NODE_LOCALITY_DELAY = 
++     PREFIX + "node-locality-delay";
++
++  @Private 
++  public static final int DEFAULT_NODE_LOCALITY_DELAY = -1;
++
+   public CapacitySchedulerConfiguration() {
+     this(new Configuration());
+   }
+@@ -290,4 +297,9 @@ public class CapacitySchedulerConfiguration extends Configuration {
+   public boolean getEnableUserMetrics() {
+     return getBoolean(ENABLE_USER_METRICS, DEFAULT_ENABLE_USER_METRICS);
+   }
++
++  public int getNodeLocalityDelay() {
++    int delay = getInt(NODE_LOCALITY_DELAY, DEFAULT_NODE_LOCALITY_DELAY);
++    return (delay == DEFAULT_NODE_LOCALITY_DELAY) ? 0 : delay;
++  }
+ }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/LeafQueue.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/LeafQueue.java
+index cf303cb..cac1a52 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/LeafQueue.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/LeafQueue.java
+@@ -124,6 +124,8 @@ public class LeafQueue implements CSQueue {
+   
+   private final ActiveUsersManager activeUsersManager;
+   
++  private final int nodeLocalityDelay;
++  
+   public LeafQueue(CapacitySchedulerContext cs, 
+       String queueName, CSQueue parent, 
+       Comparator<FiCaSchedulerApp> applicationComparator, CSQueue old) {
+@@ -188,6 +190,9 @@ public class LeafQueue implements CSQueue {
+     Map<QueueACL, AccessControlList> acls = 
+       cs.getConfiguration().getAcls(getQueuePath());
+ 
++    this.nodeLocalityDelay = 
++        cs.getConfiguration().getNodeLocalityDelay();
++    
+     setupQueueConfigs(
+         cs.getClusterResources(),
+         capacity, absoluteCapacity, 
+@@ -528,6 +533,11 @@ public class LeafQueue implements CSQueue {
+     return Collections.singletonList(userAclInfo);
+   }
+ 
++  @Private
++  public int getNodeLocalityDelay() {
++    return nodeLocalityDelay;
++  }
++  
+   public String toString() {
+     return queueName + ": " + 
+         "capacity=" + capacity + ", " + 
+@@ -1095,7 +1105,7 @@ public class LeafQueue implements CSQueue {
+           reservedContainer)) {
+         return assignContainer(clusterResource, node, application, priority, request, 
+             NodeType.RACK_LOCAL, reservedContainer);
+-      }
++      } 
+     }
+     return Resources.none();
+   }
+@@ -1112,7 +1122,6 @@ public class LeafQueue implements CSQueue {
+             NodeType.OFF_SWITCH, reservedContainer);
+       }
+     }
+-    
+     return Resources.none();
+   }
+ 
+@@ -1147,7 +1156,12 @@ public class LeafQueue implements CSQueue {
+       
+     // If we are here, we do need containers on this rack for RACK_LOCAL req
+     if (type == NodeType.RACK_LOCAL) {
+-      return true;
++      // 'Delay' rack-local just a little bit...
++      long missedOpportunities = application.getSchedulingOpportunities(priority);
++      return (
++          Math.min(scheduler.getNumClusterNodes(), getNodeLocalityDelay()) < 
++          missedOpportunities
++          );
+     }
+ 
+     // Check if we need containers on this host
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/resources/capacity-scheduler.xml b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/resources/capacity-scheduler.xml
+index 71d5fcd..9de7989 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/resources/capacity-scheduler.xml
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/resources/capacity-scheduler.xml
+@@ -92,4 +92,15 @@
+     </description>
+   </property>
+ 
++  <property>
++    <name>yarn.scheduler.capacity.node-locality-delay</name>
++    <value>-1</value>
++    <description>
++      Number of missed scheduling opportunities after which the CapacityScheduler 
++      attempts to schedule rack-local containers. 
++      Typically this should be set to number of racks in the cluster, this 
++      feature is disabled by default, set to -1.
++    </description>
++  </property>
++
+ </configuration>
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestLeafQueue.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestLeafQueue.java
+index 6e659cf..e6c16db 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestLeafQueue.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestLeafQueue.java
+@@ -24,6 +24,7 @@ import static org.junit.Assert.assertTrue;
+ import static org.mockito.Matchers.any;
+ import static org.mockito.Matchers.eq;
+ import static org.mockito.Mockito.doAnswer;
++import static org.mockito.Mockito.doReturn;
+ import static org.mockito.Mockito.doNothing;
+ import static org.mockito.Mockito.mock;
+ import static org.mockito.Mockito.never;
+@@ -1278,19 +1279,29 @@ public class TestLeafQueue {
+         TestUtils.createResourceRequest(rack_1, 1*GB, 1, 
+             priority, recordFactory));
+     app_0_requests_0.add(
+-        TestUtils.createResourceRequest(RMNodeImpl.ANY, 1*GB, 1, // one extra 
++        TestUtils.createResourceRequest(RMNodeImpl.ANY, 1*GB, 2, // one extra 
+             priority, recordFactory));
+     app_0.updateResourceRequests(app_0_requests_0);
+-    assertEquals(1, app_0.getTotalRequiredResources(priority));
++    assertEquals(2, app_0.getTotalRequiredResources(priority));
+     
+     String host_3 = "host_3"; // on rack_1
+     FiCaSchedulerNode node_3 = TestUtils.getMockNode(host_3, rack_1, 0, 8*GB);
+     
++    // Rack-delay
++    doReturn(1).when(a).getNodeLocalityDelay();
++    
++    // Shouldn't assign RACK_LOCAL yet
++    assignment = a.assignContainers(clusterResource, node_3);
++    assertEquals(1, app_0.getSchedulingOpportunities(priority));
++    assertEquals(2, app_0.getTotalRequiredResources(priority));
++    assertEquals(NodeType.NODE_LOCAL, assignment.getType()); // None->NODE_LOCAL
++
++    // Should assign RACK_LOCAL now
+     assignment = a.assignContainers(clusterResource, node_3);
+     verify(app_0).allocate(eq(NodeType.RACK_LOCAL), eq(node_3), 
+         any(Priority.class), any(ResourceRequest.class), any(Container.class));
+     assertEquals(0, app_0.getSchedulingOpportunities(priority)); // should reset
+-    assertEquals(0, app_0.getTotalRequiredResources(priority));
++    assertEquals(1, app_0.getTotalRequiredResources(priority));
+     assertEquals(NodeType.RACK_LOCAL, assignment.getType());
+   }
+   
+-- 
+1.7.0.4
+

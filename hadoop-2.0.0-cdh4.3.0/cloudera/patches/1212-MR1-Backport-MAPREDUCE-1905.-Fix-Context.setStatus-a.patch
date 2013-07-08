@@ -1,0 +1,466 @@
+From a67d72bd2a9e29f651fac858d0aed3db4bd0e9aa Mon Sep 17 00:00:00 2001
+From: Karthik Kambatla <kasha@cloudera.com>
+Date: Fri, 9 Nov 2012 14:11:36 -0800
+Subject: [PATCH 1212/1357] MR1: Backport MAPREDUCE-1905. Fix Context.setStatus() and Context.progress APIs
+
+Reason: Bug fix - Status and progress not being reported correctly
+Ref: CDH-8955
+Author: Amareshwari Sriramadasu
+---
+ src/mapred/org/apache/hadoop/mapred/MapTask.java   |    3 +-
+ .../org/apache/hadoop/mapred/ReduceTask.java       |    3 +-
+ src/mapred/org/apache/hadoop/mapred/Task.java      |    3 +-
+ .../hadoop/mapred/TaskAttemptContextImpl.java      |   35 ++++++++++--
+ .../hadoop/mapreduce/TaskAttemptContext.java       |   16 +++++
+ .../hadoop/mapreduce/TaskInputOutputContext.java   |   16 -----
+ .../mapreduce/lib/output/MultipleOutputs.java      |   36 +++++++++++-
+ .../mapreduce/task/TaskAttemptContextImpl.java     |   61 ++++++++++++++++----
+ .../mapreduce/task/TaskInputOutputContextImpl.java |   13 +----
+ .../apache/hadoop/mapreduce/TestTaskContext.java   |   61 ++++++++++++++++++++
+ 10 files changed, 197 insertions(+), 50 deletions(-)
+ create mode 100644 src/test/org/apache/hadoop/mapreduce/TestTaskContext.java
+
+diff --git a/src/mapred/org/apache/hadoop/mapred/MapTask.java b/src/mapred/org/apache/hadoop/mapred/MapTask.java
+index 06615bf..fe37ad4 100644
+--- a/src/mapred/org/apache/hadoop/mapred/MapTask.java
++++ b/src/mapred/org/apache/hadoop/mapred/MapTask.java
+@@ -600,7 +600,8 @@ class MapTask extends Task {
+     // make a task context so we can get the classes
+     org.apache.hadoop.mapreduce.TaskAttemptContext taskContext =
+       new org.apache.hadoop.mapreduce.task.TaskAttemptContextImpl(job, 
+-                                                                  getTaskID());
++                                                                  getTaskID(),
++                                                                  reporter);
+     // make a mapper
+     org.apache.hadoop.mapreduce.Mapper<INKEY,INVALUE,OUTKEY,OUTVALUE> mapper =
+       (org.apache.hadoop.mapreduce.Mapper<INKEY,INVALUE,OUTKEY,OUTVALUE>)
+diff --git a/src/mapred/org/apache/hadoop/mapred/ReduceTask.java b/src/mapred/org/apache/hadoop/mapred/ReduceTask.java
+index 493a30b..b7ef7b9 100644
+--- a/src/mapred/org/apache/hadoop/mapred/ReduceTask.java
++++ b/src/mapred/org/apache/hadoop/mapred/ReduceTask.java
+@@ -574,7 +574,8 @@ class ReduceTask extends Task {
+     };
+     // make a task context so we can get the classes
+     org.apache.hadoop.mapreduce.TaskAttemptContext taskContext =
+-      new org.apache.hadoop.mapreduce.task.TaskAttemptContextImpl(job, getTaskID());
++      new org.apache.hadoop.mapreduce.task.TaskAttemptContextImpl(job,
++          getTaskID(), reporter);
+     // make a reducer
+     org.apache.hadoop.mapreduce.Reducer<INKEY,INVALUE,OUTKEY,OUTVALUE> reducer =
+       (org.apache.hadoop.mapreduce.Reducer<INKEY,INVALUE,OUTKEY,OUTVALUE>)
+diff --git a/src/mapred/org/apache/hadoop/mapred/Task.java b/src/mapred/org/apache/hadoop/mapred/Task.java
+index e2a8e45..875134f 100644
+--- a/src/mapred/org/apache/hadoop/mapred/Task.java
++++ b/src/mapred/org/apache/hadoop/mapred/Task.java
+@@ -1335,7 +1335,8 @@ abstract public class Task implements Writable, Configurable {
+       }
+       // make a task context so we can get the classes
+       org.apache.hadoop.mapreduce.TaskAttemptContext taskContext =
+-        new org.apache.hadoop.mapreduce.task.TaskAttemptContextImpl(job, taskId);
++        new org.apache.hadoop.mapreduce.task.TaskAttemptContextImpl(job, taskId,
++            reporter);
+       Class<? extends org.apache.hadoop.mapreduce.Reducer<K,V,K,V>> newcls = 
+         (Class<? extends org.apache.hadoop.mapreduce.Reducer<K,V,K,V>>)
+            taskContext.getCombinerClass();
+diff --git a/src/mapred/org/apache/hadoop/mapred/TaskAttemptContextImpl.java b/src/mapred/org/apache/hadoop/mapred/TaskAttemptContextImpl.java
+index a0903cb..2bd9093 100644
+--- a/src/mapred/org/apache/hadoop/mapred/TaskAttemptContextImpl.java
++++ b/src/mapred/org/apache/hadoop/mapred/TaskAttemptContextImpl.java
+@@ -17,6 +17,7 @@
+ 
+ package org.apache.hadoop.mapred;
+ 
++import org.apache.hadoop.mapreduce.Counter;
+ import org.apache.hadoop.util.Progressable;
+ 
+ /**
+@@ -27,16 +28,16 @@ import org.apache.hadoop.util.Progressable;
+ public class TaskAttemptContextImpl
+        extends org.apache.hadoop.mapreduce.task.TaskAttemptContextImpl 
+        implements TaskAttemptContext {
+-  private Progressable progress;
++  private Reporter reporter;
+ 
+   TaskAttemptContextImpl(JobConf conf, TaskAttemptID taskid) {
+     this(conf, taskid, Reporter.NULL);
+   }
+   
+   TaskAttemptContextImpl(JobConf conf, TaskAttemptID taskid,
+-                         Progressable progress) {
++                         Reporter reporter) {
+     super(conf, taskid);
+-    this.progress = progress;
++    this.reporter = reporter;
+   }
+   
+   /**
+@@ -49,7 +50,7 @@ public class TaskAttemptContextImpl
+   }
+   
+   public Progressable getProgressible() {
+-    return progress;
++    return reporter;
+   }
+   
+   public JobConf getJobConf() {
+@@ -57,7 +58,31 @@ public class TaskAttemptContextImpl
+   }
+ 
+   @Override
++  public Counter getCounter(Enum<?> counterName) {
++    return reporter.getCounter(counterName);
++  }
++
++  @Override
++  public Counter getCounter(String groupName, String counterName) {
++    return reporter.getCounter(groupName, counterName);
++  }
++
++  /**
++   * Report progress.
++   */
++  @Override
+   public void progress() {
+-    progress.progress();
++    reporter.progress();
+   }
++
++  /**
++   * Set the current status of the task to the given string.
++   */
++  @Override
++  public void setStatus(String status) {
++    setStatusString(status);
++    reporter.setStatus(status);
++  }
++
++
+ }
+diff --git a/src/mapred/org/apache/hadoop/mapreduce/TaskAttemptContext.java b/src/mapred/org/apache/hadoop/mapreduce/TaskAttemptContext.java
+index e49affb..e2a7e45 100644
+--- a/src/mapred/org/apache/hadoop/mapreduce/TaskAttemptContext.java
++++ b/src/mapred/org/apache/hadoop/mapreduce/TaskAttemptContext.java
+@@ -41,4 +41,20 @@ public interface TaskAttemptContext extends JobContext, Progressable {
+    */
+   public String getStatus();
+ 
++  /**
++   * Get the {@link Counter} for the given <code>counterName</code>.
++   * @param counterName counter name
++   * @return the <code>Counter</code> for the given <code>counterName</code>
++   */
++  public Counter getCounter(Enum<?> counterName);
++
++  /**
++   * Get the {@link Counter} for the given <code>groupName</code> and 
++   * <code>counterName</code>.
++   * @param counterName counter name
++   * @return the <code>Counter</code> for the given <code>groupName</code> and 
++   *         <code>counterName</code>
++   */
++  public Counter getCounter(String groupName, String counterName);
++
+ }
+\ No newline at end of file
+diff --git a/src/mapred/org/apache/hadoop/mapreduce/TaskInputOutputContext.java b/src/mapred/org/apache/hadoop/mapreduce/TaskInputOutputContext.java
+index 0147061..4e91d39 100644
+--- a/src/mapred/org/apache/hadoop/mapreduce/TaskInputOutputContext.java
++++ b/src/mapred/org/apache/hadoop/mapreduce/TaskInputOutputContext.java
+@@ -60,22 +60,6 @@ public interface TaskInputOutputContext<KEYIN,VALUEIN,KEYOUT,VALUEOUT>
+       throws IOException, InterruptedException;
+ 
+   /**
+-   * Get the {@link Counter} for the given <code>counterName</code>.
+-   * @param counterName counter name
+-   * @return the <code>Counter</code> for the given <code>counterName</code>
+-   */
+-  public Counter getCounter(Enum<?> counterName);
+-
+-  /**
+-   * Get the {@link Counter} for the given <code>groupName</code> and 
+-   * <code>counterName</code>.
+-   * @param counterName counter name
+-   * @return the <code>Counter</code> for the given <code>groupName</code> and 
+-   *         <code>counterName</code>
+-   */
+-  public Counter getCounter(String groupName, String counterName);
+-
+-  /**
+    * Get the {@link OutputCommitter} for the task-attempt.
+    * @return the <code>OutputCommitter</code> for the task-attempt
+    */
+diff --git a/src/mapred/org/apache/hadoop/mapreduce/lib/output/MultipleOutputs.java b/src/mapred/org/apache/hadoop/mapreduce/lib/output/MultipleOutputs.java
+index daa007f..df012f5 100644
+--- a/src/mapred/org/apache/hadoop/mapreduce/lib/output/MultipleOutputs.java
++++ b/src/mapred/org/apache/hadoop/mapreduce/lib/output/MultipleOutputs.java
+@@ -382,7 +382,8 @@ public class MultipleOutputs<KEYOUT, VALUEOUT> {
+     checkBaseOutputPath(baseOutputPath);
+     TaskAttemptContext taskContext = 
+       new TaskAttemptContextImpl(context.getConfiguration(), 
+-                                 context.getTaskAttemptID());
++                                 context.getTaskAttemptID(),
++                                 new WrappedStatusReporter(context));
+     getRecordWriter(taskContext, baseOutputPath).write(key, value);
+   }
+ 
+@@ -436,14 +437,43 @@ public class MultipleOutputs<KEYOUT, VALUEOUT> {
+     job.setOutputFormatClass(getNamedOutputFormatClass(context, nameOutput));
+     job.setOutputKeyClass(getNamedOutputKeyClass(context, nameOutput));
+     job.setOutputValueClass(getNamedOutputValueClass(context, nameOutput));
+-    taskContext = new TaskAttemptContextImpl(
+-      job.getConfiguration(), context.getTaskAttemptID());
++    taskContext = new TaskAttemptContextImpl(job.getConfiguration(), context
++        .getTaskAttemptID(), new WrappedStatusReporter(context));
+     
+     taskContexts.put(nameOutput, taskContext);
+     
+     return taskContext;
+   }
+   
++  private static class WrappedStatusReporter extends StatusReporter {
++
++    TaskAttemptContext context;
++
++    public WrappedStatusReporter(TaskAttemptContext context) {
++      this.context = context;
++    }
++
++    @Override
++    public Counter getCounter(Enum<?> name) {
++      return context.getCounter(name);
++    }
++
++    @Override
++    public Counter getCounter(String group, String name) {
++      return context.getCounter(group, name);
++    }
++
++    @Override
++    public void progress() {
++      context.progress();
++    }
++
++    @Override
++    public void setStatus(String status) {
++      context.setStatus(status);
++    }
++  }
++
+   /**
+    * Closes all the opened outputs.
+    * 
+diff --git a/src/mapred/org/apache/hadoop/mapreduce/task/TaskAttemptContextImpl.java b/src/mapred/org/apache/hadoop/mapreduce/task/TaskAttemptContextImpl.java
+index 3e4c029..0aa5965 100644
+--- a/src/mapred/org/apache/hadoop/mapreduce/task/TaskAttemptContextImpl.java
++++ b/src/mapred/org/apache/hadoop/mapreduce/task/TaskAttemptContextImpl.java
+@@ -19,6 +19,9 @@
+ package org.apache.hadoop.mapreduce.task;
+ 
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.mapreduce.Counter;
++import org.apache.hadoop.mapreduce.Counters;
++import org.apache.hadoop.mapreduce.StatusReporter;
+ import org.apache.hadoop.mapreduce.TaskAttemptContext;
+ import org.apache.hadoop.mapreduce.TaskAttemptID;
+ 
+@@ -29,11 +32,18 @@ public class TaskAttemptContextImpl extends JobContextImpl
+     implements TaskAttemptContext {
+   private final TaskAttemptID taskId;
+   private String status = "";
+-  
++  private StatusReporter reporter;
++
+   public TaskAttemptContextImpl(Configuration conf, 
+                                 TaskAttemptID taskId) {
++    this(conf, taskId, new DummyReporter());
++  }
++
++  public TaskAttemptContextImpl(Configuration conf, 
++      TaskAttemptID taskId, StatusReporter reporter) {
+     super(conf, taskId.getJobID());
+     this.taskId = taskId;
++    this.reporter = reporter;
+   }
+ 
+   /**
+@@ -44,13 +54,6 @@ public class TaskAttemptContextImpl extends JobContextImpl
+   }
+ 
+   /**
+-   * Set the current status of the task to the given string.
+-   */
+-  public void setStatus(String msg) {
+-    status = msg;
+-  }
+-
+-  /**
+    * Get the last set status message.
+    * @return the current status message
+    */
+@@ -58,11 +61,47 @@ public class TaskAttemptContextImpl extends JobContextImpl
+     return status;
+   }
+ 
++  @Override
++  public Counter getCounter(Enum<?> counterName) {
++    return reporter.getCounter(counterName);
++  }
++
++  @Override
++  public Counter getCounter(String groupName, String counterName) {
++    return reporter.getCounter(groupName, counterName);
++  }
++
++  /**
++   * Report progress.
++   */
++  @Override
++  public void progress() {
++    reporter.progress();
++  }
++
++  protected void setStatusString(String status) {
++    this.status = status;
++  }
++
+   /**
+-   * Report progress. The subtypes actually do work in this method.
++   * Set the current status of the task to the given string.
+    */
+   @Override
+-  public void progress() { 
++  public void setStatus(String status) {
++    setStatusString(status);
++    reporter.setStatus(status);
++  }
++
++  public static class DummyReporter extends StatusReporter {
++    public void setStatus(String s) {
++    }
++    public void progress() {
++    }
++    public Counter getCounter(Enum<?> name) {
++      return new Counters().findCounter(name);
++    }
++    public Counter getCounter(String group, String name) {
++      return new Counters().findCounter(group, name);
++    }
+   }
+-    
+ }
+\ No newline at end of file
+diff --git a/src/mapred/org/apache/hadoop/mapreduce/task/TaskInputOutputContextImpl.java b/src/mapred/org/apache/hadoop/mapreduce/task/TaskInputOutputContextImpl.java
+index 33ce0b1..28a8a8f 100644
+--- a/src/mapred/org/apache/hadoop/mapreduce/task/TaskInputOutputContextImpl.java
++++ b/src/mapred/org/apache/hadoop/mapreduce/task/TaskInputOutputContextImpl.java
+@@ -21,7 +21,6 @@ package org.apache.hadoop.mapreduce.task;
+ import java.io.IOException;
+ 
+ import org.apache.hadoop.conf.Configuration;
+-import org.apache.hadoop.mapreduce.Counter;
+ import org.apache.hadoop.mapreduce.OutputCommitter;
+ import org.apache.hadoop.mapreduce.RecordWriter;
+ import org.apache.hadoop.mapreduce.StatusReporter;
+@@ -42,16 +41,14 @@ public abstract class TaskInputOutputContextImpl<KEYIN,VALUEIN,KEYOUT,VALUEOUT>
+        extends TaskAttemptContextImpl 
+        implements TaskInputOutputContext<KEYIN, VALUEIN, KEYOUT, VALUEOUT> {
+   private RecordWriter<KEYOUT,VALUEOUT> output;
+-  private StatusReporter reporter;
+   private OutputCommitter committer;
+ 
+   public TaskInputOutputContextImpl(Configuration conf, TaskAttemptID taskid,
+                                     RecordWriter<KEYOUT,VALUEOUT> output,
+                                     OutputCommitter committer,
+                                     StatusReporter reporter) {
+-    super(conf, taskid);
++    super(conf, taskid, reporter);
+     this.output = output;
+-    this.reporter = reporter;
+     this.committer = committer;
+   }
+ 
+@@ -88,14 +85,6 @@ public abstract class TaskInputOutputContextImpl<KEYIN,VALUEIN,KEYOUT,VALUEOUT>
+     output.write(key, value);
+   }
+ 
+-  public Counter getCounter(Enum<?> counterName) {
+-    return reporter.getCounter(counterName);
+-  }
+-
+-  public Counter getCounter(String groupName, String counterName) {
+-    return reporter.getCounter(groupName, counterName);
+-  }
+-
+   public OutputCommitter getOutputCommitter() {
+     return committer;
+   }
+diff --git a/src/test/org/apache/hadoop/mapreduce/TestTaskContext.java b/src/test/org/apache/hadoop/mapreduce/TestTaskContext.java
+new file mode 100644
+index 0000000..ff52d54
+--- /dev/null
++++ b/src/test/org/apache/hadoop/mapreduce/TestTaskContext.java
+@@ -0,0 +1,61 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.mapreduce;
++
++import java.io.IOException;
++
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.io.LongWritable;
++import org.apache.hadoop.io.Text;
++import org.apache.hadoop.mapred.HadoopTestCase;
++import org.apache.hadoop.mapred.TaskReport;
++
++/**
++ * Tests context api. 
++ */
++public class TestTaskContext extends HadoopTestCase {
++  public TestTaskContext() throws IOException {
++    super(HadoopTestCase.CLUSTER_MR , HadoopTestCase.LOCAL_FS, 1, 1);
++  }
++
++  static String myStatus = "my status";
++  static class MyMapper extends Mapper<LongWritable, Text, LongWritable, Text> {
++    @Override
++    protected void setup(Context context) throws IOException {
++      context.setStatus(myStatus);
++      assertEquals(myStatus, context.getStatus());
++    }
++  }
++
++  /**
++   * Tests context.setStatus method.
++   * 
++   * @throws IOException
++   * @throws InterruptedException
++   * @throws ClassNotFoundException
++   */
++  public void testContextStatus()
++      throws IOException, InterruptedException, ClassNotFoundException {
++    int numMaps = 1;
++    Job job = MapReduceTestUtil.createJob(createJobConf(), new Path("in"),
++        new Path("out"), numMaps, 0);
++    job.setMapperClass(MyMapper.class);
++    job.waitForCompletion(true);
++    assertTrue("Job failed", job.isSuccessful());
++  }
++}
+-- 
+1.7.0.4
+

@@ -1,0 +1,549 @@
+From 28db75160e8a5653bd6764e8d8023110b1f293c4 Mon Sep 17 00:00:00 2001
+From: Todd Lipcon <todd@cloudera.com>
+Date: Wed, 25 Jul 2012 15:42:48 -0700
+Subject: [PATCH 0258/1357] HDFS-3626. Creating file with invalid path can corrupt edit log. Contributed by Todd Lipcon.
+
+Differs from upstream patch in test code: resolved conflicts because
+upstream has already converted all tests to JUnit 4, which was not
+yet cherry-picked into CDH4 at this time.
+
+Incorporates upstream amend commit:
+  "Amend previous commit of HDFS-3626: accidentally included a hunk from
+   HADOOP-8621 in svn commit. Reverting that hunk"
+
+(cherry picked from 629dcde3869feb83511ebd2c01f0c77378a55c85, fe4269049369f16f9145723136995047c03dbf2d)
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1365801 13f79535-47bb-0310-9956-ffa450edef68
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1365817 13f79535-47bb-0310-9956-ffa450edef68
+---
+ .../src/main/java/org/apache/hadoop/fs/Path.java   |    2 +-
+ .../test/java/org/apache/hadoop/fs/TestPath.java   |    4 +-
+ .../main/java/org/apache/hadoop/hdfs/DFSUtil.java  |   16 ++-
+ .../hadoop/hdfs/server/namenode/FSDirectory.java   |   11 ++-
+ .../java/org/apache/hadoop/hdfs/TestDFSMkdirs.java |   71 +++++++++---
+ .../java/org/apache/hadoop/hdfs/TestDFSUtil.java   |    8 ++
+ .../org/apache/hadoop/hdfs/TestFileCreation.java   |  123 +++++++++++++++++++-
+ 7 files changed, 209 insertions(+), 26 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/Path.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/Path.java
+index 3d193df..74c85af 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/Path.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/Path.java
+@@ -139,7 +139,7 @@ public class Path implements Comparable {
+    * Construct a path from a URI
+    */
+   public Path(URI aUri) {
+-    uri = aUri;
++    uri = aUri.normalize();
+   }
+   
+   /** Construct a Path from components. */
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/TestPath.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/TestPath.java
+index 2be0f9d..5032caa 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/TestPath.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/TestPath.java
+@@ -61,7 +61,7 @@ public class TestPath extends TestCase {
+     assertEquals(pathString, new Path(pathString).toString());
+   }
+ 
+-  public void testNormalize() {
++  public void testNormalize() throws URISyntaxException {
+     assertEquals("", new Path(".").toString());
+     assertEquals("..", new Path("..").toString());
+     assertEquals("/", new Path("/").toString());
+@@ -75,6 +75,8 @@ public class TestPath extends TestCase {
+     assertEquals("foo", new Path("foo/").toString());
+     assertEquals("foo", new Path("foo//").toString());
+     assertEquals("foo/bar", new Path("foo//bar").toString());
++    assertEquals("hdfs://foo/foo2/bar/baz/",
++        new Path(new URI("hdfs://foo//foo2///bar/baz///")).toString());
+     if (Path.WINDOWS) {
+       assertEquals("c:/a/b", new Path("c:\\a\\b").toString());
+     }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSUtil.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSUtil.java
+index 2a5a747..54ec79d 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSUtil.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSUtil.java
+@@ -62,6 +62,7 @@ import org.apache.hadoop.ipc.RPC;
+ import org.apache.hadoop.net.NetUtils;
+ import org.apache.hadoop.net.NodeBase;
+ import org.apache.hadoop.security.UserGroupInformation;
++import org.apache.hadoop.util.StringUtils;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ 
+@@ -124,7 +125,7 @@ public class DFSUtil {
+   
+   /**
+    * Whether the pathname is valid.  Currently prohibits relative paths, 
+-   * and names which contain a ":" or "/" 
++   * names which contain a ":" or "//", or other non-canonical paths.
+    */
+   public static boolean isValidName(String src) {
+     // Path must be absolute.
+@@ -133,15 +134,22 @@ public class DFSUtil {
+     }
+       
+     // Check for ".." "." ":" "/"
+-    StringTokenizer tokens = new StringTokenizer(src, Path.SEPARATOR);
+-    while(tokens.hasMoreTokens()) {
+-      String element = tokens.nextToken();
++    String[] components = StringUtils.split(src, '/');
++    for (int i = 0; i < components.length; i++) {
++      String element = components[i];
+       if (element.equals("..") || 
+           element.equals(".")  ||
+           (element.indexOf(":") >= 0)  ||
+           (element.indexOf("/") >= 0)) {
+         return false;
+       }
++      
++      // The string may start or end with a /, but not have
++      // "//" in the middle.
++      if (element.isEmpty() && i != components.length - 1 &&
++          i != 0) {
++        return false;
++      }
+     }
+     return true;
+   }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
+index 4dbd8be..391a599 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
+@@ -230,8 +230,15 @@ public class FSDirectory implements Closeable {
+ 
+     // Always do an implicit mkdirs for parent directory tree.
+     long modTime = now();
+-    if (!mkdirs(new Path(path).getParent().toString(), permissions, true,
+-        modTime)) {
++    
++    Path parent = new Path(path).getParent();
++    if (parent == null) {
++      // Trying to add "/" as a file - this path has no
++      // parent -- avoids an NPE below.
++      return null;
++    }
++    
++    if (!mkdirs(parent.toString(), permissions, true, modTime)) {
+       return null;
+     }
+     INodeFileUnderConstruction newNode = new INodeFileUnderConstruction(
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSMkdirs.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSMkdirs.java
+index 8a053f8..d77ab00 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSMkdirs.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSMkdirs.java
+@@ -17,35 +17,46 @@
+  */
+ package org.apache.hadoop.hdfs;
+ 
+-import junit.framework.TestCase;
+-import java.io.*;
++import static org.junit.Assert.*;
++import org.junit.Test;
++
++import java.io.DataOutputStream;
++import java.io.FileNotFoundException;
++import java.io.IOException;
++
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.fs.InvalidPathException;
+ import org.apache.hadoop.fs.ParentNotDirectoryException;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.permission.FsPermission;
++import org.apache.hadoop.hdfs.server.protocol.NamenodeProtocol;
++import org.apache.hadoop.hdfs.server.protocol.NamenodeProtocols;
++import org.apache.hadoop.test.GenericTestUtils;
+ import org.apache.hadoop.util.Time;
+ 
+-
+ /**
+- * This class tests that the DFS command mkdirs cannot create subdirectories
+- * from a file when passed an illegal path.  HADOOP-281.
++ * This class tests that the DFS command mkdirs only creates valid
++ * directories, and generally behaves as expected.
+  */
+-public class TestDFSMkdirs extends TestCase {
++public class TestDFSMkdirs {
++  private Configuration conf = new HdfsConfiguration();
++
++  private static final String[] NON_CANONICAL_PATHS = new String[] {
++      "//test1",
++      "/test2/..",
++      "/test2//bar",
++      "/test2/../test4",
++      "/test5/."
++  };
+ 
+-  private void writeFile(FileSystem fileSys, Path name) throws IOException {
+-    DataOutputStream stm = fileSys.create(name);
+-    stm.writeBytes("wchien");
+-    stm.close();
+-  }
+-  
+   /**
+    * Tests mkdirs can create a directory that does not exist and will
+-   * not create a subdirectory off a file.
++   * not create a subdirectory off a file. Regression test for HADOOP-281.
+    */
++  @Test
+   public void testDFSMkdirs() throws IOException {
+-    Configuration conf = new HdfsConfiguration();
+-    MiniDFSCluster cluster = new MiniDFSCluster.Builder(conf).numDataNodes(2).build();
++    MiniDFSCluster cluster = new MiniDFSCluster.Builder(conf).numDataNodes(1).build();
+     FileSystem fileSys = cluster.getFileSystem();
+     try {
+       // First create a new directory with mkdirs
+@@ -56,7 +67,7 @@ public class TestDFSMkdirs extends TestCase {
+ 
+       // Second, create a file in that directory.
+       Path myFile = new Path("/test/mkdirs/myFile");
+-      writeFile(fileSys, myFile);
++      DFSTestUtil.writeFile(fileSys, myFile, "hello world");
+    
+       // Third, use mkdir to create a subdirectory off of that file,
+       // and check that it fails.
+@@ -80,6 +91,7 @@ public class TestDFSMkdirs extends TestCase {
+   /**
+    * Tests mkdir will not create directory when parent is missing.
+    */
++  @Test
+   public void testMkdir() throws IOException {
+     Configuration conf = new HdfsConfiguration();
+     MiniDFSCluster cluster = new MiniDFSCluster.Builder(conf).numDataNodes(2).build();
+@@ -91,7 +103,7 @@ public class TestDFSMkdirs extends TestCase {
+       // Create a dir when parent dir exists as a file, should fail
+       IOException expectedException = null;
+       String filePath = "/mkdir-file-" + Time.now();
+-      writeFile(dfs, new Path(filePath));
++      DFSTestUtil.writeFile(dfs, new Path(filePath), "hello world");
+       try {
+         dfs.mkdir(new Path(filePath + "/mkdir"), FsPermission.getDefault());
+       } catch (IOException e) {
+@@ -118,4 +130,29 @@ public class TestDFSMkdirs extends TestCase {
+       cluster.shutdown();
+     }
+   }
++
++  /**
++   * Regression test for HDFS-3626. Creates a file using a non-canonical path
++   * (i.e. with extra slashes between components) and makes sure that the NN
++   * rejects it.
++   */
++  @Test
++  public void testMkdirRpcNonCanonicalPath() throws IOException {
++    MiniDFSCluster cluster = new MiniDFSCluster.Builder(conf).numDataNodes(0).build();
++    try {
++      NamenodeProtocols nnrpc = cluster.getNameNodeRpc();
++      
++      for (String pathStr : NON_CANONICAL_PATHS) {
++        try {
++          nnrpc.mkdirs(pathStr, new FsPermission((short)0755), true);
++          fail("Did not fail when called with a non-canonicalized path: "
++             + pathStr);
++        } catch (InvalidPathException ipe) {
++          // expected
++        }
++      }
++    } finally {
++      cluster.shutdown();
++    }
++  }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSUtil.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSUtil.java
+index 6a0f4e7..5c81aa5 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSUtil.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSUtil.java
+@@ -608,4 +608,12 @@ public class TestDFSUtil {
+     assertEquals(1, uris.size());
+     assertTrue(uris.contains(new URI("hdfs://" + NN1_SRVC_ADDR)));
+   }
++  
++  @Test
++  public void testIsValidName() {
++    assertFalse(DFSUtil.isValidName("/foo/../bar"));
++    assertFalse(DFSUtil.isValidName("/foo//bar"));
++    assertTrue(DFSUtil.isValidName("/"));
++    assertTrue(DFSUtil.isValidName("/bar/"));
++  }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestFileCreation.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestFileCreation.java
+index c2f630c..d5f4ae1 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestFileCreation.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestFileCreation.java
+@@ -32,6 +32,7 @@ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_REPLICATION_MIN_
+ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_REPLICATION_DEFAULT;
+ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_REPLICATION_KEY;
+ import static org.junit.Assume.assumeTrue;
++import static org.junit.Assert.*;
+ 
+ import java.io.BufferedReader;
+ import java.io.File;
+@@ -39,6 +40,8 @@ import java.io.FileNotFoundException;
+ import java.io.FileReader;
+ import java.io.IOException;
+ import java.net.InetSocketAddress;
++import java.net.URI;
++import java.net.URISyntaxException;
+ import java.net.UnknownHostException;
+ import java.util.EnumSet;
+ 
+@@ -51,6 +54,7 @@ import org.apache.hadoop.fs.FSDataInputStream;
+ import org.apache.hadoop.fs.FSDataOutputStream;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.FsServerDefaults;
++import org.apache.hadoop.fs.InvalidPathException;
+ import org.apache.hadoop.fs.ParentNotDirectoryException;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.permission.FsPermission;
+@@ -67,14 +71,18 @@ import org.apache.hadoop.hdfs.server.datanode.SimulatedFSDataset;
+ import org.apache.hadoop.hdfs.server.datanode.fsdataset.FsDatasetSpi;
+ import org.apache.hadoop.hdfs.server.namenode.FSNamesystem;
+ import org.apache.hadoop.hdfs.server.namenode.LeaseManager;
++import org.apache.hadoop.hdfs.server.protocol.NamenodeProtocols;
++import org.apache.hadoop.io.EnumSetWritable;
+ import org.apache.hadoop.io.IOUtils;
++import org.apache.hadoop.test.GenericTestUtils;
+ import org.apache.hadoop.util.Time;
+ import org.apache.log4j.Level;
++import org.junit.Test;
+ 
+ /**
+  * This class tests various cases during file creation.
+  */
+-public class TestFileCreation extends junit.framework.TestCase {
++public class TestFileCreation {
+   static final String DIR = "/" + TestFileCreation.class.getSimpleName() + "/";
+ 
+   {
+@@ -89,6 +97,15 @@ public class TestFileCreation extends junit.framework.TestCase {
+   static final int numBlocks = 2;
+   static final int fileSize = numBlocks * blockSize + 1;
+   boolean simulatedStorage = false;
++  
++  private static final String[] NON_CANONICAL_PATHS = new String[] {
++    "//foo",
++    "///foo2",
++    "//dir//file",
++    "////test2/file",
++    "/dir/./file2",
++    "/dir/../file3"
++  };
+ 
+   // creates a file but does not close it
+   public static FSDataOutputStream createFile(FileSystem fileSys, Path name, int repl)
+@@ -123,6 +140,7 @@ public class TestFileCreation extends junit.framework.TestCase {
+   /**
+    * Test that server default values can be retrieved on the client side
+    */
++  @Test
+   public void testServerDefaults() throws IOException {
+     Configuration conf = new HdfsConfiguration();
+     conf.setLong(DFS_BLOCK_SIZE_KEY, DFS_BLOCK_SIZE_DEFAULT);
+@@ -148,11 +166,13 @@ public class TestFileCreation extends junit.framework.TestCase {
+     }
+   }
+ 
++  @Test
+   public void testFileCreation() throws IOException {
+     checkFileCreation(null);
+   }
+ 
+   /** Same test but the client should bind to a local interface */
++  @Test
+   public void testFileCreationSetLocalInterface() throws IOException {
+     assumeTrue(System.getProperty("os.name").startsWith("Linux"));
+ 
+@@ -255,6 +275,7 @@ public class TestFileCreation extends junit.framework.TestCase {
+   /**
+    * Test deleteOnExit
+    */
++  @Test
+   public void testDeleteOnExit() throws IOException {
+     Configuration conf = new HdfsConfiguration();
+     if (simulatedStorage) {
+@@ -317,6 +338,7 @@ public class TestFileCreation extends junit.framework.TestCase {
+   /**
+    * Test that file data does not become corrupted even in the face of errors.
+    */
++  @Test
+   public void testFileCreationError1() throws IOException {
+     Configuration conf = new HdfsConfiguration();
+     conf.setInt(DFS_NAMENODE_HEARTBEAT_RECHECK_INTERVAL_KEY, 1000);
+@@ -389,6 +411,7 @@ public class TestFileCreation extends junit.framework.TestCase {
+    * Test that the filesystem removes the last block from a file if its
+    * lease expires.
+    */
++  @Test
+   public void testFileCreationError2() throws IOException {
+     long leasePeriod = 1000;
+     System.out.println("testFileCreationError2 start");
+@@ -454,6 +477,7 @@ public class TestFileCreation extends junit.framework.TestCase {
+   }
+ 
+   /** test addBlock(..) when replication<min and excludeNodes==null. */
++  @Test
+   public void testFileCreationError3() throws IOException {
+     System.out.println("testFileCreationError3 start");
+     Configuration conf = new HdfsConfiguration();
+@@ -626,6 +650,7 @@ public class TestFileCreation extends junit.framework.TestCase {
+   /**
+    * Test that all open files are closed when client dies abnormally.
+    */
++  @Test
+   public void testDFSClientDeath() throws IOException, InterruptedException {
+     Configuration conf = new HdfsConfiguration();
+     System.out.println("Testing adbornal client death.");
+@@ -662,6 +687,7 @@ public class TestFileCreation extends junit.framework.TestCase {
+   /**
+    * Test file creation using createNonRecursive().
+    */
++  @Test
+   public void testFileCreationNonRecursive() throws IOException {
+     Configuration conf = new HdfsConfiguration();
+     if (simulatedStorage) {
+@@ -756,6 +782,7 @@ public class TestFileCreation extends junit.framework.TestCase {
+ /**
+  * Test that file data becomes available before file is closed.
+  */
++  @Test
+   public void testFileCreationSimulated() throws IOException {
+     simulatedStorage = true;
+     testFileCreation();
+@@ -765,6 +792,7 @@ public class TestFileCreation extends junit.framework.TestCase {
+   /**
+    * Test creating two files at the same time. 
+    */
++  @Test
+   public void testConcurrentFileCreation() throws IOException {
+     Configuration conf = new HdfsConfiguration();
+     MiniDFSCluster cluster = new MiniDFSCluster.Builder(conf).build();
+@@ -797,6 +825,7 @@ public class TestFileCreation extends junit.framework.TestCase {
+   /**
+    * Test creating a file whose data gets sync when closed
+    */
++  @Test
+   public void testFileCreationSyncOnClose() throws IOException {
+     Configuration conf = new HdfsConfiguration();
+     conf.setBoolean(DFS_DATANODE_SYNCONCLOSE_KEY, true);
+@@ -832,6 +861,7 @@ public class TestFileCreation extends junit.framework.TestCase {
+    * Then change lease period and wait for lease recovery.
+    * Finally, read the block directly from each Datanode and verify the content.
+    */
++  @Test
+   public void testLeaseExpireHardLimit() throws Exception {
+     System.out.println("testLeaseExpireHardLimit start");
+     final long leasePeriod = 1000;
+@@ -895,6 +925,7 @@ public class TestFileCreation extends junit.framework.TestCase {
+   }
+ 
+   // test closing file system before all file handles are closed.
++  @Test
+   public void testFsClose() throws Exception {
+     System.out.println("test file system close start");
+     final int DATANODE_NUM = 3;
+@@ -923,6 +954,7 @@ public class TestFileCreation extends junit.framework.TestCase {
+   }
+ 
+   // test closing file after cluster is shutdown
++  @Test
+   public void testFsCloseAfterClusterShutdown() throws IOException {
+     System.out.println("test testFsCloseAfterClusterShutdown start");
+     final int DATANODE_NUM = 3;
+@@ -967,4 +999,93 @@ public class TestFileCreation extends junit.framework.TestCase {
+       }
+     }
+   }
++
++  /**
++   * Regression test for HDFS-3626. Creates a file using a non-canonical path
++   * (i.e. with extra slashes between components) and makes sure that the NN
++   * can properly restart.
++   * 
++   * This test RPCs directly to the NN, to ensure that even an old client
++   * which passes an invalid path won't cause corrupt edits.
++   */
++  @Test
++  public void testCreateNonCanonicalPathAndRestartRpc() throws Exception {
++    doCreateTest(CreationMethod.DIRECT_NN_RPC);
++  }
++  
++  /**
++   * Another regression test for HDFS-3626. This one creates files using
++   * a Path instantiated from a string object.
++   */
++  @Test
++  public void testCreateNonCanonicalPathAndRestartFromString()
++      throws Exception {
++    doCreateTest(CreationMethod.PATH_FROM_STRING);
++  }
++
++  /**
++   * Another regression test for HDFS-3626. This one creates files using
++   * a Path instantiated from a URI object.
++   */
++  @Test
++  public void testCreateNonCanonicalPathAndRestartFromUri()
++      throws Exception {
++    doCreateTest(CreationMethod.PATH_FROM_URI);
++  }
++  
++  private static enum CreationMethod {
++    DIRECT_NN_RPC,
++    PATH_FROM_URI,
++    PATH_FROM_STRING
++  };
++  private void doCreateTest(CreationMethod method) throws Exception {
++    Configuration conf = new HdfsConfiguration();
++    MiniDFSCluster cluster = new MiniDFSCluster.Builder(conf)
++        .numDataNodes(1).build();
++    try {
++      FileSystem fs = cluster.getFileSystem();
++      NamenodeProtocols nnrpc = cluster.getNameNodeRpc();
++
++      for (String pathStr : NON_CANONICAL_PATHS) {
++        System.out.println("Creating " + pathStr + " by " + method);
++        switch (method) {
++        case DIRECT_NN_RPC:
++          try {
++            nnrpc.create(pathStr, new FsPermission((short)0755), "client",
++                new EnumSetWritable<CreateFlag>(EnumSet.of(CreateFlag.CREATE)),
++                true, (short)1, 128*1024*1024L);
++            fail("Should have thrown exception when creating '"
++                + pathStr + "'" + " by " + method);
++          } catch (InvalidPathException ipe) {
++            // When we create by direct NN RPC, the NN just rejects the
++            // non-canonical paths, rather than trying to normalize them.
++            // So, we expect all of them to fail. 
++          }
++          break;
++          
++        case PATH_FROM_URI:
++        case PATH_FROM_STRING:
++          // Unlike the above direct-to-NN case, we expect these to succeed,
++          // since the Path constructor should normalize the path.
++          Path p;
++          if (method == CreationMethod.PATH_FROM_URI) {
++            p = new Path(new URI(fs.getUri() + pathStr));
++          } else {
++            p = new Path(fs.getUri() + pathStr);  
++          }
++          FSDataOutputStream stm = fs.create(p);
++          IOUtils.closeStream(stm);
++          break;
++        default:
++          throw new AssertionError("bad method: " + method);
++        }
++      }
++      
++      cluster.restartNameNode();
++
++    } finally {
++      cluster.shutdown();
++    }
++  }
++
+ }
+-- 
+1.7.0.4
+

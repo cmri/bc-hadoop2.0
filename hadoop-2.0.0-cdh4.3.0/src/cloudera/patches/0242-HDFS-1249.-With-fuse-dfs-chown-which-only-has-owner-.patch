@@ -1,0 +1,167 @@
+From 7f3fab9b9b1b5f714a83eec8f45043bcbc75ef9b Mon Sep 17 00:00:00 2001
+From: Eli Collins <eli@apache.org>
+Date: Thu, 19 Jul 2012 18:37:47 +0000
+Subject: [PATCH 0242/1357] HDFS-1249. With fuse-dfs, chown which only has owner (or only group) argument fails with Input/output error. Contributed by Colin Patrick McCabe
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1363466 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 4533dd219fdc4f2fe1115df237901bfdfb4b055f)
+---
+ .../src/main/native/fuse-dfs/fuse_impls_chown.c    |   34 ++++++++++++-------
+ .../hadoop-hdfs/src/main/native/libhdfs/hdfs.c     |    8 ++---
+ .../hadoop-hdfs/src/main/native/libhdfs/hdfs.h     |   18 ++++++-----
+ .../main/native/libhdfs/test_libhdfs_threaded.c    |   23 +++++++++++++
+ 4 files changed, 57 insertions(+), 26 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/native/fuse-dfs/fuse_impls_chown.c b/hadoop-hdfs-project/hadoop-hdfs/src/main/native/fuse-dfs/fuse_impls_chown.c
+index 9c6105d..a14ca71 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/native/fuse-dfs/fuse_impls_chown.c
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/native/fuse-dfs/fuse_impls_chown.c
+@@ -40,19 +40,26 @@ int dfs_chown(const char *path, uid_t uid, gid_t gid)
+   assert(dfs);
+   assert('/' == *path);
+ 
+-  user = getUsername(uid);
+-  if (NULL == user) {
+-    ERROR("Could not lookup the user id string %d",(int)uid); 
+-    ret = -EIO;
++  if ((uid == -1) && (gid == -1)) {
++    ret = 0;
+     goto cleanup;
+   }
+-
+-  group = getGroup(gid);
+-  if (group == NULL) {
+-    ERROR("Could not lookup the group id string %d",(int)gid);
+-    ret = -EIO;
+-    goto cleanup;
+-  } 
++  if (uid != -1) {
++    user = getUsername(uid);
++    if (NULL == user) {
++      ERROR("Could not lookup the user id string %d",(int)uid);
++      ret = -EIO;
++      goto cleanup;
++    }
++  }
++  if (gid != -1) {
++    group = getGroup(gid);
++    if (group == NULL) {
++      ERROR("Could not lookup the group id string %d",(int)gid);
++      ret = -EIO;
++      goto cleanup;
++    }
++  }
+ 
+   userFS = doConnectAsUser(dfs->nn_uri, dfs->nn_port);
+   if (userFS == NULL) {
+@@ -62,8 +69,9 @@ int dfs_chown(const char *path, uid_t uid, gid_t gid)
+   }
+ 
+   if (hdfsChown(userFS, path, user, group)) {
+-    ERROR("Could not chown %s to %d:%d", path, (int)uid, gid);
+-    ret = (errno > 0) ? -errno : -EIO;
++    ret = errno;
++    ERROR("Could not chown %s to %d:%d: error %d", path, (int)uid, gid, ret);
++    ret = (ret > 0) ? -ret : -EIO;
+     goto cleanup;
+   }
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/hdfs.c b/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/hdfs.c
+index 3d0f7e0..eba2bf1 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/hdfs.c
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/hdfs.c
+@@ -1811,9 +1811,7 @@ int hdfsChown(hdfsFS fs, const char* path, const char *owner, const char *group)
+     }
+ 
+     if (owner == NULL && group == NULL) {
+-      fprintf(stderr, "Both owner and group cannot be null in chown");
+-      errno = EINVAL;
+-      return -1;
++      return 0;
+     }
+ 
+     jobject jFS = (jobject)fs;
+@@ -1823,8 +1821,8 @@ int hdfsChown(hdfsFS fs, const char* path, const char *owner, const char *group)
+         return -1;
+     }
+ 
+-    jstring jOwnerString = (*env)->NewStringUTF(env, owner); 
+-    jstring jGroupString = (*env)->NewStringUTF(env, group); 
++    jstring jOwnerString = owner ? (*env)->NewStringUTF(env, owner) : NULL;
++    jstring jGroupString = group ? (*env)->NewStringUTF(env, group) : NULL;
+ 
+     //Create the directory
+     int ret = 0;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/hdfs.h b/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/hdfs.h
+index 8da21ab..5c3c6df 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/hdfs.h
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/hdfs.h
+@@ -556,14 +556,16 @@ extern  "C" {
+     tOffset hdfsGetUsed(hdfsFS fs);
+ 
+     /** 
+-     * hdfsChown 
+-     * @param fs The configured filesystem handle.
+-     * @param path the path to the file or directory
+-     * @param owner this is a string in Hadoop land. Set to null or "" if only setting group
+-     * @param group  this is a string in Hadoop land. Set to null or "" if only setting user
+-     * @return 0 on success else -1
+-     */
+-    int hdfsChown(hdfsFS fs, const char* path, const char *owner, const char *group);
++     * Change the user and/or group of a file or directory.
++     *
++     * @param fs            The configured filesystem handle.
++     * @param path          the path to the file or directory
++     * @param owner         User string.  Set to NULL for 'no change'
++     * @param group         Group string.  Set to NULL for 'no change'
++     * @return              0 on success else -1
++     */
++    int hdfsChown(hdfsFS fs, const char* path, const char *owner,
++                  const char *group);
+ 
+     /** 
+      * hdfsChmod
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/test_libhdfs_threaded.c b/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/test_libhdfs_threaded.c
+index e96daa9..f415957 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/test_libhdfs_threaded.c
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/test_libhdfs_threaded.c
+@@ -67,6 +67,7 @@ static int doTestHdfsOperations(struct tlhThreadInfo *ti, hdfsFS fs)
+     char prefix[256], tmp[256];
+     hdfsFile file;
+     int ret, expected;
++    hdfsFileInfo *fileInfo;
+ 
+     snprintf(prefix, sizeof(prefix), "/tlhData%04d", ti->threadIdx);
+ 
+@@ -120,6 +121,28 @@ static int doTestHdfsOperations(struct tlhThreadInfo *ti, hdfsFS fs)
+     // TODO: Non-recursive delete should fail?
+     //EXPECT_NONZERO(hdfsDelete(fs, prefix, 0));
+ 
++    snprintf(tmp, sizeof(tmp), "%s/file", prefix);
++    EXPECT_ZERO(hdfsChown(fs, tmp, NULL, NULL));
++    EXPECT_ZERO(hdfsChown(fs, tmp, NULL, "doop"));
++    fileInfo = hdfsGetPathInfo(fs, tmp);
++    EXPECT_NONNULL(fileInfo);
++    EXPECT_ZERO(strcmp("doop", fileInfo->mGroup));
++    hdfsFreeFileInfo(fileInfo, 1);
++
++    EXPECT_ZERO(hdfsChown(fs, tmp, "ha", "doop2"));
++    fileInfo = hdfsGetPathInfo(fs, tmp);
++    EXPECT_NONNULL(fileInfo);
++    EXPECT_ZERO(strcmp("ha", fileInfo->mOwner));
++    EXPECT_ZERO(strcmp("doop2", fileInfo->mGroup));
++    hdfsFreeFileInfo(fileInfo, 1);
++
++    EXPECT_ZERO(hdfsChown(fs, tmp, "ha2", NULL));
++    fileInfo = hdfsGetPathInfo(fs, tmp);
++    EXPECT_NONNULL(fileInfo);
++    EXPECT_ZERO(strcmp("ha2", fileInfo->mOwner));
++    EXPECT_ZERO(strcmp("doop2", fileInfo->mGroup));
++    hdfsFreeFileInfo(fileInfo, 1);
++
+     EXPECT_ZERO(hdfsDelete(fs, prefix, 1));
+     return 0;
+ }
+-- 
+1.7.0.4
+

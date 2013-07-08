@@ -1,0 +1,437 @@
+From d8e6f39392664fcc2d3a4daefb14e6069b65746c Mon Sep 17 00:00:00 2001
+From: Todd Lipcon <todd@cloudera.com>
+Date: Mon, 21 May 2012 09:55:12 -0700
+Subject: [PATCH 0072/1357] HDFS-3438. BootstrapStandby should not require a rollEdits on active node. Contributed by Todd Lipcon.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1340343 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit be031272816764176bbbd5fbc3befdf3767b657f)
+(cherry picked from commit cc4790f7915d774798c3fc783aaa5feebee8009e)
+---
+ .../NamenodeProtocolServerSideTranslatorPB.java    |   16 ++++
+ .../protocolPB/NamenodeProtocolTranslatorPB.java   |   11 +++
+ .../hdfs/server/namenode/NameNodeRpcServer.java    |   14 ++-
+ .../hdfs/server/namenode/ha/BootstrapStandby.java  |   89 +++++---------------
+ .../hdfs/server/protocol/NamenodeProtocol.java     |    8 ++-
+ .../src/main/proto/NamenodeProtocol.proto          |   18 ++++-
+ .../server/namenode/ha/TestBootstrapStandby.java   |   26 +++---
+ 7 files changed, 94 insertions(+), 88 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/NamenodeProtocolServerSideTranslatorPB.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/NamenodeProtocolServerSideTranslatorPB.java
+index bcb344d..c3466e1 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/NamenodeProtocolServerSideTranslatorPB.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/NamenodeProtocolServerSideTranslatorPB.java
+@@ -32,6 +32,8 @@ import org.apache.hadoop.hdfs.protocol.proto.NamenodeProtocolProtos.GetBlocksReq
+ import org.apache.hadoop.hdfs.protocol.proto.NamenodeProtocolProtos.GetBlocksResponseProto;
+ import org.apache.hadoop.hdfs.protocol.proto.NamenodeProtocolProtos.GetEditLogManifestRequestProto;
+ import org.apache.hadoop.hdfs.protocol.proto.NamenodeProtocolProtos.GetEditLogManifestResponseProto;
++import org.apache.hadoop.hdfs.protocol.proto.NamenodeProtocolProtos.GetMostRecentCheckpointTxIdRequestProto;
++import org.apache.hadoop.hdfs.protocol.proto.NamenodeProtocolProtos.GetMostRecentCheckpointTxIdResponseProto;
+ import org.apache.hadoop.hdfs.protocol.proto.NamenodeProtocolProtos.GetTransactionIdRequestProto;
+ import org.apache.hadoop.hdfs.protocol.proto.NamenodeProtocolProtos.GetTransactionIdResponseProto;
+ import org.apache.hadoop.hdfs.protocol.proto.NamenodeProtocolProtos.RegisterRequestProto;
+@@ -104,6 +106,20 @@ public class NamenodeProtocolServerSideTranslatorPB implements
+     }
+     return GetTransactionIdResponseProto.newBuilder().setTxId(txid).build();
+   }
++  
++  @Override
++  public GetMostRecentCheckpointTxIdResponseProto getMostRecentCheckpointTxId(
++      RpcController unused, GetMostRecentCheckpointTxIdRequestProto request)
++      throws ServiceException {
++    long txid;
++    try {
++      txid = impl.getMostRecentCheckpointTxId();
++    } catch (IOException e) {
++      throw new ServiceException(e);
++    }
++    return GetMostRecentCheckpointTxIdResponseProto.newBuilder().setTxId(txid).build();
++  }
++
+ 
+   @Override
+   public RollEditLogResponseProto rollEditLog(RpcController unused,
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/NamenodeProtocolTranslatorPB.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/NamenodeProtocolTranslatorPB.java
+index b802457..f48e994 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/NamenodeProtocolTranslatorPB.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/NamenodeProtocolTranslatorPB.java
+@@ -31,6 +31,7 @@ import org.apache.hadoop.hdfs.protocol.proto.NamenodeProtocolProtos.ErrorReportR
+ import org.apache.hadoop.hdfs.protocol.proto.NamenodeProtocolProtos.GetBlockKeysRequestProto;
+ import org.apache.hadoop.hdfs.protocol.proto.NamenodeProtocolProtos.GetBlocksRequestProto;
+ import org.apache.hadoop.hdfs.protocol.proto.NamenodeProtocolProtos.GetEditLogManifestRequestProto;
++import org.apache.hadoop.hdfs.protocol.proto.NamenodeProtocolProtos.GetMostRecentCheckpointTxIdRequestProto;
+ import org.apache.hadoop.hdfs.protocol.proto.NamenodeProtocolProtos.GetTransactionIdRequestProto;
+ import org.apache.hadoop.hdfs.protocol.proto.NamenodeProtocolProtos.RegisterRequestProto;
+ import org.apache.hadoop.hdfs.protocol.proto.NamenodeProtocolProtos.RollEditLogRequestProto;
+@@ -120,6 +121,16 @@ public class NamenodeProtocolTranslatorPB implements NamenodeProtocol,
+   }
+ 
+   @Override
++  public long getMostRecentCheckpointTxId() throws IOException {
++    try {
++      return rpcProxy.getMostRecentCheckpointTxId(NULL_CONTROLLER,
++          GetMostRecentCheckpointTxIdRequestProto.getDefaultInstance()).getTxId();
++    } catch (ServiceException e) {
++      throw ProtobufHelper.getRemoteException(e);
++    }
++  }
++
++  @Override
+   public CheckpointSignature rollEditLog() throws IOException {
+     try {
+       return PBHelper.convert(rpcProxy.rollEditLog(NULL_CONTROLLER,
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java
+index 46271d3..d699693 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java
+@@ -50,8 +50,6 @@ import org.apache.hadoop.ha.protocolPB.HAServiceProtocolServerSideTranslatorPB;
+ import org.apache.hadoop.hdfs.DFSConfigKeys;
+ import org.apache.hadoop.hdfs.DFSUtil;
+ import org.apache.hadoop.hdfs.HDFSPolicyProvider;
+-import org.apache.hadoop.hdfs.HdfsConfiguration;
+-import org.apache.hadoop.hdfs.protocol.Block;
+ import org.apache.hadoop.hdfs.protocol.BlockListAsLongs;
+ import org.apache.hadoop.hdfs.protocol.CorruptFileBlocks;
+ import org.apache.hadoop.hdfs.protocol.DatanodeID;
+@@ -713,10 +711,16 @@ class NameNodeRpcServer implements NamenodeProtocols {
+ 
+   @Override // NamenodeProtocol
+   public long getTransactionID() throws IOException {
+-    namesystem.checkOperation(OperationCategory.CHECKPOINT);
+-    return namesystem.getEditLog().getSyncTxId();
++    namesystem.checkOperation(OperationCategory.UNCHECKED);
++    return namesystem.getFSImage().getLastAppliedOrWrittenTxId();
+   }
+-
++  
++  @Override // NamenodeProtocol
++  public long getMostRecentCheckpointTxId() throws IOException {
++    namesystem.checkOperation(OperationCategory.UNCHECKED);
++    return namesystem.getFSImage().getMostRecentCheckpointTxId();
++  }
++  
+   @Override // NamenodeProtocol
+   public CheckpointSignature rollEditLog() throws IOException {
+     return namesystem.rollEditLog();
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/BootstrapStandby.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/BootstrapStandby.java
+index e76de8b..da09fff 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/BootstrapStandby.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/BootstrapStandby.java
+@@ -33,18 +33,10 @@ import org.apache.hadoop.HadoopIllegalArgumentException;
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.conf.Configurable;
+ import org.apache.hadoop.conf.Configuration;
+-import org.apache.hadoop.ha.HAServiceProtocol;
+-import org.apache.hadoop.ha.HAServiceStatus;
+-import org.apache.hadoop.ha.HAServiceProtocol.HAServiceState;
+-import org.apache.hadoop.ha.HAServiceProtocol.RequestSource;
+-import org.apache.hadoop.ha.HAServiceProtocol.StateChangeRequestInfo;
+-import org.apache.hadoop.ha.ServiceFailedException;
+ import org.apache.hadoop.hdfs.DFSUtil;
+ import org.apache.hadoop.hdfs.HAUtil;
+-import org.apache.hadoop.hdfs.HdfsConfiguration;
+ import org.apache.hadoop.hdfs.NameNodeProxies;
+ import org.apache.hadoop.hdfs.protocol.HdfsConstants;
+-import org.apache.hadoop.hdfs.server.namenode.CheckpointSignature;
+ import org.apache.hadoop.hdfs.server.namenode.EditLogInputStream;
+ import org.apache.hadoop.hdfs.server.namenode.FSImage;
+ import org.apache.hadoop.hdfs.server.namenode.FSNamesystem;
+@@ -54,10 +46,8 @@ import org.apache.hadoop.hdfs.server.namenode.TransferFsImage;
+ import org.apache.hadoop.hdfs.server.protocol.NamenodeProtocol;
+ import org.apache.hadoop.hdfs.server.protocol.NamespaceInfo;
+ import org.apache.hadoop.hdfs.tools.DFSHAAdmin;
+-import org.apache.hadoop.hdfs.tools.NNHAServiceTarget;
+ import org.apache.hadoop.io.IOUtils;
+ import org.apache.hadoop.io.MD5Hash;
+-import org.apache.hadoop.security.AccessControlException;
+ import org.apache.hadoop.security.SecurityUtil;
+ import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.util.Tool;
+@@ -92,7 +82,7 @@ public class BootstrapStandby implements Tool, Configurable {
+   // Exit/return codes.
+   static final int ERR_CODE_FAILED_CONNECT = 2;
+   static final int ERR_CODE_INVALID_VERSION = 3;
+-  static final int ERR_CODE_OTHER_NN_NOT_ACTIVE = 4;
++  // Skip 4 - was used in previous versions, but no longer returned.
+   static final int ERR_CODE_ALREADY_FORMATTED = 5;
+   static final int ERR_CODE_LOGS_UNAVAILABLE = 6; 
+ 
+@@ -144,12 +134,6 @@ public class BootstrapStandby implements Tool, Configurable {
+         .getProxy();
+   }
+   
+-  private HAServiceProtocol createHAProtocolProxy()
+-      throws IOException {
+-    return new NNHAServiceTarget(new HdfsConfiguration(conf), nsId, otherNNId)
+-        .getProxy(conf, 15000);
+-  }
+-
+   private int doRun() throws IOException {
+ 
+     NamenodeProtocol proxy = createNNProtocolProxy();
+@@ -186,29 +170,6 @@ public class BootstrapStandby implements Tool, Configurable {
+         "           Layout version: " + nsInfo.getLayoutVersion() + "\n" +
+         "=====================================================");
+ 
+-    // Ensure the other NN is active - we can't force it to roll edit logs
+-    // below if it's not active.
+-    if (!isOtherNNActive()) {
+-      String err = "NameNode " + nsId + "." + nnId + " at " + otherIpcAddr +
+-          " is not currently in ACTIVE state.";
+-      if (!interactive) {
+-        LOG.fatal(err + " Please transition it to " +
+-            "active before attempting to bootstrap a standby node.");
+-        return ERR_CODE_OTHER_NN_NOT_ACTIVE;
+-      }
+-      
+-      System.err.println(err);
+-      if (ToolRunner.confirmPrompt(
+-            "Do you want to automatically transition it to active now?")) {
+-        transitionOtherNNActive();
+-      } else {
+-        LOG.fatal("User aborted. Exiting without bootstrapping standby.");
+-        return ERR_CODE_OTHER_NN_NOT_ACTIVE;
+-      }
+-    }
+-    
+-
+-    
+     // Check with the user before blowing away data.
+     if (!NameNode.confirmFormat(
+             Sets.union(Sets.newHashSet(dirsToFormat),
+@@ -216,13 +177,10 @@ public class BootstrapStandby implements Tool, Configurable {
+             force, interactive)) {
+       return ERR_CODE_ALREADY_FORMATTED;
+     }
+-
+-    // Force the active to roll its log
+-    CheckpointSignature csig = proxy.rollEditLog();
+-    long imageTxId = csig.getMostRecentCheckpointTxId();
+-    long rollTxId = csig.getCurSegmentTxId();
+-
+-
++    
++    long imageTxId = proxy.getMostRecentCheckpointTxId();
++    long curTxId = proxy.getTransactionID();
++    
+     // Format the storage (writes VERSION file)
+     NNStorage storage = new NNStorage(conf, dirsToFormat, editUrisToFormat);
+     storage.format(nsInfo);
+@@ -235,11 +193,11 @@ public class BootstrapStandby implements Tool, Configurable {
+     
+     // Ensure that we have enough edits already in the shared directory to
+     // start up from the last checkpoint on the active.
+-    if (!checkLogsAvailableForRead(image, imageTxId, rollTxId)) {
++    if (!checkLogsAvailableForRead(image, imageTxId, curTxId)) {
+       return ERR_CODE_LOGS_UNAVAILABLE;
+     }
+     
+-    image.getStorage().writeTransactionIdFileToStorage(rollTxId);
++    image.getStorage().writeTransactionIdFileToStorage(curTxId);
+ 
+     // Download that checkpoint into our storage directories.
+     MD5Hash hash = TransferFsImage.downloadImageToStorage(
+@@ -250,32 +208,31 @@ public class BootstrapStandby implements Tool, Configurable {
+   }
+ 
+   
+-  private void transitionOtherNNActive()
+-      throws AccessControlException, ServiceFailedException, IOException {
+-    LOG.info("Transitioning the running namenode to active...");
+-    createHAProtocolProxy().transitionToActive(
+-        new StateChangeRequestInfo(RequestSource.REQUEST_BY_USER));
+-    LOG.info("Successful");
+-  }
+-
+   private boolean checkLogsAvailableForRead(FSImage image, long imageTxId,
+-      long rollTxId) {
+-    
++      long curTxIdOnOtherNode) {
++
++    if (imageTxId == curTxIdOnOtherNode) {
++      // The other node hasn't written any logs since the last checkpoint.
++      // This can be the case if the NN was freshly formatted as HA, and
++      // then started in standby mode, so it has no edit logs at all.
++      return true;
++    }
+     long firstTxIdInLogs = imageTxId + 1;
+-    long lastTxIdInLogs = rollTxId - 1;
+-    assert lastTxIdInLogs >= firstTxIdInLogs;
++    
++    assert curTxIdOnOtherNode >= firstTxIdInLogs :
++      "first=" + firstTxIdInLogs + " onOtherNode=" + curTxIdOnOtherNode;
+     
+     try {
+       Collection<EditLogInputStream> streams =
+         image.getEditLog().selectInputStreams(
+-          firstTxIdInLogs, lastTxIdInLogs, false);
++          firstTxIdInLogs, curTxIdOnOtherNode, true);
+       for (EditLogInputStream stream : streams) {
+         IOUtils.closeStream(stream);
+       }
+       return true;
+     } catch (IOException e) {
+       String msg = "Unable to read transaction ids " +
+-          firstTxIdInLogs + "-" + lastTxIdInLogs +
++          firstTxIdInLogs + "-" + curTxIdOnOtherNode +
+           " from the configured shared edits storage " +
+           Joiner.on(",").join(sharedEditsUris) + ". " +
+           "Please copy these logs into the shared edits storage " + 
+@@ -294,12 +251,6 @@ public class BootstrapStandby implements Tool, Configurable {
+     return (nsInfo.getLayoutVersion() == HdfsConstants.LAYOUT_VERSION);
+   }
+   
+-  private boolean isOtherNNActive()
+-      throws AccessControlException, IOException {
+-    HAServiceStatus status = createHAProtocolProxy().getServiceStatus();
+-    return status.getState() == HAServiceState.ACTIVE;
+-  }
+-
+   private void parseConfAndFindOtherNN() throws IOException {
+     Configuration conf = getConf();
+     nsId = DFSUtil.getNamenodeNameServiceId(conf);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/protocol/NamenodeProtocol.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/protocol/NamenodeProtocol.java
+index d1a40c6..96b502b 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/protocol/NamenodeProtocol.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/protocol/NamenodeProtocol.java
+@@ -87,12 +87,18 @@ public interface NamenodeProtocol {
+ 
+   /**
+    * @return The most recent transaction ID that has been synced to
+-   * persistent storage.
++   * persistent storage, or applied from persistent storage in the
++   * case of a non-active node.
+    * @throws IOException
+    */
+   public long getTransactionID() throws IOException;
+ 
+   /**
++   * Get the transaction ID of the most recent checkpoint.
++   */
++  public long getMostRecentCheckpointTxId() throws IOException;
++
++  /**
+    * Closes the current edit log and opens a new one. The 
+    * call fails if the file system is in SafeMode.
+    * @throws IOException
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/NamenodeProtocol.proto b/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/NamenodeProtocol.proto
+index e1ddcf0..c54771b 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/NamenodeProtocol.proto
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/NamenodeProtocol.proto
+@@ -85,6 +85,16 @@ message RollEditLogResponseProto {
+ }
+ 
+ /**
++ * void request
++ */
++message GetMostRecentCheckpointTxIdRequestProto {
++}
++
++message GetMostRecentCheckpointTxIdResponseProto{
++  required uint64 txId = 1;
++}
++
++/**
+  * registration - Namenode reporting the error
+  * errorCode - error code indicating the error
+  * msg - Free text description of the error
+@@ -189,12 +199,18 @@ service NamenodeProtocolService {
+       returns(GetTransactionIdResponseProto);
+ 
+   /**
++   * Get the transaction ID of the most recently persisted editlog record
++   */
++  rpc getMostRecentCheckpointTxId(GetMostRecentCheckpointTxIdRequestProto) 
++      returns(GetMostRecentCheckpointTxIdResponseProto);
++
++  /**
+    * Close the current editlog and open a new one for checkpointing purposes
+    */
+   rpc rollEditLog(RollEditLogRequestProto) returns(RollEditLogResponseProto);
+ 
+   /**
+-   * Close the current editlog and open a new one for checkpointing purposes
++   * Request info about the version running on this NameNode
+    */
+   rpc versionRequest(VersionRequestProto) returns(VersionResponseProto);
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestBootstrapStandby.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestBootstrapStandby.java
+index b26e85a..4f93f4f 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestBootstrapStandby.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestBootstrapStandby.java
+@@ -23,6 +23,7 @@ import java.io.IOException;
+ import java.net.URI;
+ import java.util.Collections;
+ import java.util.List;
++import java.util.Set;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+@@ -35,6 +36,7 @@ import org.apache.hadoop.hdfs.server.namenode.FSImageTestUtil;
+ import org.apache.hadoop.hdfs.server.namenode.NNStorage;
+ import org.apache.hadoop.hdfs.server.namenode.NameNode;
+ import org.apache.hadoop.hdfs.server.namenode.NameNodeAdapter;
++import org.apache.hadoop.hdfs.server.namenode.NamenodeFsck;
+ import org.apache.hadoop.test.GenericTestUtils;
+ import org.apache.hadoop.test.GenericTestUtils.LogCapturer;
+ import org.junit.After;
+@@ -43,6 +45,7 @@ import org.junit.Test;
+ 
+ import com.google.common.base.Suppliers;
+ import com.google.common.collect.ImmutableList;
++import com.google.common.collect.ImmutableSet;
+ import com.google.common.collect.Lists;
+ 
+ import static org.junit.Assert.*;
+@@ -177,7 +180,7 @@ public class TestBootstrapStandby {
+       logs.stopCapturing();
+     }
+     GenericTestUtils.assertMatches(logs.getOutput(),
+-        "FATAL.*Unable to read transaction ids 1-4 from the configured shared");
++        "FATAL.*Unable to read transaction ids 1-3 from the configured shared");
+   }
+   
+   @Test
+@@ -195,30 +198,29 @@ public class TestBootstrapStandby {
+     assertEquals(0, rc);
+   }
+   
++  /**
++   * Test that, even if the other node is not active, we are able
++   * to bootstrap standby from it.
++   */
+   @Test(timeout=30000)
+   public void testOtherNodeNotActive() throws Exception {
+     cluster.transitionToStandby(0);
+     int rc = BootstrapStandby.run(
+-        new String[]{"-nonInteractive"},
+-        cluster.getConfiguration(1));
+-    assertEquals(BootstrapStandby.ERR_CODE_OTHER_NN_NOT_ACTIVE, rc);
+-    
+-    // Answer "yes" to the prompt about transition to active
+-    System.setIn(new ByteArrayInputStream("yes\n".getBytes()));
+-    rc = BootstrapStandby.run(
+         new String[]{"-force"},
+         cluster.getConfiguration(1));
+     assertEquals(0, rc);
+-    
+-    assertFalse(nn0.getNamesystem().isInStandbyState());
+   }
+-
++  
+   private void assertNNFilesMatch() throws Exception {
+     List<File> curDirs = Lists.newArrayList();
+     curDirs.addAll(FSImageTestUtil.getNameNodeCurrentDirs(cluster, 0));
+     curDirs.addAll(FSImageTestUtil.getNameNodeCurrentDirs(cluster, 1));
++    
++    // Ignore seen_txid file, since the newly bootstrapped standby
++    // will have a higher seen_txid than the one it bootstrapped from.
++    Set<String> ignoredFiles = ImmutableSet.of("seen_txid");
+     FSImageTestUtil.assertParallelFilesAreIdentical(curDirs,
+-        Collections.<String>emptySet());
++        ignoredFiles);
+   }
+ 
+   private void removeStandbyNameDirs() {
+-- 
+1.7.0.4
+

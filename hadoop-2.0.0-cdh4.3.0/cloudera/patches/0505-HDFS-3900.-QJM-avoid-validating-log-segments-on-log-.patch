@@ -1,0 +1,216 @@
+From eeada587be09651f437afad57d5ffea160c3ed66 Mon Sep 17 00:00:00 2001
+From: Todd Lipcon <todd@apache.org>
+Date: Mon, 10 Sep 2012 18:53:41 +0000
+Subject: [PATCH 0505/1357] HDFS-3900. QJM: avoid validating log segments on log rolls. Contributed by Todd Lipcon.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-3077@1383041 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 9d7c43aa8d8d718e921f6f2fcb72928d1a8676c4)
+---
+ .../hadoop-hdfs/CHANGES.HDFS-3077.txt              |    2 +
+ .../hadoop/hdfs/qjournal/server/Journal.java       |   84 ++++++++++++-------
+ .../hadoop/hdfs/qjournal/server/TestJournal.java   |    4 +-
+ 3 files changed, 57 insertions(+), 33 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/CHANGES.HDFS-3077.txt b/hadoop-hdfs-project/hadoop-hdfs/CHANGES.HDFS-3077.txt
+index 0a47ee2..a2265c5 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/CHANGES.HDFS-3077.txt
++++ b/hadoop-hdfs-project/hadoop-hdfs/CHANGES.HDFS-3077.txt
+@@ -56,3 +56,5 @@ HDFS-3897. QJM: TestBlockToken fails after HDFS-3893. (atm)
+ HDFS-3898. QJM: enable TCP_NODELAY for IPC (todd)
+ 
+ HDFS-3885. QJM: optimize log sync when JN is lagging behind (todd)
++
++HDFS-3900. QJM: avoid validating log segments on log rolls (todd)
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/server/Journal.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/server/Journal.java
+index 99ba41b..38bb166 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/server/Journal.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/server/Journal.java
+@@ -144,17 +144,18 @@ class Journal implements Closeable {
+   }
+   
+   /**
+-   * Iterate over the edit logs stored locally, and set
+-   * {@link #curSegmentTxId} to refer to the most recently written
+-   * one.
++   * Scan the local storage directory, and return the segment containing
++   * the highest transaction.
++   * @return the EditLogFile with the highest transactions, or null
++   * if no files exist.
+    */
+-  private synchronized void scanStorage() throws IOException {
++  private synchronized EditLogFile scanStorageForLatestEdits() throws IOException {
+     if (!fjm.getStorageDirectory().getCurrentDir().exists()) {
+-      return;
++      return null;
+     }
++    
+     LOG.info("Scanning storage " + fjm);
+     List<EditLogFile> files = fjm.getLogFiles(0);
+-    curSegmentTxId = HdfsConstants.INVALID_TXID;
+     
+     while (!files.isEmpty()) {
+       EditLogFile latestLog = files.remove(files.size() - 1);
+@@ -166,10 +167,12 @@ class Journal implements Closeable {
+             "moving it aside and looking for previous log");
+         latestLog.moveAsideEmptyFile();
+       } else {
+-        curSegmentTxId = latestLog.getFirstTxId();
+-        break;
++        return latestLog;
+       }
+     }
++    
++    LOG.info("No files in " + fjm);
++    return null;
+   }
+ 
+   /**
+@@ -248,25 +251,30 @@ class Journal implements Closeable {
+     }
+     
+     lastPromisedEpoch.set(epoch);
+-    if (curSegment != null) {
+-      curSegment.close();
+-      curSegment = null;
+-      curSegmentTxId = HdfsConstants.INVALID_TXID;
+-    }
++    abortCurSegment();
+     
+     NewEpochResponseProto.Builder builder =
+         NewEpochResponseProto.newBuilder();
+ 
+-    // TODO: we only need to do this once, not on writer switchover.
+-    scanStorage();
++    EditLogFile latestFile = scanStorageForLatestEdits();
+ 
+-    if (curSegmentTxId != HdfsConstants.INVALID_TXID) {
+-      builder.setLastSegmentTxId(curSegmentTxId);
++    if (latestFile != null) {
++      builder.setLastSegmentTxId(latestFile.getFirstTxId());
+     }
+     
+     return builder.build();
+   }
+ 
++  private void abortCurSegment() throws IOException {
++    if (curSegment == null) {
++      return;
++    }
++    
++    curSegment.abort();
++    curSegment = null;
++    curSegmentTxId = HdfsConstants.INVALID_TXID;
++  }
++
+   /**
+    * Write a batch of edits to the journal.
+    * {@see QJournalProtocol#journal(RequestInfo, long, long, int, byte[])}
+@@ -287,11 +295,11 @@ class Journal implements Closeable {
+       // instead of rolling to a new one, which breaks one of the
+       // invariants in the design. If it happens, abort the segment
+       // and throw an exception.
+-      curSegment.abort();
+-      curSegment = null;
+-      throw new IllegalStateException(
++      JournalOutOfSyncException e = new JournalOutOfSyncException(
+           "Writer out of sync: it thinks it is writing segment " + segmentTxId
+           + " but current segment is " + curSegmentTxId);
++      abortCurSegment();
++      throw e;
+     }
+       
+     checkSync(nextTxId == firstTxnId,
+@@ -410,8 +418,7 @@ class Journal implements Closeable {
+       // The writer may have lost a connection to us and is now
+       // re-connecting after the connection came back.
+       // We should abort our own old segment.
+-      curSegment.abort();
+-      curSegment = null;
++      abortCurSegment();
+     }
+ 
+     // Paranoid sanity check: we should never overwrite a finalized log file.
+@@ -459,11 +466,23 @@ class Journal implements Closeable {
+     checkFormatted();
+     checkRequest(reqInfo);
+ 
++    boolean needsValidation = true;
++
++    // Finalizing the log that the writer was just writing.
+     if (startTxId == curSegmentTxId) {
+       if (curSegment != null) {
+         curSegment.close();
+         curSegment = null;
++        curSegmentTxId = HdfsConstants.INVALID_TXID;
+       }
++      
++      checkSync(nextTxId == endTxId + 1,
++          "Trying to finalize in-progress log segment %s to end at " +
++          "txid %s but only written up to txid %s",
++          startTxId, endTxId, nextTxId - 1);
++      // No need to validate the edit log if the client is finalizing
++      // the log segment that it was just writing to.
++      needsValidation = false;
+     }
+     
+     FileJournalManager.EditLogFile elf = fjm.getLogFile(startTxId);
+@@ -473,15 +492,16 @@ class Journal implements Closeable {
+     }
+ 
+     if (elf.isInProgress()) {
+-      // TODO: this is slow to validate when in non-recovery cases
+-      // we already know the length here!
+-
+-      LOG.info("Validating log about to be finalized: " + elf);
+-      elf.validateLog();
+-
+-      checkSync(elf.getLastTxId() == endTxId,
+-          "Trying to finalize log %s-%s, but current state of log " +
+-          "is %s", startTxId, endTxId, elf);
++      if (needsValidation) {
++        LOG.info("Validating log segment " + elf.getFile() + " about to be " +
++            "finalized");
++        elf.validateLog();
++  
++        checkSync(elf.getLastTxId() == endTxId,
++            "Trying to finalize in-progress log segment %s to end at " +
++            "txid %s but log %s on disk only contains up to txid %s",
++            startTxId, endTxId, elf.getFile(), elf.getLastTxId());
++      }
+       fjm.finalizeLogSegment(startTxId, endTxId);
+     } else {
+       Preconditions.checkArgument(endTxId == elf.getLastTxId(),
+@@ -599,6 +619,8 @@ class Journal implements Closeable {
+     checkFormatted();
+     checkRequest(reqInfo);
+     
++    abortCurSegment();
++    
+     PrepareRecoveryResponseProto.Builder builder =
+         PrepareRecoveryResponseProto.newBuilder();
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/qjournal/server/TestJournal.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/qjournal/server/TestJournal.java
+index 8577e1e..9579193 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/qjournal/server/TestJournal.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/qjournal/server/TestJournal.java
+@@ -222,7 +222,7 @@ public class TestJournal {
+       fail("did not fail to finalize");
+     } catch (JournalOutOfSyncException e) {
+       GenericTestUtils.assertExceptionContains(
+-          "but current state of log is", e);
++          "but only written up to txid 3", e);
+     }
+     
+     // Check that, even if we re-construct the journal by scanning the
+@@ -235,7 +235,7 @@ public class TestJournal {
+       fail("did not fail to finalize");
+     } catch (JournalOutOfSyncException e) {
+       GenericTestUtils.assertExceptionContains(
+-          "but current state of log is", e);
++          "disk only contains up to txid 3", e);
+     }
+   }
+   
+-- 
+1.7.0.4
+

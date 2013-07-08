@@ -1,0 +1,214 @@
+From 62882fd726d94e42191b06d3227bd8d284dd80ed Mon Sep 17 00:00:00 2001
+From: Thomas Graves <tgraves@apache.org>
+Date: Mon, 20 Aug 2012 15:36:51 +0000
+Subject: [PATCH 0648/1357] YARN-27. Failed refreshQueues due to misconfiguration prevents further refreshing of queues (Arun Murthy via tgraves)
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1375066 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 95d8ec004c178be4c7f72ab549fb5ab9bf7a79ce)
+---
+ .../resourcemanager/scheduler/QueueMetrics.java    |   40 ++++++++++++++++---
+ .../scheduler/TestQueueMetrics.java                |   41 +++++++++++++++++++-
+ .../scheduler/capacity/TestLeafQueue.java          |   26 +++++++++----
+ 3 files changed, 92 insertions(+), 15 deletions(-)
+
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/QueueMetrics.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/QueueMetrics.java
+index bd44fcf..1f74cc7 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/QueueMetrics.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/QueueMetrics.java
+@@ -26,6 +26,7 @@ import java.util.HashMap;
+ import java.util.Map;
+ 
+ import org.apache.hadoop.classification.InterfaceAudience;
++import org.apache.hadoop.classification.InterfaceAudience.Private;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.metrics2.MetricsCollector;
+ import org.apache.hadoop.metrics2.MetricsInfo;
+@@ -120,14 +121,41 @@ public class QueueMetrics implements MetricsSource {
+                     enableUserMetrics, conf);
+   }
+ 
+-  public static QueueMetrics forQueue(MetricsSystem ms, String queueName,
++  /**
++   * Helper method to clear cache - used only for unit tests.
++   */
++  @Private
++  public synchronized static void clearQueueMetrics() {
++    queueMetrics.clear();
++  }
++  
++  /**
++   * Simple metrics cache to help prevent re-registrations.
++   */
++  private static Map<String, QueueMetrics> queueMetrics =
++      new HashMap<String, QueueMetrics>();
++  
++  public synchronized 
++  static QueueMetrics forQueue(MetricsSystem ms, String queueName,
+                                       Queue parent, boolean enableUserMetrics,
+ 				      Configuration conf) {
+-    QueueMetrics metrics = 
+-      new QueueMetrics(ms, queueName, parent, enableUserMetrics, conf
+-		       ).tag(QUEUE_INFO, queueName);
+-    return ms == null ? metrics : ms.register(sourceName(queueName).toString(),
+-        "Metrics for queue: " + queueName, metrics);
++    QueueMetrics metrics = queueMetrics.get(queueName);
++    if (metrics == null) {
++      metrics =
++          new QueueMetrics(ms, queueName, parent, enableUserMetrics, conf).
++          tag(QUEUE_INFO, queueName);
++      
++      // Register with the MetricsSystems
++      if (ms != null) {
++        metrics = 
++            ms.register(
++                sourceName(queueName).toString(), 
++                "Metrics for queue: " + queueName, metrics);
++      }
++      queueMetrics.put(queueName, metrics);
++    }
++
++    return metrics;
+   }
+ 
+   public synchronized QueueMetrics getUserMetrics(String userName) {
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/TestQueueMetrics.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/TestQueueMetrics.java
+index 5ae32f6..6ef2950 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/TestQueueMetrics.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/TestQueueMetrics.java
+@@ -38,14 +38,22 @@ import org.apache.hadoop.yarn.server.resourcemanager.resource.Resource;
+ import org.apache.hadoop.yarn.server.resourcemanager.resource.Resources;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptState;
+ import org.apache.hadoop.yarn.util.BuilderUtils;
++import org.junit.Assert;
++import org.junit.Before;
+ import org.junit.Test;
+ 
+ public class TestQueueMetrics {
+   static final int GB = 1024; // MB
+   private static final Configuration conf = new Configuration();
+ 
+-  final MetricsSystem ms = new MetricsSystemImpl();
++  private MetricsSystem ms;
+ 
++  @Before
++  public void setUp() {
++    ms = new MetricsSystemImpl();
++    QueueMetrics.clearQueueMetrics();
++  }
++  
+   @Test public void testDefaultSingleQueueMetrics() {
+     String queueName = "single";
+     String user = "alice";
+@@ -226,6 +234,37 @@ public class TestQueueMetrics {
+     checkApps(userSource, 1, 0, 0, 1, 0, 0);
+     checkApps(parentUserSource, 1, 0, 0, 1, 0, 0);
+   }
++  
++  @Test 
++  public void testMetricsCache() {
++    MetricsSystem ms = new MetricsSystemImpl("cache");
++    
++    try {
++      String p1 = "root1";
++      String leafQueueName = "root1.leaf";
++      ms.start();
++
++      QueueMetrics p1Metrics =
++          QueueMetrics.forQueue(ms, p1, null, true, conf);
++      Queue parentQueue1 = make(stub(Queue.class).returning(p1Metrics).
++          from.getMetrics());
++      QueueMetrics metrics =
++          QueueMetrics.forQueue(ms, leafQueueName, parentQueue1, true, conf);
++
++      Assert.assertNotNull("QueueMetrics for A shoudn't be null", metrics);
++
++      // Re-register to check for cache hit, shouldn't blow up metrics-system...
++      // also, verify parent-metrics
++      QueueMetrics alterMetrics =
++          QueueMetrics.forQueue(ms, leafQueueName, parentQueue1, true, conf);
++
++      Assert.assertNotNull("QueueMetrics for alterMetrics shoudn't be null", 
++          alterMetrics);
++    } finally {
++      ms.shutdown();
++    }
++  }
++
+ 
+   public static void checkApps(MetricsSource source, int submitted, int pending,
+       int running, int completed, int failed, int killed) {
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestLeafQueue.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestLeafQueue.java
+index e6c16db..4c1a001 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestLeafQueue.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestLeafQueue.java
+@@ -99,7 +99,8 @@ public class TestLeafQueue {
+     csConf = 
+         new CapacitySchedulerConfiguration();
+     csConf.setBoolean("yarn.scheduler.capacity.user-metrics.enable", true);
+-    setupQueueConfiguration(csConf);
++    final String newRoot = "root" + System.currentTimeMillis();
++    setupQueueConfiguration(csConf, newRoot);
+     YarnConfiguration conf = new YarnConfiguration();
+     cs.setConf(conf);
+     
+@@ -113,7 +114,8 @@ public class TestLeafQueue {
+     when(csContext.getClusterResources()).
+         thenReturn(Resources.createResource(100 * 16 * GB));
+     root = 
+-        CapacityScheduler.parseQueue(csContext, csConf, null, "root", 
++        CapacityScheduler.parseQueue(csContext, csConf, null, 
++            CapacitySchedulerConfiguration.ROOT, 
+             queues, queues, 
+             CapacityScheduler.queueComparator, 
+             CapacityScheduler.applicationComparator, 
+@@ -127,25 +129,33 @@ public class TestLeafQueue {
+   private static final String C = "c";
+   private static final String C1 = "c1";
+   private static final String D = "d";
+-  private void setupQueueConfiguration(CapacitySchedulerConfiguration conf) {
++  private void setupQueueConfiguration(
++      CapacitySchedulerConfiguration conf, 
++      final String newRoot) {
+     
+     // Define top-level queues
+-    conf.setQueues(CapacitySchedulerConfiguration.ROOT, new String[] {A, B, C, D});
++    conf.setQueues(CapacitySchedulerConfiguration.ROOT, new String[] {newRoot});
+     conf.setCapacity(CapacitySchedulerConfiguration.ROOT, 100);
+     conf.setMaximumCapacity(CapacitySchedulerConfiguration.ROOT, 100);
+     conf.setAcl(CapacitySchedulerConfiguration.ROOT, QueueACL.SUBMIT_APPLICATIONS, " ");
+     
+-    final String Q_A = CapacitySchedulerConfiguration.ROOT + "." + A;
++    final String Q_newRoot = CapacitySchedulerConfiguration.ROOT + "." + newRoot;
++    conf.setQueues(Q_newRoot, new String[] {A, B, C, D});
++    conf.setCapacity(Q_newRoot, 100);
++    conf.setMaximumCapacity(Q_newRoot, 100);
++    conf.setAcl(Q_newRoot, QueueACL.SUBMIT_APPLICATIONS, " ");
++
++    final String Q_A = Q_newRoot + "." + A;
+     conf.setCapacity(Q_A, 8.5f);
+     conf.setMaximumCapacity(Q_A, 20);
+     conf.setAcl(Q_A, QueueACL.SUBMIT_APPLICATIONS, "*");
+     
+-    final String Q_B = CapacitySchedulerConfiguration.ROOT + "." + B;
++    final String Q_B = Q_newRoot + "." + B;
+     conf.setCapacity(Q_B, 80);
+     conf.setMaximumCapacity(Q_B, 99);
+     conf.setAcl(Q_B, QueueACL.SUBMIT_APPLICATIONS, "*");
+ 
+-    final String Q_C = CapacitySchedulerConfiguration.ROOT + "." + C;
++    final String Q_C = Q_newRoot + "." + C;
+     conf.setCapacity(Q_C, 1.5f);
+     conf.setMaximumCapacity(Q_C, 10);
+     conf.setAcl(Q_C, QueueACL.SUBMIT_APPLICATIONS, " ");
+@@ -155,7 +165,7 @@ public class TestLeafQueue {
+     final String Q_C1 = Q_C + "." + C1;
+     conf.setCapacity(Q_C1, 100);
+ 
+-    final String Q_D = CapacitySchedulerConfiguration.ROOT + "." + D;
++    final String Q_D = Q_newRoot + "." + D;
+     conf.setCapacity(Q_D, 10);
+     conf.setMaximumCapacity(Q_D, 11);
+     conf.setAcl(Q_D, QueueACL.SUBMIT_APPLICATIONS, "user_d");
+-- 
+1.7.0.4
+

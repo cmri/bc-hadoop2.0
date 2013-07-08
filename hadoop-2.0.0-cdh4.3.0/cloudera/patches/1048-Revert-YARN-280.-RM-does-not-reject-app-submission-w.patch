@@ -1,0 +1,160 @@
+From be6b85a614e3ee4787758c7ac25d2f90a2cce4ad Mon Sep 17 00:00:00 2001
+From: Sandy Ryza <sandy@cloudera.com>
+Date: Wed, 1 May 2013 18:39:04 -0700
+Subject: [PATCH 1048/1357] Revert "YARN-280. RM does not reject app submission with invalid tokens (Daryn Sharp via tgraves)"
+
+This reverts commit 6c1b0df116131bb134fa471cfb0b28d46a9f5ceb.
+---
+ .../security/DelegationTokenRenewer.java           |   69 +++++++++-----------
+ .../security/TestDelegationTokenRenewer.java       |   21 ------
+ 2 files changed, 31 insertions(+), 59 deletions(-)
+
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/security/DelegationTokenRenewer.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/security/DelegationTokenRenewer.java
+index 9232190..e5abbb7 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/security/DelegationTokenRenewer.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/security/DelegationTokenRenewer.java
+@@ -276,26 +276,21 @@ public class DelegationTokenRenewer extends AbstractService {
+     Collection <Token<?>> tokens = ts.getAllTokens();
+     long now = System.currentTimeMillis();
+     
+-    // find tokens for renewal, but don't add timers until we know
+-    // all renewable tokens are valid
+-    Set<DelegationTokenToRenew> dtrs = new HashSet<DelegationTokenToRenew>();
+     for(Token<?> token : tokens) {
+       // first renew happens immediately
+       if (token.isManaged()) {
+         DelegationTokenToRenew dtr = 
+           new DelegationTokenToRenew(applicationId, token, getConfig(), now, 
+               shouldCancelAtEnd); 
+-        renewToken(dtr);
+-        dtrs.add(dtr);
+-      }
+-    }
+-    for (DelegationTokenToRenew dtr : dtrs) {
+-      addTokenToList(dtr);
+-      setTimerForTokenRenewal(dtr);
+-      if (LOG.isDebugEnabled()) {
+-        LOG.debug("Registering token for renewal for:" +
+-            " service = " + dtr.token.getService() +
+-            " for appId = " + applicationId);
++
++        addTokenToList(dtr);
++      
++        setTimerForTokenRenewal(dtr, true);
++        if (LOG.isDebugEnabled()) {
++          LOG.debug("Registering token for renewal for:" +
++              " service = " + token.getService() + 
++              " for appId = " + applicationId);
++        }
+       }
+     }
+   }
+@@ -320,13 +315,22 @@ public class DelegationTokenRenewer extends AbstractService {
+ 
+       Token<?> token = dttr.token;
+       try {
+-        renewToken(dttr);
++        // need to use doAs so that http can find the kerberos tgt
++        dttr.expirationDate = UserGroupInformation.getLoginUser()
++          .doAs(new PrivilegedExceptionAction<Long>(){
++
++          @Override
++          public Long run() throws Exception {
++            return dttr.token.renew(dttr.conf);
++          }
++        });
++
+         if (LOG.isDebugEnabled()) {
+           LOG.debug("Renewing delegation-token for:" + token.getService() + 
+               "; new expiration;" + dttr.expirationDate);
+         }
+         
+-        setTimerForTokenRenewal(dttr);// set the next one
++        setTimerForTokenRenewal(dttr, false);// set the next one
+       } catch (Exception e) {
+         LOG.error("Exception renewing token" + token + ". Not rescheduled", e);
+         removeFailedDelegationToken(dttr);
+@@ -343,12 +347,19 @@ public class DelegationTokenRenewer extends AbstractService {
+   /**
+    * set task to renew the token
+    */
+-  private void setTimerForTokenRenewal(DelegationTokenToRenew token)
+-      throws IOException {
++  private 
++  void setTimerForTokenRenewal(DelegationTokenToRenew token, 
++                               boolean firstTime) throws IOException {
+       
+     // calculate timer time
+-    long expiresIn = token.expirationDate - System.currentTimeMillis();
+-    long renewIn = token.expirationDate - expiresIn/10; // little bit before the expiration
++    long now = System.currentTimeMillis();
++    long renewIn;
++    if(firstTime) {
++      renewIn = now;
++    } else {
++      long expiresIn = (token.expirationDate - now); 
++      renewIn = now + expiresIn - expiresIn/10; // little bit before the expiration
++    }
+     
+     // need to create new task every time
+     TimerTask tTask = new RenewalTimerTask(token);
+@@ -357,24 +368,6 @@ public class DelegationTokenRenewer extends AbstractService {
+     renewalTimer.schedule(token.timerTask, new Date(renewIn));
+   }
+ 
+-  // renew a token
+-  private void renewToken(final DelegationTokenToRenew dttr)
+-      throws IOException {
+-    // need to use doAs so that http can find the kerberos tgt
+-    // NOTE: token renewers should be responsible for the correct UGI!
+-    try {
+-      dttr.expirationDate = UserGroupInformation.getLoginUser().doAs(
+-          new PrivilegedExceptionAction<Long>(){          
+-            @Override
+-            public Long run() throws Exception {
+-              return dttr.token.renew(dttr.conf);
+-            }
+-          });
+-    } catch (InterruptedException e) {
+-      throw new IOException(e);
+-    }
+-  }
+-
+   // cancel a token
+   private void cancelToken(DelegationTokenToRenew t) {
+     if(t.shouldCancelAtEnd) {
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/security/TestDelegationTokenRenewer.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/security/TestDelegationTokenRenewer.java
+index ad127a9..1c3614e 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/security/TestDelegationTokenRenewer.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/security/TestDelegationTokenRenewer.java
+@@ -357,27 +357,6 @@ public class TestDelegationTokenRenewer {
+     }
+   }
+   
+-  @Test
+-  public void testInvalidDTWithAddApplication() throws Exception {
+-    MyFS dfs = (MyFS)FileSystem.get(conf);
+-    LOG.info("dfs="+(Object)dfs.hashCode() + ";conf="+conf.hashCode());
+-
+-    MyToken token = dfs.getDelegationToken(new Text("user1"));
+-    token.cancelToken();
+-
+-    Credentials ts = new Credentials();
+-    ts.addToken(token.getKind(), token);
+-    
+-    // register the tokens for renewal
+-    ApplicationId appId =  BuilderUtils.newApplicationId(0, 0);
+-    try {
+-      delegationTokenRenewer.addApplication(appId, ts, true);
+-      fail("App submission with a cancelled token should have failed");
+-    } catch (InvalidToken e) {
+-      // expected
+-    }
+-  }
+-  
+   /**
+    * Basic idea of the test:
+    * 1. register a token for 2 seconds with no cancel at the end
+-- 
+1.7.0.4
+

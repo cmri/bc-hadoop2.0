@@ -1,0 +1,199 @@
+From 0f8eab20fbfdb05657c33cd6044bc371ecdd52f6 Mon Sep 17 00:00:00 2001
+From: Alejandro Abdelnur <tucu@apache.org>
+Date: Wed, 13 Jun 2012 02:22:06 +0000
+Subject: [PATCH 0270/1357] HADOOP-8465. hadoop-auth should support ephemeral authentication (tucu)
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1349613 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 8948e9b15853d86227755ba0702bfc0093d7be44)
+---
+ .../server/AuthenticationFilter.java               |    5 +-
+ .../authentication/server/AuthenticationToken.java |   10 ++--
+ .../server/TestAuthenticationFilter.java           |   67 ++++++++++++-------
+ 3 files changed, 50 insertions(+), 32 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-auth/src/main/java/org/apache/hadoop/security/authentication/server/AuthenticationFilter.java b/hadoop-common-project/hadoop-auth/src/main/java/org/apache/hadoop/security/authentication/server/AuthenticationFilter.java
+index b1795d1..0bd78f5 100644
+--- a/hadoop-common-project/hadoop-auth/src/main/java/org/apache/hadoop/security/authentication/server/AuthenticationFilter.java
++++ b/hadoop-common-project/hadoop-auth/src/main/java/org/apache/hadoop/security/authentication/server/AuthenticationFilter.java
+@@ -347,7 +347,8 @@ public class AuthenticationFilter implements Filter {
+             LOG.debug("Request [{}] triggering authentication", getRequestURL(httpRequest));
+           }
+           token = authHandler.authenticate(httpRequest, httpResponse);
+-          if (token != null && token != AuthenticationToken.ANONYMOUS) {
++          if (token != null && token.getExpires() != 0 &&
++              token != AuthenticationToken.ANONYMOUS) {
+             token.setExpires(System.currentTimeMillis() + getValidity() * 1000);
+           }
+           newToken = true;
+@@ -375,7 +376,7 @@ public class AuthenticationFilter implements Filter {
+               return (authToken != AuthenticationToken.ANONYMOUS) ? authToken : null;
+             }
+           };
+-          if (newToken && token != AuthenticationToken.ANONYMOUS) {
++          if (newToken && !token.isExpired() && token != AuthenticationToken.ANONYMOUS) {
+             String signedToken = signer.sign(token.toString());
+             Cookie cookie = createCookie(signedToken);
+             httpResponse.addCookie(cookie);
+diff --git a/hadoop-common-project/hadoop-auth/src/main/java/org/apache/hadoop/security/authentication/server/AuthenticationToken.java b/hadoop-common-project/hadoop-auth/src/main/java/org/apache/hadoop/security/authentication/server/AuthenticationToken.java
+index e2856a3..ff68847 100644
+--- a/hadoop-common-project/hadoop-auth/src/main/java/org/apache/hadoop/security/authentication/server/AuthenticationToken.java
++++ b/hadoop-common-project/hadoop-auth/src/main/java/org/apache/hadoop/security/authentication/server/AuthenticationToken.java
+@@ -115,10 +115,10 @@ public class AuthenticationToken implements Principal {
+    */
+   private void generateToken() {
+     StringBuffer sb = new StringBuffer();
+-    sb.append(USER_NAME).append("=").append(userName).append(ATTR_SEPARATOR);
+-    sb.append(PRINCIPAL).append("=").append(principal).append(ATTR_SEPARATOR);
+-    sb.append(TYPE).append("=").append(type).append(ATTR_SEPARATOR);
+-    sb.append(EXPIRES).append("=").append(expires);
++    sb.append(USER_NAME).append("=").append(getUserName()).append(ATTR_SEPARATOR);
++    sb.append(PRINCIPAL).append("=").append(getName()).append(ATTR_SEPARATOR);
++    sb.append(TYPE).append("=").append(getType()).append(ATTR_SEPARATOR);
++    sb.append(EXPIRES).append("=").append(getExpires());
+     token = sb.toString();
+   }
+ 
+@@ -165,7 +165,7 @@ public class AuthenticationToken implements Principal {
+    * @return if the token has expired.
+    */
+   public boolean isExpired() {
+-    return expires != -1 && System.currentTimeMillis() > expires;
++    return getExpires() != -1 && System.currentTimeMillis() > getExpires();
+   }
+ 
+   /**
+diff --git a/hadoop-common-project/hadoop-auth/src/test/java/org/apache/hadoop/security/authentication/server/TestAuthenticationFilter.java b/hadoop-common-project/hadoop-auth/src/test/java/org/apache/hadoop/security/authentication/server/TestAuthenticationFilter.java
+index 746cf7b..1c31e54 100644
+--- a/hadoop-common-project/hadoop-auth/src/test/java/org/apache/hadoop/security/authentication/server/TestAuthenticationFilter.java
++++ b/hadoop-common-project/hadoop-auth/src/test/java/org/apache/hadoop/security/authentication/server/TestAuthenticationFilter.java
+@@ -73,6 +73,7 @@ public class TestAuthenticationFilter extends TestCase {
+     public static boolean init;
+     public static boolean managementOperationReturn;
+     public static boolean destroy;
++    public static boolean expired;
+ 
+     public static final String TYPE = "dummy";
+ 
+@@ -86,6 +87,7 @@ public class TestAuthenticationFilter extends TestCase {
+       init = true;
+       managementOperationReturn =
+         config.getProperty("management.operation.return", "true").equals("true");
++      expired = config.getProperty("expired.token", "false").equals("true");
+     }
+ 
+     @Override
+@@ -116,7 +118,7 @@ public class TestAuthenticationFilter extends TestCase {
+       String param = request.getParameter("authenticated");
+       if (param != null && param.equals("true")) {
+         token = new AuthenticationToken("u", "p", "t");
+-        token.setExpires(System.currentTimeMillis() + 1000);
++        token.setExpires((expired) ? 0 : System.currentTimeMillis() + 1000);
+       } else {
+         response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+       }
+@@ -386,12 +388,16 @@ public class TestAuthenticationFilter extends TestCase {
+     }
+   }
+ 
+-  private void _testDoFilterAuthentication(boolean withDomainPath, boolean invalidToken) throws Exception {
++  private void _testDoFilterAuthentication(boolean withDomainPath,
++                                           boolean invalidToken,
++                                           boolean expired) throws Exception {
+     AuthenticationFilter filter = new AuthenticationFilter();
+     try {
+       FilterConfig config = Mockito.mock(FilterConfig.class);
+       Mockito.when(config.getInitParameter("management.operation.return")).
+         thenReturn("true");
++      Mockito.when(config.getInitParameter("expired.token")).
++        thenReturn(Boolean.toString(expired));
+       Mockito.when(config.getInitParameter(AuthenticationFilter.AUTH_TYPE)).thenReturn(
+         DummyAuthenticationHandler.class.getName());
+       Mockito.when(config.getInitParameter(AuthenticationFilter.AUTH_TOKEN_VALIDITY)).thenReturn("1000");
+@@ -400,7 +406,8 @@ public class TestAuthenticationFilter extends TestCase {
+         new Vector<String>(Arrays.asList(AuthenticationFilter.AUTH_TYPE,
+                                  AuthenticationFilter.AUTH_TOKEN_VALIDITY,
+                                  AuthenticationFilter.SIGNATURE_SECRET,
+-                                 "management.operation.return")).elements());
++                                 "management.operation.return",
++                                 "expired.token")).elements());
+ 
+       if (withDomainPath) {
+         Mockito.when(config.getInitParameter(AuthenticationFilter.COOKIE_DOMAIN)).thenReturn(".foo.com");
+@@ -457,26 +464,32 @@ public class TestAuthenticationFilter extends TestCase {
+ 
+       filter.doFilter(request, response, chain);
+ 
+-      assertNotNull(setCookie[0]);
+-      assertEquals(AuthenticatedURL.AUTH_COOKIE, setCookie[0].getName());
+-      assertTrue(setCookie[0].getValue().contains("u="));
+-      assertTrue(setCookie[0].getValue().contains("p="));
+-      assertTrue(setCookie[0].getValue().contains("t="));
+-      assertTrue(setCookie[0].getValue().contains("e="));
+-      assertTrue(setCookie[0].getValue().contains("s="));
+-      assertTrue(calledDoFilter[0]);
+-
+-      Signer signer = new Signer("secret".getBytes());
+-      String value = signer.verifyAndExtract(setCookie[0].getValue());
+-      AuthenticationToken token = AuthenticationToken.parse(value);
+-      assertEquals(System.currentTimeMillis() + 1000 * 1000, token.getExpires(), 100);
+-
+-      if (withDomainPath) {
+-        assertEquals(".foo.com", setCookie[0].getDomain());
+-        assertEquals("/bar", setCookie[0].getPath());
++      if (expired) {
++        Mockito.verify(response, Mockito.never()).
++          addCookie(Mockito.any(Cookie.class));
+       } else {
+-        assertNull(setCookie[0].getDomain());
+-        assertNull(setCookie[0].getPath());
++        assertNotNull(setCookie[0]);
++        assertEquals(AuthenticatedURL.AUTH_COOKIE, setCookie[0].getName());
++        assertTrue(setCookie[0].getValue().contains("u="));
++        assertTrue(setCookie[0].getValue().contains("p="));
++        assertTrue(setCookie[0].getValue().contains("t="));
++        assertTrue(setCookie[0].getValue().contains("e="));
++        assertTrue(setCookie[0].getValue().contains("s="));
++        assertTrue(calledDoFilter[0]);
++
++        Signer signer = new Signer("secret".getBytes());
++        String value = signer.verifyAndExtract(setCookie[0].getValue());
++        AuthenticationToken token = AuthenticationToken.parse(value);
++        assertEquals(System.currentTimeMillis() + 1000 * 1000,
++                     token.getExpires(), 100);
++
++        if (withDomainPath) {
++          assertEquals(".foo.com", setCookie[0].getDomain());
++          assertEquals("/bar", setCookie[0].getPath());
++        } else {
++          assertNull(setCookie[0].getDomain());
++          assertNull(setCookie[0].getPath());
++        }
+       }
+     } finally {
+       filter.destroy();
+@@ -484,15 +497,19 @@ public class TestAuthenticationFilter extends TestCase {
+   }
+ 
+   public void testDoFilterAuthentication() throws Exception {
+-    _testDoFilterAuthentication(false, false);
++    _testDoFilterAuthentication(false, false, false);
++  }
++
++  public void testDoFilterAuthenticationImmediateExpiration() throws Exception {
++    _testDoFilterAuthentication(false, false, true);
+   }
+ 
+   public void testDoFilterAuthenticationWithInvalidToken() throws Exception {
+-    _testDoFilterAuthentication(false, true);
++    _testDoFilterAuthentication(false, true, false);
+   }
+ 
+   public void testDoFilterAuthenticationWithDomainPath() throws Exception {
+-    _testDoFilterAuthentication(true, false);
++    _testDoFilterAuthentication(true, false, false);
+   }
+ 
+   public void testDoFilterAuthenticated() throws Exception {
+-- 
+1.7.0.4
+

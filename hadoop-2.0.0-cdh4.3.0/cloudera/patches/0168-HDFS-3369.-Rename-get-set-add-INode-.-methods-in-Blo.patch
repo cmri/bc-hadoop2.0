@@ -1,0 +1,954 @@
+From a572f8aa5c3557bd7b7830873f1b8d49ce0af4f8 Mon Sep 17 00:00:00 2001
+From: Tsz-wo Sze <szetszwo@apache.org>
+Date: Thu, 10 May 2012 21:41:25 +0000
+Subject: [PATCH 0168/1357] HDFS-3369. Rename {get|set|add}INode(..) methods in BlockManager and BlocksMap to {get|set|add}BlockCollection(..).  Contributed by John George
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1336909 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit fae0ef6d35a792734f11360d5d8bfa0728b6beb8)
+---
+ .../hdfs/server/blockmanagement/BlockInfo.java     |   21 ++--
+ .../hdfs/server/blockmanagement/BlockManager.java  |  132 ++++++++++----------
+ .../blockmanagement/BlockPlacementPolicy.java      |   12 +-
+ .../BlockPlacementPolicyDefault.java               |    2 +-
+ .../hdfs/server/blockmanagement/BlocksMap.java     |   16 ++--
+ .../hadoop/hdfs/server/namenode/FSDirectory.java   |    6 +-
+ .../hdfs/server/namenode/FSEditLogLoader.java      |    2 +-
+ .../hadoop/hdfs/server/namenode/FSNamesystem.java  |    8 +-
+ .../hadoop/hdfs/server/namenode/INodeFile.java     |    4 +-
+ .../namenode/INodeFileUnderConstruction.java       |    2 +-
+ .../hdfs/server/namenode/NamenodeJspHelper.java    |    2 +-
+ .../server/blockmanagement/TestBlockManager.java   |    2 +-
+ .../blockmanagement/BlockPlacementPolicyRaid.java  |   28 ++--
+ .../TestBlockPlacementPolicyRaid.java              |   26 ++--
+ 14 files changed, 131 insertions(+), 132 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockInfo.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockInfo.java
+index 09597bc..71fe5b3 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockInfo.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockInfo.java
+@@ -32,8 +32,7 @@ import org.apache.hadoop.hdfs.util.LightWeightGSet;
+ @InterfaceAudience.Private
+ public class BlockInfo extends Block implements
+     LightWeightGSet.LinkedElement {
+-
+-  private BlockCollection inode;
++  private BlockCollection bc;
+ 
+   /** For implementing {@link LightWeightGSet.LinkedElement} interface */
+   private LightWeightGSet.LinkedElement nextLinkedElement;
+@@ -58,13 +57,13 @@ public class BlockInfo extends Block implements
+    */
+   public BlockInfo(int replication) {
+     this.triplets = new Object[3*replication];
+-    this.inode = null;
++    this.bc = null;
+   }
+   
+   public BlockInfo(Block blk, int replication) {
+     super(blk);
+     this.triplets = new Object[3*replication];
+-    this.inode = null;
++    this.bc = null;
+   }
+ 
+   /**
+@@ -73,16 +72,16 @@ public class BlockInfo extends Block implements
+    * @param from BlockInfo to copy from.
+    */
+   protected BlockInfo(BlockInfo from) {
+-    this(from, from.inode.getReplication());
+-    this.inode = from.inode;
++    this(from, from.bc.getReplication());
++    this.bc = from.bc;
+   }
+ 
+-  public BlockCollection getINode() {
+-    return inode;
++  public BlockCollection getBlockCollection() {
++    return bc;
+   }
+ 
+-  public void setINode(BlockCollection inode) {
+-    this.inode = inode;
++  public void setBlockCollection(BlockCollection bc) {
++    this.bc = bc;
+   }
+ 
+   DatanodeDescriptor getDatanode(int index) {
+@@ -335,7 +334,7 @@ public class BlockInfo extends Block implements
+       BlockUCState s, DatanodeDescriptor[] targets) {
+     if(isComplete()) {
+       return new BlockInfoUnderConstruction(
+-          this, getINode().getReplication(), s, targets);
++          this, getBlockCollection().getReplication(), s, targets);
+     }
+     // the block is already under construction
+     BlockInfoUnderConstruction ucBlock = (BlockInfoUnderConstruction)this;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+index 0e5c411..c8cd733 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+@@ -146,7 +146,7 @@ public class BlockManager {
+   private final long replicationRecheckInterval;
+   
+   /**
+-   * Mapping: Block -> { INode, datanodes, self ref }
++   * Mapping: Block -> { BlockCollection, datanodes, self ref }
+    * Updated only in response to client-sent information.
+    */
+   final BlocksMap blocksMap;
+@@ -196,7 +196,7 @@ public class BlockManager {
+   public final short minReplication;
+   /** Default number of replicas */
+   public final int defaultReplication;
+-  /** The maximum number of entries returned by getCorruptInodes() */
++  /** value returned by MAX_CORRUPT_FILES_RETURNED */
+   final int maxCorruptFilesReturned;
+ 
+   final float blocksInvalidateWorkPct;
+@@ -409,7 +409,7 @@ public class BlockManager {
+                          numReplicas.decommissionedReplicas();
+     
+     if (block instanceof BlockInfo) {
+-      String fileName = ((BlockInfo)block).getINode().getName();
++      String fileName = ((BlockInfo)block).getBlockCollection().getName();
+       out.print(fileName + ": ");
+     }
+     // l: == live:, d: == decommissioned c: == corrupt e: == excess
+@@ -479,17 +479,17 @@ public class BlockManager {
+    * Commit the last block of the file and mark it as complete if it has
+    * meets the minimum replication requirement
+    * 
+-   * @param fileINode file inode
++   * @param bc block collection
+    * @param commitBlock - contains client reported block length and generation
+    * @return true if the last block is changed to committed state.
+    * @throws IOException if the block does not have at least a minimal number
+    * of replicas reported from data-nodes.
+    */
+-  public boolean commitOrCompleteLastBlock(MutableBlockCollection fileINode, 
++  public boolean commitOrCompleteLastBlock(MutableBlockCollection bc, 
+       Block commitBlock) throws IOException {
+     if(commitBlock == null)
+       return false; // not committing, this is a block allocation retry
+-    BlockInfo lastBlock = fileINode.getLastBlock();
++    BlockInfo lastBlock = bc.getLastBlock();
+     if(lastBlock == null)
+       return false; // no blocks in file yet
+     if(lastBlock.isComplete())
+@@ -497,22 +497,22 @@ public class BlockManager {
+     
+     final boolean b = commitBlock((BlockInfoUnderConstruction)lastBlock, commitBlock);
+     if(countNodes(lastBlock).liveReplicas() >= minReplication)
+-      completeBlock(fileINode, fileINode.numBlocks()-1, false);
++      completeBlock(bc, bc.numBlocks()-1, false);
+     return b;
+   }
+ 
+   /**
+    * Convert a specified block of the file to a complete block.
+-   * @param fileINode file
++   * @param bc file
+    * @param blkIndex  block index in the file
+    * @throws IOException if the block does not have at least a minimal number
+    * of replicas reported from data-nodes.
+    */
+-  private BlockInfo completeBlock(final MutableBlockCollection fileINode,
++  private BlockInfo completeBlock(final MutableBlockCollection bc,
+       final int blkIndex, boolean force) throws IOException {
+     if(blkIndex < 0)
+       return null;
+-    BlockInfo curBlock = fileINode.getBlocks()[blkIndex];
++    BlockInfo curBlock = bc.getBlocks()[blkIndex];
+     if(curBlock.isComplete())
+       return curBlock;
+     BlockInfoUnderConstruction ucBlock = (BlockInfoUnderConstruction)curBlock;
+@@ -525,7 +525,7 @@ public class BlockManager {
+           "Cannot complete block: block has not been COMMITTED by the client");
+     BlockInfo completeBlock = ucBlock.convertToCompleteBlock();
+     // replace penultimate block in file
+-    fileINode.setBlock(blkIndex, completeBlock);
++    bc.setBlock(blkIndex, completeBlock);
+     
+     // Since safe-mode only counts complete blocks, and we now have
+     // one more complete block, we need to adjust the total up, and
+@@ -541,12 +541,12 @@ public class BlockManager {
+     return blocksMap.replaceBlock(completeBlock);
+   }
+ 
+-  private BlockInfo completeBlock(final MutableBlockCollection fileINode,
++  private BlockInfo completeBlock(final MutableBlockCollection bc,
+       final BlockInfo block, boolean force) throws IOException {
+-    BlockInfo[] fileBlocks = fileINode.getBlocks();
++    BlockInfo[] fileBlocks = bc.getBlocks();
+     for(int idx = 0; idx < fileBlocks.length; idx++)
+       if(fileBlocks[idx] == block) {
+-        return completeBlock(fileINode, idx, force);
++        return completeBlock(bc, idx, force);
+       }
+     return block;
+   }
+@@ -556,10 +556,10 @@ public class BlockManager {
+    * regardless of whether enough replicas are present. This is necessary
+    * when tailing edit logs as a Standby.
+    */
+-  public BlockInfo forceCompleteBlock(final MutableBlockCollection fileINode,
++  public BlockInfo forceCompleteBlock(final MutableBlockCollection bc,
+       final BlockInfoUnderConstruction block) throws IOException {
+     block.commitBlock(block);
+-    return completeBlock(fileINode, block, true);
++    return completeBlock(bc, block, true);
+   }
+ 
+   
+@@ -573,14 +573,14 @@ public class BlockManager {
+    * The methods returns null if there is no partial block at the end.
+    * The client is supposed to allocate a new block with the next call.
+    *
+-   * @param fileINode file
++   * @param bc file
+    * @return the last block locations if the block is partial or null otherwise
+    */
+   public LocatedBlock convertLastBlockToUnderConstruction(
+-      MutableBlockCollection fileINode) throws IOException {
+-    BlockInfo oldBlock = fileINode.getLastBlock();
++      MutableBlockCollection bc) throws IOException {
++    BlockInfo oldBlock = bc.getLastBlock();
+     if(oldBlock == null ||
+-        fileINode.getPreferredBlockSize() == oldBlock.getNumBytes())
++        bc.getPreferredBlockSize() == oldBlock.getNumBytes())
+       return null;
+     assert oldBlock == getStoredBlock(oldBlock) :
+       "last block of the file is not in blocksMap";
+@@ -588,7 +588,7 @@ public class BlockManager {
+     DatanodeDescriptor[] targets = getNodes(oldBlock);
+ 
+     BlockInfoUnderConstruction ucBlock =
+-      fileINode.setLastBlock(oldBlock, targets);
++      bc.setLastBlock(oldBlock, targets);
+     blocksMap.replaceBlock(ucBlock);
+ 
+     // Remove block from replication queue.
+@@ -608,7 +608,7 @@ public class BlockManager {
+         // always decrement total blocks
+         -1);
+ 
+-    final long fileLength = fileINode.computeContentSummary().getLength();
++    final long fileLength = bc.computeContentSummary().getLength();
+     final long pos = fileLength - ucBlock.getNumBytes();
+     return createLocatedBlock(ucBlock, pos, AccessMode.WRITE);
+   }
+@@ -948,8 +948,8 @@ public class BlockManager {
+                             " does not exist. ");
+     }
+ 
+-    BlockCollection inode = storedBlock.getINode();
+-    if (inode == null) {
++    BlockCollection bc = storedBlock.getBlockCollection();
++    if (bc == null) {
+       NameNode.stateChangeLog.info("BLOCK markBlockAsCorrupt: " +
+                                    "block " + storedBlock +
+                                    " could not be marked as corrupt as it" +
+@@ -963,7 +963,7 @@ public class BlockManager {
+ 
+     // Add this replica to corruptReplicas Map
+     corruptReplicas.addToCorruptReplicasMap(storedBlock, node, reason);
+-    if (countNodes(storedBlock).liveReplicas() >= inode.getReplication()) {
++    if (countNodes(storedBlock).liveReplicas() >= bc.getReplication()) {
+       // the block is over-replicated so invalidate the replicas immediately
+       invalidateBlock(storedBlock, node);
+     } else if (namesystem.isPopulatingReplQueues()) {
+@@ -1076,7 +1076,7 @@ public class BlockManager {
+     int requiredReplication, numEffectiveReplicas;
+     List<DatanodeDescriptor> containingNodes, liveReplicaNodes;
+     DatanodeDescriptor srcNode;
+-    BlockCollection fileINode = null;
++    BlockCollection bc = null;
+     int additionalReplRequired;
+ 
+     int scheduledWork = 0;
+@@ -1088,15 +1088,15 @@ public class BlockManager {
+         for (int priority = 0; priority < blocksToReplicate.size(); priority++) {
+           for (Block block : blocksToReplicate.get(priority)) {
+             // block should belong to a file
+-            fileINode = blocksMap.getINode(block);
++            bc = blocksMap.getBlockCollection(block);
+             // abandoned block or block reopened for append
+-            if(fileINode == null || fileINode instanceof MutableBlockCollection) {
++            if(bc == null || bc instanceof MutableBlockCollection) {
+               neededReplications.remove(block, priority); // remove from neededReplications
+               neededReplications.decrementReplicationIndex(priority);
+               continue;
+             }
+ 
+-            requiredReplication = fileINode.getReplication();
++            requiredReplication = bc.getReplication();
+ 
+             // get a source data-node
+             containingNodes = new ArrayList<DatanodeDescriptor>();
+@@ -1132,7 +1132,7 @@ public class BlockManager {
+             } else {
+               additionalReplRequired = 1; // Needed on a new rack
+             }
+-            work.add(new ReplicationWork(block, fileINode, srcNode,
++            work.add(new ReplicationWork(block, bc, srcNode,
+                 containingNodes, liveReplicaNodes, additionalReplRequired,
+                 priority));
+           }
+@@ -1154,8 +1154,8 @@ public class BlockManager {
+ 
+       // choose replication targets: NOT HOLDING THE GLOBAL LOCK
+       // It is costly to extract the filename for which chooseTargets is called,
+-      // so for now we pass in the Inode itself.
+-      rw.targets = blockplacement.chooseTarget(rw.fileINode,
++      // so for now we pass in the block collection itself.
++      rw.targets = blockplacement.chooseTarget(rw.bc,
+           rw.additionalReplRequired, rw.srcNode, rw.liveReplicaNodes,
+           excludedNodes, rw.block.getNumBytes());
+     }
+@@ -1174,15 +1174,15 @@ public class BlockManager {
+           int priority = rw.priority;
+           // Recheck since global lock was released
+           // block should belong to a file
+-          fileINode = blocksMap.getINode(block);
++          bc = blocksMap.getBlockCollection(block);
+           // abandoned block or block reopened for append
+-          if(fileINode == null || fileINode instanceof MutableBlockCollection) {
++          if(bc == null || bc instanceof MutableBlockCollection) {
+             neededReplications.remove(block, priority); // remove from neededReplications
+             rw.targets = null;
+             neededReplications.decrementReplicationIndex(priority);
+             continue;
+           }
+-          requiredReplication = fileINode.getReplication();
++          requiredReplication = bc.getReplication();
+ 
+           // do not schedule more if enough replicas is already pending
+           NumberReplicas numReplicas = countNodes(block);
+@@ -1941,7 +1941,7 @@ assert storedBlock.findDatanode(dn) < 0 : "Block " + block
+     int numCurrentReplica = countLiveNodes(storedBlock);
+     if (storedBlock.getBlockUCState() == BlockUCState.COMMITTED
+         && numCurrentReplica >= minReplication) {
+-      completeBlock((MutableBlockCollection)storedBlock.getINode(), storedBlock, false);
++      completeBlock((MutableBlockCollection)storedBlock.getBlockCollection(), storedBlock, false);
+     } else if (storedBlock.isComplete()) {
+       // check whether safe replication is reached for the block
+       // only complete blocks are counted towards that.
+@@ -1969,7 +1969,7 @@ assert storedBlock.findDatanode(dn) < 0 : "Block " + block
+     } else {
+       storedBlock = block;
+     }
+-    if (storedBlock == null || storedBlock.getINode() == null) {
++    if (storedBlock == null || storedBlock.getBlockCollection() == null) {
+       // If this block does not belong to anyfile, then we are done.
+       NameNode.stateChangeLog.info("BLOCK* addStoredBlock: " + block + " on "
+           + node + " size " + block.getNumBytes()
+@@ -1979,8 +1979,8 @@ assert storedBlock.findDatanode(dn) < 0 : "Block " + block
+       return block;
+     }
+     assert storedBlock != null : "Block must be stored by now";
+-    BlockCollection fileINode = storedBlock.getINode();
+-    assert fileINode != null : "Block must belong to a file";
++    BlockCollection bc = storedBlock.getBlockCollection();
++    assert bc != null : "Block must belong to a file";
+ 
+     // add block to the datanode
+     boolean added = node.addBlock(storedBlock);
+@@ -2006,7 +2006,7 @@ assert storedBlock.findDatanode(dn) < 0 : "Block " + block
+ 
+     if(storedBlock.getBlockUCState() == BlockUCState.COMMITTED &&
+         numLiveReplicas >= minReplication) {
+-      storedBlock = completeBlock((MutableBlockCollection)fileINode, storedBlock, false);
++      storedBlock = completeBlock((MutableBlockCollection)bc, storedBlock, false);
+     } else if (storedBlock.isComplete()) {
+       // check whether safe replication is reached for the block
+       // only complete blocks are counted towards that
+@@ -2017,7 +2017,7 @@ assert storedBlock.findDatanode(dn) < 0 : "Block " + block
+     }
+     
+     // if file is under construction, then done for now
+-    if (fileINode instanceof MutableBlockCollection) {
++    if (bc instanceof MutableBlockCollection) {
+       return storedBlock;
+     }
+ 
+@@ -2027,7 +2027,7 @@ assert storedBlock.findDatanode(dn) < 0 : "Block " + block
+     }
+ 
+     // handle underReplication/overReplication
+-    short fileReplication = fileINode.getReplication();
++    short fileReplication = bc.getReplication();
+     if (!isNeededReplication(storedBlock, fileReplication, numCurrentReplica)) {
+       neededReplications.remove(storedBlock, numCurrentReplica,
+           num.decommissionedReplicas(), fileReplication);
+@@ -2154,8 +2154,8 @@ assert storedBlock.findDatanode(dn) < 0 : "Block " + block
+    * what happened with it.
+    */
+   private MisReplicationResult processMisReplicatedBlock(BlockInfo block) {
+-    BlockCollection fileINode = block.getINode();
+-    if (fileINode == null) {
++    BlockCollection bc = block.getBlockCollection();
++    if (bc == null) {
+       // block does not belong to any file
+       addToInvalidates(block);
+       return MisReplicationResult.INVALID;
+@@ -2166,7 +2166,7 @@ assert storedBlock.findDatanode(dn) < 0 : "Block " + block
+       return MisReplicationResult.UNDER_CONSTRUCTION;
+     }
+     // calculate current replication
+-    short expectedReplication = fileINode.getReplication();
++    short expectedReplication = bc.getReplication();
+     NumberReplicas num = countNodes(block);
+     int numCurrentReplica = num.liveReplicas();
+     // add to under-replicated queue if need to be
+@@ -2283,7 +2283,7 @@ assert storedBlock.findDatanode(dn) < 0 : "Block " + block
+                               BlockPlacementPolicy replicator) {
+     assert namesystem.hasWriteLock();
+     // first form a rack to datanodes map and
+-    BlockCollection inode = getINode(b);
++    BlockCollection bc = getBlockCollection(b);
+     final Map<String, List<DatanodeDescriptor>> rackMap
+         = new HashMap<String, List<DatanodeDescriptor>>();
+     for(final Iterator<DatanodeDescriptor> iter = nonExcess.iterator();
+@@ -2323,7 +2323,7 @@ assert storedBlock.findDatanode(dn) < 0 : "Block " + block
+               || (addedNode != null && !priSet.contains(addedNode))) ) {
+         cur = delNodeHint;
+       } else { // regular excessive replica removal
+-        cur = replicator.chooseReplicaToDelete(inode, b, replication,
++        cur = replicator.chooseReplicaToDelete(bc, b, replication,
+             priSet, remains);
+       }
+       firstOne = false;
+@@ -2404,8 +2404,8 @@ assert storedBlock.findDatanode(dn) < 0 : "Block " + block
+       // necessary. In that case, put block on a possibly-will-
+       // be-replicated list.
+       //
+-      BlockCollection fileINode = blocksMap.getINode(block);
+-      if (fileINode != null) {
++      BlockCollection bc = blocksMap.getBlockCollection(block);
++      if (bc != null) {
+         namesystem.decrementSafeBlockCount(block);
+         updateNeededReplications(block, -1, 0);
+       }
+@@ -2636,7 +2636,7 @@ assert storedBlock.findDatanode(dn) < 0 : "Block " + block
+       NumberReplicas num) {
+     int curReplicas = num.liveReplicas();
+     int curExpectedReplicas = getReplication(block);
+-    BlockCollection fileINode = blocksMap.getINode(block);
++    BlockCollection bc = blocksMap.getBlockCollection(block);
+     Iterator<DatanodeDescriptor> nodeIter = blocksMap.nodeIterator(block);
+     StringBuilder nodeList = new StringBuilder();
+     while (nodeIter.hasNext()) {
+@@ -2649,7 +2649,7 @@ assert storedBlock.findDatanode(dn) < 0 : "Block " + block
+         + ", corrupt replicas: " + num.corruptReplicas()
+         + ", decommissioned replicas: " + num.decommissionedReplicas()
+         + ", excess replicas: " + num.excessReplicas()
+-        + ", Is Open File: " + (fileINode instanceof MutableBlockCollection)
++        + ", Is Open File: " + (bc instanceof MutableBlockCollection)
+         + ", Datanodes having this block: " + nodeList + ", Current Datanode: "
+         + srcNode + ", Is current datanode decommissioning: "
+         + srcNode.isDecommissionInProgress());
+@@ -2664,8 +2664,8 @@ assert storedBlock.findDatanode(dn) < 0 : "Block " + block
+     final Iterator<? extends Block> it = srcNode.getBlockIterator();
+     while(it.hasNext()) {
+       final Block block = it.next();
+-      BlockCollection fileINode = blocksMap.getINode(block);
+-      short expectedReplication = fileINode.getReplication();
++      BlockCollection bc = blocksMap.getBlockCollection(block);
++      short expectedReplication = bc.getReplication();
+       NumberReplicas num = countNodes(block);
+       int numCurrentReplica = num.liveReplicas();
+       if (numCurrentReplica > expectedReplication) {
+@@ -2687,9 +2687,9 @@ assert storedBlock.findDatanode(dn) < 0 : "Block " + block
+     final Iterator<? extends Block> it = srcNode.getBlockIterator();
+     while(it.hasNext()) {
+       final Block block = it.next();
+-      BlockCollection fileINode = blocksMap.getINode(block);
++      BlockCollection bc = blocksMap.getBlockCollection(block);
+ 
+-      if (fileINode != null) {
++      if (bc != null) {
+         NumberReplicas num = countNodes(block);
+         int curReplicas = num.liveReplicas();
+         int curExpectedReplicas = getReplication(block);
+@@ -2704,7 +2704,7 @@ assert storedBlock.findDatanode(dn) < 0 : "Block " + block
+             if ((curReplicas == 0) && (num.decommissionedReplicas() > 0)) {
+               decommissionOnlyReplicas++;
+             }
+-            if (fileINode instanceof MutableBlockCollection) {
++            if (bc instanceof MutableBlockCollection) {
+               underReplicatedInOpenFiles++;
+             }
+           }
+@@ -2807,11 +2807,11 @@ assert storedBlock.findDatanode(dn) < 0 : "Block " + block
+ 
+   /* get replication factor of a block */
+   private int getReplication(Block block) {
+-    BlockCollection fileINode = blocksMap.getINode(block);
+-    if (fileINode == null) { // block does not belong to any file
++    BlockCollection bc = blocksMap.getBlockCollection(block);
++    if (bc == null) { // block does not belong to any file
+       return 0;
+     }
+-    return fileINode.getReplication();
++    return bc.getReplication();
+   }
+ 
+ 
+@@ -2883,12 +2883,12 @@ assert storedBlock.findDatanode(dn) < 0 : "Block " + block
+     return this.neededReplications.getCorruptBlockSize();
+   }
+ 
+-  public BlockInfo addINode(BlockInfo block, BlockCollection iNode) {
+-    return blocksMap.addINode(block, iNode);
++  public BlockInfo addBlockCollection(BlockInfo block, BlockCollection bc) {
++    return blocksMap.addBlockCollection(block, bc);
+   }
+ 
+-  public BlockCollection getINode(Block b) {
+-    return blocksMap.getINode(b);
++  public BlockCollection getBlockCollection(Block b) {
++    return blocksMap.getBlockCollection(b);
+   }
+ 
+   /** @return an iterator of the datanodes. */
+@@ -3025,7 +3025,7 @@ assert storedBlock.findDatanode(dn) < 0 : "Block " + block
+   private static class ReplicationWork {
+ 
+     private Block block;
+-    private BlockCollection fileINode;
++    private BlockCollection bc;
+ 
+     private DatanodeDescriptor srcNode;
+     private List<DatanodeDescriptor> containingNodes;
+@@ -3036,14 +3036,14 @@ assert storedBlock.findDatanode(dn) < 0 : "Block " + block
+     private int priority;
+ 
+     public ReplicationWork(Block block,
+-        BlockCollection fileINode,
++        BlockCollection bc,
+         DatanodeDescriptor srcNode,
+         List<DatanodeDescriptor> containingNodes,
+         List<DatanodeDescriptor> liveReplicaNodes,
+         int additionalReplRequired,
+         int priority) {
+       this.block = block;
+-      this.fileINode = fileINode;
++      this.bc = bc;
+       this.srcNode = srcNode;
+       this.containingNodes = containingNodes;
+       this.liveReplicaNodes = liveReplicaNodes;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicy.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicy.java
+index b07d70c..e1efae5 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicy.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicy.java
+@@ -110,11 +110,11 @@ public abstract class BlockPlacementPolicy {
+    * choose <i>numOfReplicas</i> data nodes for <i>writer</i>
+    * If not, return as many as we can.
+    * The base implemenatation extracts the pathname of the file from the
+-   * specified srcInode, but this could be a costly operation depending on the
++   * specified srcBC, but this could be a costly operation depending on the
+    * file system implementation. Concrete implementations of this class should
+    * override this method to avoid this overhead.
+    * 
+-   * @param srcInode The inode of the file for which chooseTarget is being invoked.
++   * @param srcBC block collection of file for which chooseTarget is invoked.
+    * @param numOfReplicas additional number of replicas wanted.
+    * @param writer the writer's machine, null if not in the cluster.
+    * @param chosenNodes datanodes that have been chosen as targets.
+@@ -122,13 +122,13 @@ public abstract class BlockPlacementPolicy {
+    * @return array of DatanodeDescriptor instances chosen as target 
+    * and sorted as a pipeline.
+    */
+-  DatanodeDescriptor[] chooseTarget(BlockCollection srcInode,
++  DatanodeDescriptor[] chooseTarget(BlockCollection srcBC,
+                                     int numOfReplicas,
+                                     DatanodeDescriptor writer,
+                                     List<DatanodeDescriptor> chosenNodes,
+                                     HashMap<Node, Node> excludedNodes,
+                                     long blocksize) {
+-    return chooseTarget(srcInode.getName(), numOfReplicas, writer,
++    return chooseTarget(srcBC.getName(), numOfReplicas, writer,
+                         chosenNodes, excludedNodes, blocksize);
+   }
+ 
+@@ -149,7 +149,7 @@ public abstract class BlockPlacementPolicy {
+    * Decide whether deleting the specified replica of the block still makes 
+    * the block conform to the configured block placement policy.
+    * 
+-   * @param srcInode The inode of the file to which the block-to-be-deleted belongs
++   * @param srcBC block collection of file to which block-to-be-deleted belongs
+    * @param block The block to be deleted
+    * @param replicationFactor The required number of replicas for this block
+    * @param existingReplicas The replica locations of this block that are present
+@@ -158,7 +158,7 @@ public abstract class BlockPlacementPolicy {
+                    listed in the previous parameter.
+    * @return the replica that is the best candidate for deletion
+    */
+-  abstract public DatanodeDescriptor chooseReplicaToDelete(BlockCollection srcInode,
++  abstract public DatanodeDescriptor chooseReplicaToDelete(BlockCollection srcBC,
+                                       Block block, 
+                                       short replicationFactor,
+                                       Collection<DatanodeDescriptor> existingReplicas,
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyDefault.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyDefault.java
+index da25213..a1e7a20 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyDefault.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyDefault.java
+@@ -546,7 +546,7 @@ public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
+   }
+ 
+   @Override
+-  public DatanodeDescriptor chooseReplicaToDelete(BlockCollection inode,
++  public DatanodeDescriptor chooseReplicaToDelete(BlockCollection bc,
+                                                  Block block,
+                                                  short replicationFactor,
+                                                  Collection<DatanodeDescriptor> first, 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlocksMap.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlocksMap.java
+index 71fc544..6757ef4 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlocksMap.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlocksMap.java
+@@ -25,7 +25,7 @@ import org.apache.hadoop.hdfs.util.LightWeightGSet;
+ 
+ /**
+  * This class maintains the map from a block to its metadata.
+- * block's metadata currently includes INode it belongs to and
++ * block's metadata currently includes blockCollection it belongs to and
+  * the datanodes that store the block.
+  */
+ class BlocksMap {
+@@ -92,21 +92,21 @@ class BlocksMap {
+     blocks = null;
+   }
+ 
+-  BlockCollection getINode(Block b) {
++  BlockCollection getBlockCollection(Block b) {
+     BlockInfo info = blocks.get(b);
+-    return (info != null) ? info.getINode() : null;
++    return (info != null) ? info.getBlockCollection() : null;
+   }
+ 
+   /**
+-   * Add block b belonging to the specified file inode to the map.
++   * Add block b belonging to the specified block collection to the map.
+    */
+-  BlockInfo addINode(BlockInfo b, BlockCollection iNode) {
++  BlockInfo addBlockCollection(BlockInfo b, BlockCollection bc) {
+     BlockInfo info = blocks.get(b);
+     if (info != b) {
+       info = b;
+       blocks.put(info);
+     }
+-    info.setINode(iNode);
++    info.setBlockCollection(bc);
+     return info;
+   }
+ 
+@@ -120,7 +120,7 @@ class BlocksMap {
+     if (blockInfo == null)
+       return;
+ 
+-    blockInfo.setINode(null);
++    blockInfo.setBlockCollection(null);
+     for(int idx = blockInfo.numNodes()-1; idx >= 0; idx--) {
+       DatanodeDescriptor dn = blockInfo.getDatanode(idx);
+       dn.removeBlock(blockInfo); // remove from the list and wipe the location
+@@ -168,7 +168,7 @@ class BlocksMap {
+     boolean removed = node.removeBlock(info);
+ 
+     if (info.getDatanode(0) == null     // no datanodes left
+-              && info.getINode() == null) {  // does not belong to a file
++              && info.getBlockCollection() == null) {  // does not belong to a file
+       blocks.remove(b);  // remove block from the map
+     }
+     return removed;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
+index 21dab50..3865617 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
+@@ -309,7 +309,7 @@ public class FSDirectory implements Closeable {
+         INodeFile newF = (INodeFile)newNode;
+         BlockInfo[] blocks = newF.getBlocks();
+         for (int i = 0; i < blocks.length; i++) {
+-          newF.setBlock(i, getBlockManager().addINode(blocks[i], newF));
++          newF.setBlock(i, getBlockManager().addBlockCollection(blocks[i], newF));
+         }
+       }
+     } finally {
+@@ -346,7 +346,7 @@ public class FSDirectory implements Closeable {
+             fileINode.getReplication(),
+             BlockUCState.UNDER_CONSTRUCTION,
+             targets);
+-      getBlockManager().addINode(blockInfo, fileINode);
++      getBlockManager().addBlockCollection(blockInfo, fileINode);
+       fileINode.addBlock(blockInfo);
+ 
+       if(NameNode.stateChangeLog.isDebugEnabled()) {
+@@ -1127,7 +1127,7 @@ public class FSDirectory implements Closeable {
+ 
+       int index = 0;
+       for (BlockInfo b : newnode.getBlocks()) {
+-        BlockInfo info = getBlockManager().addINode(b, newnode);
++        BlockInfo info = getBlockManager().addBlockCollection(b, newnode);
+         newnode.setBlock(index, info); // inode refers to the block in BlocksMap
+         index++;
+       }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLogLoader.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLogLoader.java
+index f4009b9..8bf45af 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLogLoader.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLogLoader.java
+@@ -601,7 +601,7 @@ public class FSEditLogLoader {
+           // OP_ADD operations as each block is allocated.
+           newBI = new BlockInfo(newBlock, file.getReplication());
+         }
+-        fsNamesys.getBlockManager().addINode(newBI, file);
++        fsNamesys.getBlockManager().addBlockCollection(newBI, file);
+         file.addBlock(newBI);
+         fsNamesys.getBlockManager().processQueuedMessagesForBlock(newBlock);
+       }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+index 2933d42..712e1eb 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+@@ -3120,7 +3120,7 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+       if (storedBlock == null) {
+         throw new IOException("Block (=" + lastblock + ") not found");
+       }
+-      INodeFile iFile = (INodeFile) storedBlock.getINode();
++      INodeFile iFile = (INodeFile) storedBlock.getBlockCollection();
+       if (!iFile.isUnderConstruction() || storedBlock.isComplete()) {
+         throw new IOException("Unexpected block (=" + lastblock
+                               + ") since the file (=" + iFile.getLocalName()
+@@ -4409,7 +4409,7 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+    * Returns whether the given block is one pointed-to by a file.
+    */
+   private boolean isValidBlock(Block b) {
+-    return (blockManager.getINode(b) != null);
++    return (blockManager.getBlockCollection(b) != null);
+   }
+ 
+   // Distributed upgrade manager
+@@ -4668,7 +4668,7 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+     }
+     
+     // check file inode
+-    INodeFile file = (INodeFile) storedBlock.getINode();
++    INodeFile file = (INodeFile) storedBlock.getBlockCollection();
+     if (file==null || !file.isUnderConstruction()) {
+       throw new IOException("The file " + storedBlock + 
+           " belonged to does not exist or it is not under construction.");
+@@ -4980,7 +4980,7 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+ 
+       while (blkIterator.hasNext()) {
+         Block blk = blkIterator.next();
+-        INode inode = (INodeFile) blockManager.getINode(blk);
++        INode inode = (INodeFile) blockManager.getBlockCollection(blk);
+         skip++;
+         if (inode != null && blockManager.countNodes(blk).liveReplicas() == 0) {
+           String src = FSDirectory.getFullPathName(inode);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeFile.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeFile.java
+index 55cb688..b3485ec 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeFile.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeFile.java
+@@ -131,7 +131,7 @@ public class INodeFile extends INode implements BlockCollection {
+     }
+     
+     for(BlockInfo bi: newlist) {
+-      bi.setINode(this);
++      bi.setBlockCollection(this);
+     }
+     this.blocks = newlist;
+   }
+@@ -164,7 +164,7 @@ public class INodeFile extends INode implements BlockCollection {
+     if(blocks != null && v != null) {
+       for (BlockInfo blk : blocks) {
+         v.add(blk);
+-        blk.setINode(null);
++        blk.setBlockCollection(null);
+       }
+     }
+     blocks = null;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeFileUnderConstruction.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeFileUnderConstruction.java
+index 03b0fbd..66e33e0 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeFileUnderConstruction.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeFileUnderConstruction.java
+@@ -156,7 +156,7 @@ public class INodeFileUnderConstruction extends INodeFile
+     BlockInfoUnderConstruction ucBlock =
+       lastBlock.convertToBlockUnderConstruction(
+           BlockUCState.UNDER_CONSTRUCTION, targets);
+-    ucBlock.setINode(this);
++    ucBlock.setBlockCollection(this);
+     setBlock(numBlocks()-1, ucBlock);
+     return ucBlock;
+   }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeJspHelper.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeJspHelper.java
+index b4e4822..f284aaa 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeJspHelper.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeJspHelper.java
+@@ -734,7 +734,7 @@ class NamenodeJspHelper {
+         this.inode = null;
+       } else {
+         this.block = new Block(blockId);
+-        this.inode = (INodeFile) blockManager.getINode(block);
++        this.inode = (INodeFile) blockManager.getBlockCollection(block);
+       }
+     }
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestBlockManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestBlockManager.java
+index a6e8c4f..da61f19 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestBlockManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestBlockManager.java
+@@ -380,7 +380,7 @@ public class TestBlockManager {
+     Mockito.doReturn((short)3).when(iNode).getReplication();
+     BlockInfo blockInfo = blockOnNodes(blockId, nodes);
+ 
+-    bm.blocksMap.addINode(blockInfo, iNode);
++    bm.blocksMap.addBlockCollection(blockInfo, iNode);
+     return blockInfo;
+   }
+ 
+diff --git a/hadoop-mapreduce-project/src/contrib/raid/src/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyRaid.java b/hadoop-mapreduce-project/src/contrib/raid/src/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyRaid.java
+index 7797711..5099eea 100644
+--- a/hadoop-mapreduce-project/src/contrib/raid/src/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyRaid.java
++++ b/hadoop-mapreduce-project/src/contrib/raid/src/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyRaid.java
+@@ -144,25 +144,25 @@ public class BlockPlacementPolicyRaid extends BlockPlacementPolicy {
+ 
+   /** {@inheritDoc} */
+   @Override
+-  public DatanodeDescriptor chooseReplicaToDelete(BlockCollection inode,
++  public DatanodeDescriptor chooseReplicaToDelete(BlockCollection bc,
+       Block block, short replicationFactor,
+       Collection<DatanodeDescriptor> first,
+       Collection<DatanodeDescriptor> second) {
+ 
+     DatanodeDescriptor chosenNode = null;
+     try {
+-      String path = cachedFullPathNames.get(inode);
++      String path = cachedFullPathNames.get(bc);
+       FileType type = getFileType(path);
+       if (type == FileType.NOT_RAID) {
+         return defaultPolicy.chooseReplicaToDelete(
+-            inode, block, replicationFactor, first, second);
++            bc, block, replicationFactor, first, second);
+       }
+       List<LocatedBlock> companionBlocks =
+           getCompanionBlocks(path, type, block);
+       if (companionBlocks == null || companionBlocks.size() == 0) {
+         // Use the default method if it is not a valid raided or parity file
+         return defaultPolicy.chooseReplicaToDelete(
+-            inode, block, replicationFactor, first, second);
++            bc, block, replicationFactor, first, second);
+       }
+       // Delete from the first collection first
+       // This ensures the number of unique rack of this block is not reduced
+@@ -174,12 +174,12 @@ public class BlockPlacementPolicyRaid extends BlockPlacementPolicy {
+         return chosenNode;
+       }
+       return defaultPolicy.chooseReplicaToDelete(
+-          inode, block, replicationFactor, first, second);
++          bc, block, replicationFactor, first, second);
+     } catch (Exception e) {
+       LOG.debug("Error happend when choosing replica to delete" +
+         StringUtils.stringifyException(e));
+       return defaultPolicy.chooseReplicaToDelete(
+-          inode, block, replicationFactor, first, second);
++          bc, block, replicationFactor, first, second);
+     }
+   }
+ 
+@@ -446,25 +446,25 @@ public class BlockPlacementPolicyRaid extends BlockPlacementPolicy {
+       };
+ 
+     static private class INodeWithHashCode {
+-      BlockCollection inode;
+-      INodeWithHashCode(BlockCollection inode) {
+-        this.inode = inode;
++      BlockCollection bc;
++      INodeWithHashCode(BlockCollection bc) {
++        this.bc= bc;
+       }
+       @Override
+       public boolean equals(Object obj) {
+-        return inode == obj;
++        return bc== obj;
+       }
+       @Override
+       public int hashCode() {
+-        return System.identityHashCode(inode);
++        return System.identityHashCode(bc);
+       }
+       String getFullPathName() {
+-        return inode.getName();
++        return bc.getName();
+       }
+     }
+ 
+-    public String get(BlockCollection inode) throws IOException {
+-      return cacheInternal.get(new INodeWithHashCode(inode));
++    public String get(BlockCollection bc) throws IOException {
++      return cacheInternal.get(new INodeWithHashCode(bc));
+     }
+   }
+ 
+diff --git a/hadoop-mapreduce-project/src/contrib/raid/src/test/org/apache/hadoop/hdfs/server/blockmanagement/TestBlockPlacementPolicyRaid.java b/hadoop-mapreduce-project/src/contrib/raid/src/test/org/apache/hadoop/hdfs/server/blockmanagement/TestBlockPlacementPolicyRaid.java
+index 19d8143..84cc534 100644
+--- a/hadoop-mapreduce-project/src/contrib/raid/src/test/org/apache/hadoop/hdfs/server/blockmanagement/TestBlockPlacementPolicyRaid.java
++++ b/hadoop-mapreduce-project/src/contrib/raid/src/test/org/apache/hadoop/hdfs/server/blockmanagement/TestBlockPlacementPolicyRaid.java
+@@ -240,19 +240,19 @@ public class TestBlockPlacementPolicyRaid {
+       // test full path cache
+       CachedFullPathNames cachedFullPathNames =
+           new CachedFullPathNames(namesystem);
+-      final BlockCollection[] inodes = NameNodeRaidTestUtil.getBlockCollections(
++      final BlockCollection[] bcs = NameNodeRaidTestUtil.getBlockCollections(
+           namesystem, file1, file2);
+ 
+-      verifyCachedFullPathNameResult(cachedFullPathNames, inodes[0]);
+-      verifyCachedFullPathNameResult(cachedFullPathNames, inodes[0]);
+-      verifyCachedFullPathNameResult(cachedFullPathNames, inodes[1]);
+-      verifyCachedFullPathNameResult(cachedFullPathNames, inodes[1]);
++      verifyCachedFullPathNameResult(cachedFullPathNames, bcs[0]);
++      verifyCachedFullPathNameResult(cachedFullPathNames, bcs[0]);
++      verifyCachedFullPathNameResult(cachedFullPathNames, bcs[1]);
++      verifyCachedFullPathNameResult(cachedFullPathNames, bcs[1]);
+       try {
+         Thread.sleep(1200L);
+       } catch (InterruptedException e) {
+       }
+-      verifyCachedFullPathNameResult(cachedFullPathNames, inodes[1]);
+-      verifyCachedFullPathNameResult(cachedFullPathNames, inodes[0]);
++      verifyCachedFullPathNameResult(cachedFullPathNames, bcs[1]);
++      verifyCachedFullPathNameResult(cachedFullPathNames, bcs[0]);
+     } finally {
+       if (cluster != null) {
+         cluster.shutdown();
+@@ -476,14 +476,14 @@ public class TestBlockPlacementPolicyRaid {
+   }
+ 
+   private void verifyCachedFullPathNameResult(
+-      CachedFullPathNames cachedFullPathNames, BlockCollection inode)
++      CachedFullPathNames cachedFullPathNames, BlockCollection bc)
+   throws IOException {
+-    String res1 = inode.getName();
+-    String res2 = cachedFullPathNames.get(inode);
++    String res1 = bc.getName();
++    String res2 = cachedFullPathNames.get(bc);
+     LOG.info("Actual path name: " + res1);
+     LOG.info("Cached path name: " + res2);
+-    Assert.assertEquals(cachedFullPathNames.get(inode),
+-                        inode.getName());
++    Assert.assertEquals(cachedFullPathNames.get(bc),
++                        bc.getName());
+   }
+ 
+   private void verifyCachedBlocksResult(CachedLocatedBlocks cachedBlocks,
+@@ -502,7 +502,7 @@ public class TestBlockPlacementPolicyRaid {
+   private Collection<LocatedBlock> getCompanionBlocks(
+       FSNamesystem namesystem, BlockPlacementPolicyRaid policy,
+       ExtendedBlock block) throws IOException {
+-    INodeFile inode = (INodeFile)blockManager.blocksMap.getINode(block
++    INodeFile inode = (INodeFile)blockManager.blocksMap.getBlockCollection(block
+         .getLocalBlock());
+     FileType type = policy.getFileType(inode.getFullPathName());
+     return policy.getCompanionBlocks(inode.getFullPathName(), type,
+-- 
+1.7.0.4
+

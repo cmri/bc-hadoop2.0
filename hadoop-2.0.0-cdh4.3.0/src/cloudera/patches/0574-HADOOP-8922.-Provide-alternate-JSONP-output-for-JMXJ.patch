@@ -1,0 +1,163 @@
+From 74e1186fe69eaf7cf57fa5b692d645f819e8189b Mon Sep 17 00:00:00 2001
+From: Robert Joseph Evans <bobby@apache.org>
+Date: Tue, 16 Oct 2012 18:00:01 +0000
+Subject: [PATCH 0574/1357] HADOOP-8922. Provide alternate JSONP output for JMXJsonServlet to allow javascript in browser dashboard (Damien Hardy via bobby)
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1398904 13f79535-47bb-0310-9956-ffa450edef68
+---
+ .../java/org/apache/hadoop/jmx/JMXJsonServlet.java |   82 ++++++++++++--------
+ .../org/apache/hadoop/jmx/TestJMXJsonServlet.java  |   24 ++++++
+ 2 files changed, 74 insertions(+), 32 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/jmx/JMXJsonServlet.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/jmx/JMXJsonServlet.java
+index fe8dbdb..1c20227 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/jmx/JMXJsonServlet.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/jmx/JMXJsonServlet.java
+@@ -113,11 +113,16 @@ import org.codehaus.jackson.JsonGenerator;
+  *  All other objects will be converted to a string and output as such.
+  *  
+  *  The bean's name and modelerType will be returned for all beans.
++ *  
++ *  Optional paramater "callback" should be used to deliver JSONP response.
++ *  
+  */
+ public class JMXJsonServlet extends HttpServlet {
+   private static final Log LOG = LogFactory.getLog(JMXJsonServlet.class);
+ 
+   private static final long serialVersionUID = 1L;
++  
++  private static final String CALLBACK_PARAM = "callback";
+ 
+   // ----------------------------------------------------- Instance Variables
+   /**
+@@ -151,48 +156,61 @@ public class JMXJsonServlet extends HttpServlet {
+         return;
+       }
+ 
+-      response.setContentType("application/json; charset=utf8");
+-
+       PrintWriter writer = response.getWriter();
+-
+       JsonFactory jsonFactory = new JsonFactory();
+       JsonGenerator jg = jsonFactory.createJsonGenerator(writer);
+-      jg.useDefaultPrettyPrinter();
+-      jg.writeStartObject();
+-      if (mBeanServer == null) {
+-        jg.writeStringField("result", "ERROR");
+-        jg.writeStringField("message", "No MBeanServer could be found");
+-        jg.close();
+-        LOG.error("No MBeanServer could be found.");
+-        response.setStatus(HttpServletResponse.SC_NOT_FOUND);
+-        return;
+-      }
+       
+-      // query per mbean attribute
+-      String getmethod = request.getParameter("get");
+-      if (getmethod != null) {
+-        String[] splitStrings = getmethod.split("\\:\\:");
+-        if (splitStrings.length != 2) {
++      try {
++        jg.disable(JsonGenerator.Feature.AUTO_CLOSE_TARGET);
++        jg.useDefaultPrettyPrinter();
++        jg.writeStartObject();
++        
++        // "callback" parameter implies JSONP outpout
++        String jsonpcb = request.getParameter(CALLBACK_PARAM);
++        if (jsonpcb != null) {
++          response.setContentType("application/javascript; charset=utf8");
++          writer.write(jsonpcb + "(");
++        } else {
++          response.setContentType("application/json; charset=utf8");
++        }
++        
++        if (mBeanServer == null) {
+           jg.writeStringField("result", "ERROR");
+-          jg.writeStringField("message", "query format is not as expected.");
++          jg.writeStringField("message", "No MBeanServer could be found");
++          jg.close();
++          LOG.error("No MBeanServer could be found.");
++          response.setStatus(HttpServletResponse.SC_NOT_FOUND);
++          return;
++        }
++              
++        // query per mbean attribute
++        String getmethod = request.getParameter("get");
++        if (getmethod != null) {
++          String[] splitStrings = getmethod.split("\\:\\:");
++          if (splitStrings.length != 2) {
++            jg.writeStringField("result", "ERROR");
++            jg.writeStringField("message", "query format is not as expected.");
++            jg.close();
++            response.setStatus(HttpServletResponse.SC_BAD_REQUEST);
++            return;
++          }
++          listBeans(jg, new ObjectName(splitStrings[0]), splitStrings[1],
++              response);
+           jg.close();
+-          response.setStatus(HttpServletResponse.SC_BAD_REQUEST);
+           return;
+         }
+-        listBeans(jg, new ObjectName(splitStrings[0]), splitStrings[1],
+-            response);
+-        jg.close();
+-        return;
+-      }
+ 
+-      // query per mbean
+-      String qry = request.getParameter("qry");
+-      if (qry == null) {
+-        qry = "*:*";
++        // query per mbean
++        String qry = request.getParameter("qry");
++        if (qry == null) {
++          qry = "*:*";
++        }
++        listBeans(jg, new ObjectName(qry), null, response);
++      } finally {
++        jg.close();
++        writer.write(");");
++        writer.close();
+       }
+-      listBeans(jg, new ObjectName(qry), null, response);
+-      jg.close();
+-
+     } catch ( IOException e ) {
+       LOG.error("Caught an exception while processing JMX request", e);
+       response.setStatus(HttpServletResponse.SC_INTERNAL_SERVER_ERROR);
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/jmx/TestJMXJsonServlet.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/jmx/TestJMXJsonServlet.java
+index 62a2af9..a03eba9 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/jmx/TestJMXJsonServlet.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/jmx/TestJMXJsonServlet.java
+@@ -78,5 +78,29 @@ public class TestJMXJsonServlet extends HttpServerFunctionalTest {
+         "/jmx?get=java.lang:type=Memory::"));
+     LOG.info("/jmx RESULT: "+result);
+     assertReFind("\"ERROR\"", result);
++
++    // test to get JSONP result
++    result = readOutput(new URL(baseUrl, "/jmx?qry=java.lang:type=Memory&callback=mycallback1"));
++    LOG.info("/jmx?qry=java.lang:type=Memory&callback=mycallback RESULT: "+result);
++    assertReFind("^mycallback1\\(\\{", result);
++    assertReFind("\\}\\);$", result);
++
++    // negative test to get an attribute of a mbean as JSONP
++    result = readOutput(new URL(baseUrl,
++        "/jmx?get=java.lang:type=Memory::&callback=mycallback2"));
++    LOG.info("/jmx RESULT: "+result);
++    assertReFind("^mycallback2\\(\\{", result);
++    assertReFind("\"ERROR\"", result);
++    assertReFind("\\}\\);$", result);
++
++    // test to get an attribute of a mbean as JSONP
++    result = readOutput(new URL(baseUrl,
++        "/jmx?get=java.lang:type=Memory::HeapMemoryUsage&callback=mycallback3"));
++    LOG.info("/jmx RESULT: "+result);
++    assertReFind("^mycallback3\\(\\{", result);
++    assertReFind("\"name\"\\s*:\\s*\"java.lang:type=Memory\"", result);
++    assertReFind("\"committed\"\\s*:", result);
++    assertReFind("\\}\\);$", result);
++
+   }
+ }
+-- 
+1.7.0.4
+

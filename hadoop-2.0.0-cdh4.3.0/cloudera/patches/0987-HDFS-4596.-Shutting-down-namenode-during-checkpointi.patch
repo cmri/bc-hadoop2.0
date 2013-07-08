@@ -1,0 +1,115 @@
+From 0ba1fa9f8921f6f12ddf1d3d55f34d7df33a90d3 Mon Sep 17 00:00:00 2001
+From: Aaron Twining Myers <atm@apache.org>
+Date: Thu, 14 Mar 2013 20:01:03 +0000
+Subject: [PATCH 0987/1357] HDFS-4596. Shutting down namenode during checkpointing can lead to md5sum error. Contributed by Andrew Wang.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1456630 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 35803832ae9a40e94329bd04cef2f3158032e6c3)
+---
+ .../server/namenode/CheckpointFaultInjector.java   |    1 +
+ .../hadoop/hdfs/server/namenode/FSImage.java       |    6 ++-
+ .../hdfs/server/namenode/TestCheckpoint.java       |   54 ++++++++++++++++++++
+ 3 files changed, 60 insertions(+), 1 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/CheckpointFaultInjector.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/CheckpointFaultInjector.java
+index d898250..3a55025 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/CheckpointFaultInjector.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/CheckpointFaultInjector.java
+@@ -43,4 +43,5 @@ class CheckpointFaultInjector {
+     return false;
+   }
+   
++  public void afterMD5Rename() throws IOException {}
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java
+index 4e39650..12c6547 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java
+@@ -1110,7 +1110,7 @@ public class FSImage implements Closeable {
+    */
+   public synchronized void saveDigestAndRenameCheckpointImage(
+       long txid, MD5Hash digest) throws IOException {
+-    renameCheckpoint(txid);
++    // Write and rename MD5 file
+     List<StorageDirectory> badSds = Lists.newArrayList();
+     
+     for (StorageDirectory sd : storage.dirIterable(NameNodeDirType.IMAGE)) {
+@@ -1123,6 +1123,10 @@ public class FSImage implements Closeable {
+     }
+     storage.reportErrorsOnDirectories(badSds);
+     
++    CheckpointFaultInjector.getInstance().afterMD5Rename();
++    
++    // Rename image from tmp file
++    renameCheckpoint(txid);
+     // So long as this is the newest image available,
+     // advertise it as such to other checkpointers
+     // from now on
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestCheckpoint.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestCheckpoint.java
+index aa831d2..aa7677a 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestCheckpoint.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestCheckpoint.java
+@@ -1305,6 +1305,60 @@ public class TestCheckpoint {
+   }
+   
+   /**
++   * Test NN restart if a failure happens in between creating the fsimage
++   * MD5 file and renaming the fsimage.
++   */
++  @Test(timeout=30000)
++  public void testFailureBeforeRename () throws IOException {
++    Configuration conf = new HdfsConfiguration();
++    FSDataOutputStream fos = null;
++    SecondaryNameNode secondary = null;
++    MiniDFSCluster cluster = null;
++    FileSystem fs = null;
++    NameNode namenode = null;
++
++    try {
++      cluster = new MiniDFSCluster.Builder(conf).numDataNodes(numDatanodes)
++          .build();
++      cluster.waitActive();
++      namenode = cluster.getNameNode();
++      fs = cluster.getFileSystem();
++      secondary = startSecondaryNameNode(conf);
++      fos = fs.create(new Path("tmpfile0"));
++      fos.write(new byte[] { 0, 1, 2, 3 });
++      secondary.doCheckpoint();
++      fos.write(new byte[] { 0, 1, 2, 3 });
++      fos.hsync();
++
++      // Cause merge to fail in next checkpoint.
++      Mockito.doThrow(new IOException(
++          "Injecting failure after MD5Rename"))
++          .when(faultInjector).afterMD5Rename();
++
++      try {
++        secondary.doCheckpoint();
++        fail("Fault injection failed.");
++      } catch (IOException ioe) {
++        // This is expected.
++      }
++      Mockito.reset(faultInjector);
++      // Namenode should still restart successfully
++      cluster.restartNameNode();
++    } finally {
++      if (secondary != null) {
++        secondary.shutdown();
++      }
++      if (fs != null) {
++        fs.close();
++      }
++      if (cluster != null) {
++        cluster.shutdown();
++      }
++      Mockito.reset(faultInjector);
++    }
++  }
++
++  /**
+    * Test case where two secondary namenodes are checkpointing the same
+    * NameNode. This differs from {@link #testMultipleSecondaryNamenodes()}
+    * since that test runs against two distinct NNs.
+-- 
+1.7.0.4
+

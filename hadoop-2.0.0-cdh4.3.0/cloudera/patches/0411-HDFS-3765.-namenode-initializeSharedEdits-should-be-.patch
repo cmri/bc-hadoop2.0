@@ -1,0 +1,408 @@
+From bf0aba9b291670c33118572d63df9b708de30866 Mon Sep 17 00:00:00 2001
+From: Todd Lipcon <todd@apache.org>
+Date: Tue, 14 Aug 2012 20:11:40 +0000
+Subject: [PATCH 0411/1357] HDFS-3765. namenode -initializeSharedEdits should be able to initialize all shared storages. Contributed by Vinay and Todd Lipcon.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1373061 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 2db527c63db27afbf7f36d40a4bbb76efdf86e41)
+---
+ .../main/java/org/apache/hadoop/util/ExitUtil.java |    2 +-
+ .../bkjournal/TestBookKeeperAsHASharedDir.java     |  110 +++++++++++++++++++
+ .../hadoop/hdfs/server/namenode/NameNode.java      |  113 +++++++++++---------
+ .../hadoop/hdfs/server/namenode/ha/HATestUtil.java |    2 +-
+ .../namenode/ha/TestInitializeSharedEdits.java     |    7 ++
+ 5 files changed, 182 insertions(+), 52 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/ExitUtil.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/ExitUtil.java
+index a539a7a..72fdb4e 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/ExitUtil.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/ExitUtil.java
+@@ -112,4 +112,4 @@ public final class ExitUtil {
+   public static void terminate(int status) throws ExitException {
+     terminate(status, "ExitException");
+   }
+-}
+\ No newline at end of file
++}
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/bkjournal/src/test/java/org/apache/hadoop/contrib/bkjournal/TestBookKeeperAsHASharedDir.java b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/bkjournal/src/test/java/org/apache/hadoop/contrib/bkjournal/TestBookKeeperAsHASharedDir.java
+index 7f97a6d..edfbcc3 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/bkjournal/src/test/java/org/apache/hadoop/contrib/bkjournal/TestBookKeeperAsHASharedDir.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/bkjournal/src/test/java/org/apache/hadoop/contrib/bkjournal/TestBookKeeperAsHASharedDir.java
+@@ -18,6 +18,7 @@
+ package org.apache.hadoop.contrib.bkjournal;
+ 
+ import static org.junit.Assert.*;
++
+ import org.junit.Test;
+ import org.junit.Before;
+ import org.junit.After;
+@@ -25,6 +26,9 @@ import org.junit.BeforeClass;
+ import org.junit.AfterClass;
+ 
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.ha.ServiceFailedException;
++import org.apache.hadoop.ha.HAServiceProtocol.RequestSource;
++import org.apache.hadoop.ha.HAServiceProtocol.StateChangeRequestInfo;
+ import org.apache.hadoop.hdfs.DFSConfigKeys;
+ 
+ import org.apache.hadoop.hdfs.HAUtil;
+@@ -36,18 +40,26 @@ import org.apache.hadoop.ha.ServiceFailedException;
+ import org.apache.hadoop.hdfs.server.namenode.ha.HATestUtil;
+ import org.apache.hadoop.hdfs.server.namenode.NameNode;
+ import org.apache.hadoop.hdfs.server.namenode.FSEditLogTestUtil;
++import org.apache.hadoop.hdfs.server.namenode.NameNodeAdapter;
+ 
+ import org.apache.hadoop.ipc.RemoteException;
+ 
+ import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.fs.FileUtil;
+ import org.apache.hadoop.fs.Path;
+ 
++import org.apache.hadoop.test.GenericTestUtils;
++import org.apache.hadoop.util.ExitUtil;
++import org.apache.hadoop.util.ExitUtil.ExitException;
++
+ import org.apache.bookkeeper.proto.BookieServer;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ 
++import java.io.File;
+ import java.io.IOException;
++import java.net.URISyntaxException;
+ 
+ import static org.mockito.Matchers.anyInt;
+ import static org.mockito.Mockito.mock;
+@@ -72,6 +84,11 @@ public class TestBookKeeperAsHASharedDir {
+     bkutil = new BKJMUtil(numBookies);
+     bkutil.start();
+   }
++  
++  @Before
++  public void clearExitStatus() {
++    ExitUtil.resetFirstExitException();
++  }
+ 
+   @AfterClass
+   public static void teardownBookkeeper() throws Exception {
+@@ -259,4 +276,97 @@ public class TestBookKeeperAsHASharedDir {
+       }
+     }
+   }
++  
++  /**
++   * Use NameNode INTIALIZESHAREDEDITS to initialize the shared edits. i.e. copy
++   * the edits log segments to new bkjm shared edits.
++   * 
++   * @throws Exception
++   */
++  @Test
++  public void testInitializeBKSharedEdits() throws Exception {
++    MiniDFSCluster cluster = null;
++    try {
++      Configuration conf = new Configuration();
++      HAUtil.setAllowStandbyReads(conf, true);
++      conf.setInt(DFSConfigKeys.DFS_HA_TAILEDITS_PERIOD_KEY, 1);
++
++      MiniDFSNNTopology topology = MiniDFSNNTopology.simpleHATopology();
++      cluster = new MiniDFSCluster.Builder(conf).nnTopology(topology)
++          .numDataNodes(0).build();
++      cluster.waitActive();
++      // Shutdown and clear the current filebased shared dir.
++      cluster.shutdownNameNodes();
++      File shareddir = new File(cluster.getSharedEditsDir(0, 1));
++      assertTrue("Initial Shared edits dir not fully deleted",
++          FileUtil.fullyDelete(shareddir));
++
++      // Check namenodes should not start without shared dir.
++      assertCanNotStartNamenode(cluster, 0);
++      assertCanNotStartNamenode(cluster, 1);
++
++      // Configure bkjm as new shared edits dir in both namenodes
++      Configuration nn1Conf = cluster.getConfiguration(0);
++      Configuration nn2Conf = cluster.getConfiguration(1);
++      nn1Conf.set(DFSConfigKeys.DFS_NAMENODE_SHARED_EDITS_DIR_KEY, BKJMUtil
++          .createJournalURI("/initializeSharedEdits").toString());
++      nn2Conf.set(DFSConfigKeys.DFS_NAMENODE_SHARED_EDITS_DIR_KEY, BKJMUtil
++          .createJournalURI("/initializeSharedEdits").toString());
++      BKJMUtil.addJournalManagerDefinition(nn1Conf);
++      BKJMUtil.addJournalManagerDefinition(nn2Conf);
++
++      // Initialize the BKJM shared edits.
++      assertFalse(NameNode.initializeSharedEdits(nn1Conf));
++
++      // NameNode should be able to start and should be in sync with BKJM as
++      // shared dir
++      assertCanStartHANameNodes(cluster, conf, "/testBKJMInitialize");
++    } finally {
++      if (cluster != null) {
++        cluster.shutdown();
++      }
++    }
++  }
++
++  private void assertCanNotStartNamenode(MiniDFSCluster cluster, int nnIndex) {
++    try {
++      cluster.restartNameNode(nnIndex, false);
++      fail("Should not have been able to start NN" + (nnIndex)
++          + " without shared dir");
++    } catch (IOException ioe) {
++      LOG.info("Got expected exception", ioe);
++      GenericTestUtils.assertExceptionContains(
++          "Cannot start an HA namenode with name dirs that need recovery", ioe);
++    }
++  }
++
++  private void assertCanStartHANameNodes(MiniDFSCluster cluster,
++      Configuration conf, String path) throws ServiceFailedException,
++      IOException, URISyntaxException, InterruptedException {
++    // Now should be able to start both NNs. Pass "false" here so that we don't
++    // try to waitActive on all NNs, since the second NN doesn't exist yet.
++    cluster.restartNameNode(0, false);
++    cluster.restartNameNode(1, true);
++
++    // Make sure HA is working.
++    cluster
++        .getNameNode(0)
++        .getRpcServer()
++        .transitionToActive(
++            new StateChangeRequestInfo(RequestSource.REQUEST_BY_USER));
++    FileSystem fs = null;
++    try {
++      Path newPath = new Path(path);
++      fs = HATestUtil.configureFailoverFs(cluster, conf);
++      assertTrue(fs.mkdirs(newPath));
++      HATestUtil.waitForStandbyToCatchUp(cluster.getNameNode(0),
++          cluster.getNameNode(1));
++      assertTrue(NameNodeAdapter.getFileInfo(cluster.getNameNode(1),
++          newPath.toString(), false).isDir());
++    } finally {
++      if (fs != null) {
++        fs.close();
++      }
++    }
++  }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNode.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNode.java
+index 6f30c1c..2547c71 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNode.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNode.java
+@@ -17,18 +17,12 @@
+  */
+ package org.apache.hadoop.hdfs.server.namenode;
+ 
+-import java.io.File;
+-import java.io.FileInputStream;
+-import java.io.FileNotFoundException;
+ import java.io.IOException;
+-import java.io.InputStream;
+-import java.io.OutputStream;
+ import java.net.InetSocketAddress;
+ import java.net.URI;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collection;
+-import java.util.Iterator;
+ import java.util.List;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+@@ -42,10 +36,10 @@ import org.apache.hadoop.ha.HealthCheckFailedException;
+ import org.apache.hadoop.ha.ServiceFailedException;
+ import org.apache.hadoop.fs.CommonConfigurationKeys;
+ import org.apache.hadoop.fs.FileSystem;
+-import org.apache.hadoop.fs.FileUtil;
+ import org.apache.hadoop.fs.Trash;
+ import static org.apache.hadoop.hdfs.DFSConfigKeys.*;
+ 
++import org.apache.hadoop.hdfs.DFSConfigKeys;
+ import org.apache.hadoop.hdfs.DFSUtil;
+ import org.apache.hadoop.hdfs.HAUtil;
+ import org.apache.hadoop.hdfs.HdfsConfiguration;
+@@ -53,9 +47,6 @@ import org.apache.hadoop.hdfs.protocol.ClientProtocol;
+ import org.apache.hadoop.hdfs.protocol.HdfsConstants;
+ import org.apache.hadoop.hdfs.server.common.HdfsServerConstants.NamenodeRole;
+ import org.apache.hadoop.hdfs.server.common.HdfsServerConstants.StartupOption;
+-import org.apache.hadoop.hdfs.server.common.Storage.StorageDirectory;
+-import org.apache.hadoop.hdfs.server.namenode.FileJournalManager.EditLogFile;
+-import org.apache.hadoop.hdfs.server.namenode.JournalSet.JournalAndStream;
+ import org.apache.hadoop.hdfs.server.namenode.ha.ActiveState;
+ import org.apache.hadoop.hdfs.server.namenode.ha.BootstrapStandby;
+ import org.apache.hadoop.hdfs.server.namenode.ha.HAContext;
+@@ -68,8 +59,6 @@ import org.apache.hadoop.hdfs.server.protocol.NamenodeProtocol;
+ import org.apache.hadoop.hdfs.server.protocol.NamenodeProtocols;
+ import org.apache.hadoop.hdfs.server.protocol.NamenodeRegistration;
+ import org.apache.hadoop.hdfs.server.protocol.NamespaceInfo;
+-import org.apache.hadoop.hdfs.util.AtomicFileOutputStream;
+-import org.apache.hadoop.io.IOUtils;
+ import org.apache.hadoop.ipc.Server;
+ import org.apache.hadoop.ipc.StandbyException;
+ import org.apache.hadoop.metrics2.lib.DefaultMetricsSystem;
+@@ -88,6 +77,7 @@ import static org.apache.hadoop.util.ExitUtil.terminate;
+ import static org.apache.hadoop.util.ToolRunner.confirmPrompt;
+ 
+ import com.google.common.annotations.VisibleForTesting;
++import com.google.common.base.Preconditions;
+ import com.google.common.collect.Lists;
+ 
+ /**********************************************************
+@@ -764,9 +754,18 @@ public class NameNode {
+     String nsId = DFSUtil.getNamenodeNameServiceId(conf);
+     String namenodeId = HAUtil.getNameNodeId(conf, nsId);
+     initializeGenericKeys(conf, nsId, namenodeId);
++    
++    if (conf.get(DFSConfigKeys.DFS_NAMENODE_SHARED_EDITS_DIR_KEY) == null) {
++      LOG.fatal("No shared edits directory configured for namespace " +
++          nsId + " namenode " + namenodeId);
++      return false;
++    }
++
+     NNStorage existingStorage = null;
+     try {
+-      FSNamesystem fsns = FSNamesystem.loadFromDisk(conf,
++      Configuration confWithoutShared = new Configuration(conf);
++      confWithoutShared.unset(DFSConfigKeys.DFS_NAMENODE_SHARED_EDITS_DIR_KEY);
++      FSNamesystem fsns = FSNamesystem.loadFromDisk(confWithoutShared,
+           FSNamesystem.getNamespaceDirs(conf),
+           FSNamesystem.getNamespaceEditsDirs(conf, false));
+       
+@@ -796,11 +795,9 @@ public class NameNode {
+       fsns.getFSImage().getEditLog().close();
+       fsns.getFSImage().getEditLog().initJournalsForWrite();
+       fsns.getFSImage().getEditLog().recoverUnclosedStreams();
+-      
+-      if (copyEditLogSegmentsToSharedDir(fsns, sharedEditsDirs,
+-          newSharedStorage, conf)) {
+-        return true; // aborted
+-      }
++
++      copyEditLogSegmentsToSharedDir(fsns, sharedEditsDirs, newSharedStorage,
++          conf);
+     } catch (IOException ioe) {
+       LOG.error("Could not initialize shared edits dir", ioe);
+       return true; // aborted
+@@ -818,43 +815,59 @@ public class NameNode {
+     }
+     return false; // did not abort
+   }
+-  
+-  private static boolean copyEditLogSegmentsToSharedDir(FSNamesystem fsns,
++
++  private static void copyEditLogSegmentsToSharedDir(FSNamesystem fsns,
+       Collection<URI> sharedEditsDirs, NNStorage newSharedStorage,
+-      Configuration conf) throws FileNotFoundException, IOException {
++      Configuration conf) throws IOException {
++    Preconditions.checkArgument(!sharedEditsDirs.isEmpty(),
++        "No shared edits specified");
+     // Copy edit log segments into the new shared edits dir.
+-    for (JournalAndStream jas : fsns.getFSImage().getEditLog().getJournals()) {
+-      FileJournalManager fjm = null;
+-      if (!(jas.getManager() instanceof FileJournalManager)) {
+-        LOG.error("Cannot populate shared edits dir from non-file " +
+-            "journal manager: " + jas.getManager());
+-        return true; // aborted
+-      } else {
+-        fjm = (FileJournalManager) jas.getManager();
+-      }
+-      for (EditLogFile elf : fjm.getLogFiles(fsns.getFSImage()
+-          .getMostRecentCheckpointTxId())) {
+-        File editLogSegment = elf.getFile();
+-        for (URI sharedEditsUri : sharedEditsDirs) {
+-          StorageDirectory sharedEditsDir = newSharedStorage
+-              .getStorageDirectory(sharedEditsUri);
+-          File targetFile = new File(sharedEditsDir.getCurrentDir(),
+-              editLogSegment.getName());
+-          if (!targetFile.exists()) {
+-            InputStream in = null;
+-            OutputStream out = null;
+-            try {
+-              in = new FileInputStream(editLogSegment);
+-              out = new AtomicFileOutputStream(targetFile);
+-              IOUtils.copyBytes(in, out, conf);
+-            } finally {
+-              IOUtils.cleanup(LOG, in, out);
+-            }
+-          }
++    List<URI> sharedEditsUris = new ArrayList<URI>(sharedEditsDirs);
++    FSEditLog newSharedEditLog = new FSEditLog(conf, newSharedStorage,
++        sharedEditsUris);
++    newSharedEditLog.initJournalsForWrite();
++    newSharedEditLog.recoverUnclosedStreams();
++    
++    FSEditLog sourceEditLog = fsns.getFSImage().editLog;
++    
++    long fromTxId = fsns.getFSImage().getMostRecentCheckpointTxId();
++    Collection<EditLogInputStream> streams = sourceEditLog.selectInputStreams(
++        fromTxId+1, 0);
++
++    // Set the nextTxid to the CheckpointTxId+1
++    newSharedEditLog.setNextTxId(fromTxId + 1);
++    
++    // Copy all edits after last CheckpointTxId to shared edits dir
++    for (EditLogInputStream stream : streams) {
++      LOG.debug("Beginning to copy stream " + stream + " to shared edits");
++      FSEditLogOp op;
++      boolean segmentOpen = false;
++      while ((op = stream.readOp()) != null) {
++        if (LOG.isTraceEnabled()) {
++          LOG.trace("copying op: " + op);
++        }
++        if (!segmentOpen) {
++          newSharedEditLog.startLogSegment(op.txid, false);
++          segmentOpen = true;
++        }
++        
++        newSharedEditLog.logEdit(op);
++
++        if (op.opCode == FSEditLogOpCodes.OP_END_LOG_SEGMENT) {
++          newSharedEditLog.logSync();
++          newSharedEditLog.endCurrentLogSegment(false);
++          LOG.debug("ending log segment because of END_LOG_SEGMENT op in " + stream);
++          segmentOpen = false;
+         }
+       }
++      
++      if (segmentOpen) {
++        LOG.debug("ending log segment because of end of stream in " + stream);
++        newSharedEditLog.logSync();
++        newSharedEditLog.endCurrentLogSegment(false);
++        segmentOpen = false;
++      }
+     }
+-    return false; // did not abort
+   }
+ 
+   private static boolean finalize(Configuration conf,
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/HATestUtil.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/HATestUtil.java
+index 40d7e08..9b87eb7 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/HATestUtil.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/HATestUtil.java
+@@ -65,7 +65,7 @@ public abstract class HATestUtil {
+    * @throws CouldNotCatchUpException if the standby doesn't catch up to the
+    *         active in NN_LAG_TIMEOUT milliseconds
+    */
+-  static void waitForStandbyToCatchUp(NameNode active,
++  public static void waitForStandbyToCatchUp(NameNode active,
+       NameNode standby) throws InterruptedException, IOException, CouldNotCatchUpException {
+     
+     long activeTxId = active.getNamesystem().getFSImage().getEditLog()
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestInitializeSharedEdits.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestInitializeSharedEdits.java
+index 72110b2..47182d2 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestInitializeSharedEdits.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestInitializeSharedEdits.java
+@@ -159,6 +159,13 @@ public class TestInitializeSharedEdits {
+   }
+   
+   @Test
++  public void testFailWhenNoSharedEditsSpecified() throws Exception {
++    Configuration confNoShared = new Configuration(conf);
++    confNoShared.unset(DFSConfigKeys.DFS_NAMENODE_SHARED_EDITS_DIR_KEY);
++    assertFalse(NameNode.initializeSharedEdits(confNoShared, true));
++  }
++  
++  @Test
+   public void testDontOverWriteExistingDir() {
+     assertFalse(NameNode.initializeSharedEdits(conf, false));
+     assertTrue(NameNode.initializeSharedEdits(conf, false));
+-- 
+1.7.0.4
+

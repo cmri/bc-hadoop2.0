@@ -1,0 +1,96 @@
+From 17293454236c67d3296923ae0d58a0bf9be1de05 Mon Sep 17 00:00:00 2001
+From: Thomas White <tomwhite@apache.org>
+Date: Thu, 10 Jan 2013 10:09:06 +0000
+Subject: [PATCH 0840/1357] Merge -r 1431250:1431251 from trunk to branch-2. Fixes: HADOOP-9183. Potential deadlock in ActiveStandbyElector.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/branch-2@1431252 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 1ea60b498d92de1fbbfdaa2a6df48bfc87b46500)
+---
+ .../org/apache/hadoop/ha/ActiveStandbyElector.java |   35 ++++++--------------
+ 1 files changed, 10 insertions(+), 25 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ha/ActiveStandbyElector.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ha/ActiveStandbyElector.java
+index 95d0ad4..0f254d9 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ha/ActiveStandbyElector.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ha/ActiveStandbyElector.java
+@@ -613,7 +613,7 @@ public class ActiveStandbyElector implements StatCallback, StringCallback {
+     // Unfortunately, the ZooKeeper constructor connects to ZooKeeper and
+     // may trigger the Connected event immediately. So, if we register the
+     // watcher after constructing ZooKeeper, we may miss that event. Instead,
+-    // we construct the watcher first, and have it queue any events it receives
++    // we construct the watcher first, and have it block any events it receives
+     // before we can set its ZooKeeper reference.
+     WatcherWithClientRef watcher = new WatcherWithClientRef();
+     ZooKeeper zk = new ZooKeeper(zkHostPort, zkSessionTimeout, watcher);
+@@ -998,19 +998,17 @@ public class ActiveStandbyElector implements StatCallback, StringCallback {
+     private CountDownLatch hasReceivedEvent = new CountDownLatch(1);
+ 
+     /**
+-     * If any events arrive before the reference to ZooKeeper is set,
+-     * they get queued up and later forwarded when the reference is
+-     * available.
++     * Latch used to wait until the reference to ZooKeeper is set.
+      */
+-    private final List<WatchedEvent> queuedEvents = Lists.newLinkedList();
++    private CountDownLatch hasSetZooKeeper = new CountDownLatch(1);
+     
+     private WatcherWithClientRef() {
+     }
+ 
+     private WatcherWithClientRef(ZooKeeper zk) {
+-      this.zk = zk;
++      setZooKeeperRef(zk);
+     }
+-    
++
+     /**
+      * Waits for the next event from ZooKeeper to arrive.
+      * 
+@@ -1025,9 +1023,7 @@ public class ActiveStandbyElector implements StatCallback, StringCallback {
+         if (!hasReceivedEvent.await(connectionTimeoutMs, TimeUnit.MILLISECONDS)) {
+           LOG.error("Connection timed out: couldn't connect to ZooKeeper in "
+               + connectionTimeoutMs + " milliseconds");
+-          synchronized (this) {
+-            zk.close();
+-          }
++          zk.close();
+           throw KeeperException.create(Code.CONNECTIONLOSS);
+         }
+       } catch (InterruptedException e) {
+@@ -1037,29 +1033,18 @@ public class ActiveStandbyElector implements StatCallback, StringCallback {
+       }
+     }
+ 
+-    private synchronized void setZooKeeperRef(ZooKeeper zk) {
++    private void setZooKeeperRef(ZooKeeper zk) {
+       Preconditions.checkState(this.zk == null,
+           "zk already set -- must be set exactly once");
+       this.zk = zk;
+-      
+-      for (WatchedEvent e : queuedEvents) {
+-        forwardEvent(e);
+-      }
+-      queuedEvents.clear();
++      hasSetZooKeeper.countDown();
+     }
+ 
+     @Override
+-    public synchronized void process(WatchedEvent event) {
+-      if (zk != null) {
+-        forwardEvent(event);
+-      } else {
+-        queuedEvents.add(event);
+-      }
+-    }
+-    
+-    private void forwardEvent(WatchedEvent event) {
++    public void process(WatchedEvent event) {
+       hasReceivedEvent.countDown();
+       try {
++        hasSetZooKeeper.await(zkSessionTimeout, TimeUnit.MILLISECONDS);
+         ActiveStandbyElector.this.processWatchEvent(
+             zk, event);
+       } catch (Throwable t) {
+-- 
+1.7.0.4
+

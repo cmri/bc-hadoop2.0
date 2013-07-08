@@ -1,0 +1,116 @@
+From ff6fda06e4a5876689c07c272b94fcc13781e576 Mon Sep 17 00:00:00 2001
+From: Eli Collins <eli@apache.org>
+Date: Mon, 10 Sep 2012 18:46:13 +0000
+Subject: [PATCH 0500/1357] HDFS-3907. Allow multiple users for local block readers. Contributed by Eli Collins
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1383031 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 0c9e9575c3c1b03cd9ac553b901b247423e1fe02)
+---
+ .../hadoop/hdfs/server/datanode/DataNode.java      |    8 ++--
+ .../hadoop/hdfs/TestShortCircuitLocalRead.java     |   31 ++++++++++++++++----
+ 2 files changed, 29 insertions(+), 10 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNode.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNode.java
+index 0973c59..d92715b 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNode.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNode.java
+@@ -279,7 +279,7 @@ public class DataNode extends Configured
+   private AbstractList<File> dataDirs;
+   private Configuration conf;
+ 
+-  private final String userWithLocalPathAccess;
++  private final List<String> usersWithLocalPathAccess;
+   private boolean connectToDnViaHostname;
+   ReadaheadPool readaheadPool;
+   private final boolean getHdfsBlockLocationsEnabled;
+@@ -302,8 +302,8 @@ public class DataNode extends Configured
+            final SecureResources resources) throws IOException {
+     super(conf);
+ 
+-    this.userWithLocalPathAccess =
+-        conf.get(DFSConfigKeys.DFS_BLOCK_LOCAL_PATH_ACCESS_USER_KEY);
++    this.usersWithLocalPathAccess = Arrays.asList(
++        conf.getTrimmedStrings(DFSConfigKeys.DFS_BLOCK_LOCAL_PATH_ACCESS_USER_KEY));
+     this.connectToDnViaHostname = conf.getBoolean(
+         DFSConfigKeys.DFS_DATANODE_USE_DN_HOSTNAME,
+         DFSConfigKeys.DFS_DATANODE_USE_DN_HOSTNAME_DEFAULT);
+@@ -1010,7 +1010,7 @@ public class DataNode extends Configured
+   private void checkBlockLocalPathAccess() throws IOException {
+     checkKerberosAuthMethod("getBlockLocalPathInfo()");
+     String currentUser = UserGroupInformation.getCurrentUser().getShortUserName();
+-    if (!currentUser.equals(this.userWithLocalPathAccess)) {
++    if (!usersWithLocalPathAccess.contains(currentUser)) {
+       throw new AccessControlException(
+           "Can't continue with getBlockLocalPathInfo() "
+               + "authorization. The user " + currentUser
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestShortCircuitLocalRead.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestShortCircuitLocalRead.java
+index 5fed40c..6690b86 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestShortCircuitLocalRead.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestShortCircuitLocalRead.java
+@@ -224,7 +224,8 @@ public class TestShortCircuitLocalRead {
+   @Test
+   public void testGetBlockLocalPathInfo() throws IOException, InterruptedException {
+     final Configuration conf = new Configuration();
+-    conf.set(DFSConfigKeys.DFS_BLOCK_LOCAL_PATH_ACCESS_USER_KEY, "alloweduser");
++    conf.set(DFSConfigKeys.DFS_BLOCK_LOCAL_PATH_ACCESS_USER_KEY,
++        "alloweduser1,alloweduser2");
+     MiniDFSCluster cluster = new MiniDFSCluster.Builder(conf).numDataNodes(1)
+         .format(true).build();
+     cluster.waitActive();
+@@ -232,8 +233,10 @@ public class TestShortCircuitLocalRead {
+     FileSystem fs = cluster.getFileSystem();
+     try {
+       DFSTestUtil.createFile(fs, new Path("/tmp/x"), 16, (short) 1, 23);
+-      UserGroupInformation aUgi = UserGroupInformation
+-          .createRemoteUser("alloweduser");
++      UserGroupInformation aUgi1 =
++          UserGroupInformation.createRemoteUser("alloweduser1");
++      UserGroupInformation aUgi2 =
++          UserGroupInformation.createRemoteUser("alloweduser2");
+       LocatedBlocks lb = cluster.getNameNode().getRpcServer()
+           .getBlockLocations("/tmp/x", 0, 16);
+       // Create a new block object, because the block inside LocatedBlock at
+@@ -241,7 +244,7 @@ public class TestShortCircuitLocalRead {
+       ExtendedBlock blk = new ExtendedBlock(lb.get(0).getBlock());
+       Token<BlockTokenIdentifier> token = lb.get(0).getBlockToken();
+       final DatanodeInfo dnInfo = lb.get(0).getLocations()[0];
+-      ClientDatanodeProtocol proxy = aUgi
++      ClientDatanodeProtocol proxy = aUgi1
+           .doAs(new PrivilegedExceptionAction<ClientDatanodeProtocol>() {
+             @Override
+             public ClientDatanodeProtocol run() throws Exception {
+@@ -250,13 +253,29 @@ public class TestShortCircuitLocalRead {
+             }
+           });
+       
+-      //This should succeed
++      // This should succeed
+       BlockLocalPathInfo blpi = proxy.getBlockLocalPathInfo(blk, token);
+       Assert.assertEquals(
+           DataNodeTestUtils.getFSDataset(dn).getBlockLocalPathInfo(blk).getBlockPath(),
+           blpi.getBlockPath());
+ 
+-      // Now try with a not allowed user.
++      // Try with the other allowed user
++      proxy = aUgi2
++          .doAs(new PrivilegedExceptionAction<ClientDatanodeProtocol>() {
++            @Override
++            public ClientDatanodeProtocol run() throws Exception {
++              return DFSUtil.createClientDatanodeProtocolProxy(dnInfo, conf,
++                  60000, false);
++            }
++          });
++
++      // This should succeed as well
++      blpi = proxy.getBlockLocalPathInfo(blk, token);
++      Assert.assertEquals(
++          DataNodeTestUtils.getFSDataset(dn).getBlockLocalPathInfo(blk).getBlockPath(),
++          blpi.getBlockPath());
++
++      // Now try with a disallowed user
+       UserGroupInformation bUgi = UserGroupInformation
+           .createRemoteUser("notalloweduser");
+       proxy = bUgi
+-- 
+1.7.0.4
+

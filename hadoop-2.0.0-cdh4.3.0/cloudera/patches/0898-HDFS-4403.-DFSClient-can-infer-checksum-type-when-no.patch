@@ -1,0 +1,313 @@
+From 31fa70d23ca07bcb07f140101ff65c0b34def247 Mon Sep 17 00:00:00 2001
+From: Todd Lipcon <todd@apache.org>
+Date: Tue, 22 Jan 2013 02:59:32 +0000
+Subject: [PATCH 0898/1357] HDFS-4403. DFSClient can infer checksum type when not provided by reading first byte. Contributed by Todd Lipcon.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/branch-2@1436731 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit efca1645e44a4c97f4e4395202883ab037f62b3a)
+
+Conflicts:
+
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClient.java
+
+Trivial conflicts due to commit of HDFS-4363 (combine PBHelper and HdfsProtoUtil) upstream
+which isn't in CDH4 yet. Replaced use of PBHelper with HdfsProtoUtil for backport.
+---
+ .../java/org/apache/hadoop/hdfs/DFSClient.java     |  163 +++++++++++++++-----
+ .../hdfs/server/namenode/FileChecksumServlets.java |   12 +--
+ .../hadoop-hdfs/src/main/proto/datatransfer.proto  |    2 +-
+ 3 files changed, 127 insertions(+), 50 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClient.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClient.java
+index 0bd3bb0..d8d9f5c 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClient.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClient.java
+@@ -154,6 +154,7 @@ import org.apache.hadoop.security.token.SecretManager.InvalidToken;
+ import org.apache.hadoop.security.token.Token;
+ import org.apache.hadoop.security.token.TokenRenewer;
+ import org.apache.hadoop.util.DataChecksum;
++import org.apache.hadoop.util.DataChecksum.Type;
+ import org.apache.hadoop.util.Progressable;
+ import org.apache.hadoop.util.Time;
+ 
+@@ -1562,7 +1563,7 @@ public class DFSClient implements java.io.Closeable {
+    */
+   public MD5MD5CRC32FileChecksum getFileChecksum(String src) throws IOException {
+     checkOpen();
+-    return getFileChecksum(src, namenode, socketFactory,
++    return getFileChecksum(src, clientName, namenode, socketFactory,
+         dfsClientConf.socketTimeout, getDataEncryptionKey(),
+         dfsClientConf.connectToDnViaHostname);
+   }
+@@ -1606,9 +1607,16 @@ public class DFSClient implements java.io.Closeable {
+   /**
+    * Get the checksum of a file.
+    * @param src The file path
++   * @param clientName the name of the client requesting the checksum.
++   * @param namenode the RPC proxy for the namenode
++   * @param socketFactory to create sockets to connect to DNs
++   * @param socketTimeout timeout to use when connecting and waiting for a response
++   * @param encryptionKey the key needed to communicate with DNs in this cluster
++   * @param connectToDnViaHostname {@see #connectToDnViaHostname()}
+    * @return The checksum 
+    */
+-  public static MD5MD5CRC32FileChecksum getFileChecksum(String src,
++  static MD5MD5CRC32FileChecksum getFileChecksum(String src,
++      String clientName,
+       ClientProtocol namenode, SocketFactory socketFactory, int socketTimeout,
+       DataEncryptionKey encryptionKey, boolean connectToDnViaHostname)
+       throws IOException {
+@@ -1643,32 +1651,16 @@ public class DFSClient implements java.io.Closeable {
+       final int timeout = 3000 * datanodes.length + socketTimeout;
+       boolean done = false;
+       for(int j = 0; !done && j < datanodes.length; j++) {
+-        Socket sock = null;
+         DataOutputStream out = null;
+         DataInputStream in = null;
+         
+         try {
+           //connect to a datanode
+-          sock = socketFactory.createSocket();
+-          String dnAddr = datanodes[j].getXferAddr(connectToDnViaHostname);
+-          if (LOG.isDebugEnabled()) {
+-            LOG.debug("Connecting to datanode " + dnAddr);
+-          }
+-          NetUtils.connect(sock, NetUtils.createSocketAddr(dnAddr), timeout);
+-          sock.setSoTimeout(timeout);
+-
+-          OutputStream unbufOut = NetUtils.getOutputStream(sock);
+-          InputStream unbufIn = NetUtils.getInputStream(sock);
+-          if (encryptionKey != null) {
+-            IOStreamPair encryptedStreams =
+-                DataTransferEncryptor.getEncryptedStreams(
+-                    unbufOut, unbufIn, encryptionKey);
+-            unbufOut = encryptedStreams.out;
+-            unbufIn = encryptedStreams.in;
+-          }
+-          out = new DataOutputStream(new BufferedOutputStream(unbufOut,
++          IOStreamPair pair = connectToDN(socketFactory, connectToDnViaHostname,
++              encryptionKey, datanodes[j], timeout);
++          out = new DataOutputStream(new BufferedOutputStream(pair.out,
+               HdfsConstants.SMALL_BUFFER_SIZE));
+-          in = new DataInputStream(unbufIn);
++          in = new DataInputStream(pair.in);
+ 
+           if (LOG.isDebugEnabled()) {
+             LOG.debug("write to " + datanodes[j] + ": "
+@@ -1681,19 +1673,8 @@ public class DFSClient implements java.io.Closeable {
+             BlockOpResponseProto.parseFrom(HdfsProtoUtil.vintPrefixed(in));
+ 
+           if (reply.getStatus() != Status.SUCCESS) {
+-            if (reply.getStatus() == Status.ERROR_ACCESS_TOKEN
+-                && i > lastRetriedIndex) {
+-              if (LOG.isDebugEnabled()) {
+-                LOG.debug("Got access token error in response to OP_BLOCK_CHECKSUM "
+-                    + "for file " + src + " for block " + block
+-                    + " from datanode " + datanodes[j]
+-                    + ". Will retry the block once.");
+-              }
+-              lastRetriedIndex = i;
+-              done = true; // actually it's not done; but we'll retry
+-              i--; // repeat at i-th block
+-              refetchBlocks = true;
+-              break;
++            if (reply.getStatus() == Status.ERROR_ACCESS_TOKEN) {
++              throw new InvalidBlockTokenException();
+             } else {
+               throw new IOException("Bad response " + reply + " for block "
+                   + block + " from datanode " + datanodes[j]);
+@@ -1725,8 +1706,17 @@ public class DFSClient implements java.io.Closeable {
+           md5.write(md5out);
+           
+           // read crc-type
+-          final DataChecksum.Type ct = HdfsProtoUtil.
+-              fromProto(checksumData.getCrcType());
++          final DataChecksum.Type ct;
++          if (checksumData.hasCrcType()) {
++            ct = HdfsProtoUtil.fromProto(checksumData.getCrcType());
++          } else {
++            LOG.debug("Retrieving checksum from an earlier-version DataNode: " +
++                      "inferring checksum by reading first byte");
++            ct = inferChecksumTypeByReading(
++                clientName, socketFactory, socketTimeout, lb, datanodes[j],
++                encryptionKey, connectToDnViaHostname);
++          }
++
+           if (i == 0) { // first block
+             crcType = ct;
+           } else if (crcType != DataChecksum.Type.MIXED
+@@ -1744,12 +1734,25 @@ public class DFSClient implements java.io.Closeable {
+             }
+             LOG.debug("got reply from " + datanodes[j] + ": md5=" + md5);
+           }
++        } catch (InvalidBlockTokenException ibte) {
++          if (i > lastRetriedIndex) {
++            if (LOG.isDebugEnabled()) {
++              LOG.debug("Got access token error in response to OP_BLOCK_CHECKSUM "
++                  + "for file " + src + " for block " + block
++                  + " from datanode " + datanodes[j]
++                  + ". Will retry the block once.");
++            }
++            lastRetriedIndex = i;
++            done = true; // actually it's not done; but we'll retry
++            i--; // repeat at i-th block
++            refetchBlocks = true;
++            break;
++          }
+         } catch (IOException ie) {
+           LOG.warn("src=" + src + ", datanodes["+j+"]=" + datanodes[j], ie);
+         } finally {
+           IOUtils.closeStream(in);
+           IOUtils.closeStream(out);
+-          IOUtils.closeSocket(sock);        
+         }
+       }
+ 
+@@ -1782,6 +1785,90 @@ public class DFSClient implements java.io.Closeable {
+   }
+ 
+   /**
++   * Connect to the given datanode's datantrasfer port, and return
++   * the resulting IOStreamPair. This includes encryption wrapping, etc.
++   */
++  private static IOStreamPair connectToDN(
++      SocketFactory socketFactory, boolean connectToDnViaHostname,
++      DataEncryptionKey encryptionKey, DatanodeInfo dn, int timeout)
++      throws IOException
++  {
++    boolean success = false;
++    Socket sock = null;
++    try {
++      sock = socketFactory.createSocket();
++      String dnAddr = dn.getXferAddr(connectToDnViaHostname);
++      if (LOG.isDebugEnabled()) {
++        LOG.debug("Connecting to datanode " + dnAddr);
++      }
++      NetUtils.connect(sock, NetUtils.createSocketAddr(dnAddr), timeout);
++      sock.setSoTimeout(timeout);
++  
++      OutputStream unbufOut = NetUtils.getOutputStream(sock);
++      InputStream unbufIn = NetUtils.getInputStream(sock);
++      IOStreamPair ret;
++      if (encryptionKey != null) {
++        ret = DataTransferEncryptor.getEncryptedStreams(
++                unbufOut, unbufIn, encryptionKey);
++      } else {
++        ret = new IOStreamPair(unbufIn, unbufOut);        
++      }
++      success = true;
++      return ret;
++    } finally {
++      if (!success) {
++        IOUtils.closeSocket(sock);
++      }
++    }
++  }
++  
++  /**
++   * Infer the checksum type for a replica by sending an OP_READ_BLOCK
++   * for the first byte of that replica. This is used for compatibility
++   * with older HDFS versions which did not include the checksum type in
++   * OpBlockChecksumResponseProto.
++   *
++   * @param in input stream from datanode
++   * @param out output stream to datanode
++   * @param lb the located block
++   * @param clientName the name of the DFSClient requesting the checksum
++   * @param dn the connected datanode
++   * @return the inferred checksum type
++   * @throws IOException if an error occurs
++   */
++  private static Type inferChecksumTypeByReading(
++      String clientName, SocketFactory socketFactory, int socketTimeout,
++      LocatedBlock lb, DatanodeInfo dn,
++      DataEncryptionKey encryptionKey, boolean connectToDnViaHostname)
++      throws IOException {
++    IOStreamPair pair = connectToDN(socketFactory, connectToDnViaHostname,
++        encryptionKey, dn, socketTimeout);
++
++    try {
++      DataOutputStream out = new DataOutputStream(new BufferedOutputStream(pair.out,
++          HdfsConstants.SMALL_BUFFER_SIZE));
++      DataInputStream in = new DataInputStream(pair.in);
++  
++      new Sender(out).readBlock(lb.getBlock(), lb.getBlockToken(), clientName, 0, 1, true);
++      final BlockOpResponseProto reply =
++          BlockOpResponseProto.parseFrom(HdfsProtoUtil.vintPrefixed(in));
++      
++      if (reply.getStatus() != Status.SUCCESS) {
++        if (reply.getStatus() == Status.ERROR_ACCESS_TOKEN) {
++          throw new InvalidBlockTokenException();
++        } else {
++          throw new IOException("Bad response " + reply + " trying to read "
++              + lb.getBlock() + " from datanode " + dn);
++        }
++      }
++      
++      return HdfsProtoUtil.fromProto(reply.getReadOpChecksumInfo().getChecksum().getType());
++    } finally {
++      IOUtils.cleanup(null, pair.in, pair.out);
++    }
++  }
++
++  /**
+    * Set permissions to a file or directory.
+    * @param src path name.
+    * @param permission
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FileChecksumServlets.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FileChecksumServlets.java
+index fd3b439..eb6efd3 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FileChecksumServlets.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FileChecksumServlets.java
+@@ -21,7 +21,6 @@ import java.io.IOException;
+ import java.io.PrintWriter;
+ import java.net.URL;
+ 
+-import javax.net.SocketFactory;
+ import javax.servlet.ServletContext;
+ import javax.servlet.ServletException;
+ import javax.servlet.http.HttpServletRequest;
+@@ -33,10 +32,8 @@ import org.apache.hadoop.fs.MD5MD5CRC32FileChecksum;
+ import org.apache.hadoop.hdfs.DFSClient;
+ import org.apache.hadoop.hdfs.DFSConfigKeys;
+ import org.apache.hadoop.hdfs.HdfsConfiguration;
+-import org.apache.hadoop.hdfs.protocol.ClientProtocol;
+ import org.apache.hadoop.hdfs.protocol.DatanodeID;
+ import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
+-import org.apache.hadoop.hdfs.server.common.HdfsServerConstants;
+ import org.apache.hadoop.hdfs.server.common.JspHelper;
+ import org.apache.hadoop.hdfs.server.datanode.DataNode;
+ import org.apache.hadoop.hdfs.server.datanode.DatanodeJspHelper;
+@@ -116,18 +113,11 @@ public class FileChecksumServlets {
+       final DataNode datanode = (DataNode) context.getAttribute("datanode");
+       final Configuration conf = 
+         new HdfsConfiguration(datanode.getConf());
+-      final int socketTimeout = conf.getInt(
+-          DFSConfigKeys.DFS_CLIENT_SOCKET_TIMEOUT_KEY,
+-          HdfsServerConstants.READ_TIMEOUT);
+-      final SocketFactory socketFactory = NetUtils.getSocketFactory(conf,
+-          ClientProtocol.class);
+       
+       try {
+         final DFSClient dfs = DatanodeJspHelper.getDFSClient(request, 
+             datanode, conf, getUGI(request, conf));
+-        final ClientProtocol nnproxy = dfs.getNamenode();
+-        final MD5MD5CRC32FileChecksum checksum = DFSClient.getFileChecksum(
+-            path, nnproxy, socketFactory, socketTimeout, dfs.getDataEncryptionKey(), false);
++        final MD5MD5CRC32FileChecksum checksum = dfs.getFileChecksum(path);
+         MD5MD5CRC32FileChecksum.write(xml, checksum);
+       } catch(IOException ioe) {
+         writeXml(ioe, path, xml);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/datatransfer.proto b/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/datatransfer.proto
+index 87a998c..3e333fb 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/datatransfer.proto
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/datatransfer.proto
+@@ -202,5 +202,5 @@ message OpBlockChecksumResponseProto {
+   required uint32 bytesPerCrc = 1;
+   required uint64 crcPerBlock = 2;
+   required bytes md5 = 3;
+-  optional ChecksumTypeProto crcType = 4 [default = CHECKSUM_CRC32];
++  optional ChecksumTypeProto crcType = 4;
+ }
+-- 
+1.7.0.4
+

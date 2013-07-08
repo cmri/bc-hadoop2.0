@@ -1,0 +1,134 @@
+From 9f743f077c72de80a84dc112f5cab250dabad640 Mon Sep 17 00:00:00 2001
+From: Eli Collins <eli@apache.org>
+Date: Mon, 11 Jun 2012 18:01:38 +0000
+Subject: [PATCH 0109/1357] HDFS-2797. Fix misuses of InputStream#skip in the edit log code. Contributed by Colin Patrick McCabe
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1348945 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 5d80662ebba51f8d6d7fb9c563043a1e17dfe5c6)
+---
+ .../server/namenode/EditLogFileInputStream.java    |    3 +-
+ .../hdfs/server/namenode/FSEditLogLoader.java      |    5 +++
+ .../hadoop/hdfs/server/namenode/StreamLimiter.java |    5 +++
+ .../namenode/ha/TestEditLogsDuringFailover.java    |   30 ++++++++++++++++++-
+ 4 files changed, 40 insertions(+), 3 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogFileInputStream.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogFileInputStream.java
+index 8e0b193..dce51c6 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogFileInputStream.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogFileInputStream.java
+@@ -167,7 +167,8 @@ public class EditLogFileInputStream extends EditLogInputStream {
+             LOG.warn("skipping " + skipAmt + " bytes at the end " +
+               "of edit log  '" + getName() + "': reached txid " + txId +
+               " out of " + lastTxId);
+-            tracker.skip(skipAmt);
++            tracker.clearLimit();
++            IOUtils.skipFully(tracker, skipAmt);
+           }
+         }
+       }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLogLoader.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLogLoader.java
+index e97149e..f4009b9 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLogLoader.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLogLoader.java
+@@ -754,6 +754,11 @@ public class FSEditLogLoader {
+     }
+ 
+     @Override
++    public void clearLimit() {
++      limitPos = Long.MAX_VALUE;
++    }
++
++    @Override
+     public void mark(int limit) {
+       super.mark(limit);
+       markPos = curPos;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/StreamLimiter.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/StreamLimiter.java
+index 9742082..4e533eb 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/StreamLimiter.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/StreamLimiter.java
+@@ -27,4 +27,9 @@ interface StreamLimiter {
+    * Set a limit.  Calling this function clears any existing limit.
+    */
+   public void setLimit(long limit);
++  
++  /**
++   * Disable limit.
++   */
++  public void clearLimit();
+ }
+\ No newline at end of file
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestEditLogsDuringFailover.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestEditLogsDuringFailover.java
+index 79dcec4..794a3b6 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestEditLogsDuringFailover.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestEditLogsDuringFailover.java
+@@ -20,6 +20,7 @@ package org.apache.hadoop.hdfs.server.namenode.ha;
+ import static org.junit.Assert.*;
+ 
+ import java.io.File;
++import java.io.FileOutputStream;
+ import java.io.IOException;
+ import java.net.URI;
+ import java.util.Collections;
+@@ -35,6 +36,7 @@ import org.apache.hadoop.hdfs.MiniDFSNNTopology;
+ import org.apache.hadoop.hdfs.server.namenode.FSImageTestUtil;
+ import org.apache.hadoop.hdfs.server.namenode.NNStorage;
+ import org.apache.hadoop.hdfs.server.namenode.NameNodeAdapter;
++import org.apache.hadoop.io.IOUtils;
+ import org.apache.hadoop.test.GenericTestUtils;
+ import org.junit.Test;
+ 
+@@ -118,8 +120,8 @@ public class TestEditLogsDuringFailover {
+     }
+   }
+   
+-  @Test
+-  public void testFailoverFinalizesAndReadsInProgress() throws Exception {
++  private void testFailoverFinalizesAndReadsInProgress(
++      boolean partialTxAtEnd) throws Exception {
+     Configuration conf = new Configuration();
+     MiniDFSCluster cluster = new MiniDFSCluster.Builder(conf)
+       .nnTopology(MiniDFSNNTopology.simpleHATopology())
+@@ -130,8 +132,21 @@ public class TestEditLogsDuringFailover {
+       URI sharedUri = cluster.getSharedEditsDir(0, 1);
+       File sharedDir = new File(sharedUri.getPath(), "current");
+       FSImageTestUtil.createAbortedLogWithMkdirs(sharedDir, NUM_DIRS_IN_LOG, 1);
++      
+       assertEditFiles(Collections.singletonList(sharedUri),
+           NNStorage.getInProgressEditsFileName(1));
++      if (partialTxAtEnd) {
++        FileOutputStream outs = null;
++        try {
++          File editLogFile =
++              new File(sharedDir, NNStorage.getInProgressEditsFileName(1));
++          outs = new FileOutputStream(editLogFile, true);
++          outs.write(new byte[] { 0x18, 0x00, 0x00, 0x00 } );
++          LOG.error("editLogFile = " + editLogFile);
++        } finally {
++          IOUtils.cleanup(LOG, outs);
++        }
++     }
+ 
+       // Transition one of the NNs to active
+       cluster.transitionToActive(0);
+@@ -149,7 +164,18 @@ public class TestEditLogsDuringFailover {
+     } finally {
+       cluster.shutdown();
+     }
++  }
++  
++  @Test
++  public void testFailoverFinalizesAndReadsInProgressSimple()
++      throws Exception {
++    testFailoverFinalizesAndReadsInProgress(false);
++  }
+ 
++  @Test
++  public void testFailoverFinalizesAndReadsInProgressWithPartialTxAtEnd()
++      throws Exception {
++    testFailoverFinalizesAndReadsInProgress(true);
+   }
+ 
+   /**
+-- 
+1.7.0.4
+

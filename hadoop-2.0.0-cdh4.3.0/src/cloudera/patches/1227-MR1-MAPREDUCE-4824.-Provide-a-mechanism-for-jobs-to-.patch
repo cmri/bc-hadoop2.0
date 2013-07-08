@@ -1,0 +1,146 @@
+From b12d8a59084b3ddf4695d20c8782a59002037838 Mon Sep 17 00:00:00 2001
+From: Tom White <tom@cloudera.com>
+Date: Tue, 18 Dec 2012 12:32:51 +0000
+Subject: [PATCH 1227/1357] MR1: MAPREDUCE-4824. Provide a mechanism for jobs to indicate they should not be recovered on restart.
+
+Reason: New feature
+Author: Tom White
+Ref: CDH-8915
+---
+ src/mapred/mapred-default.xml                      |   11 +++++++
+ .../org/apache/hadoop/mapred/JobTracker.java       |   19 +++++++++++--
+ .../apache/hadoop/mapred/TestRecoveryManager.java  |   29 +++++++++++++++++---
+ 3 files changed, 52 insertions(+), 7 deletions(-)
+
+diff --git a/src/mapred/mapred-default.xml b/src/mapred/mapred-default.xml
+index cdd5476..e219768 100644
+--- a/src/mapred/mapred-default.xml
++++ b/src/mapred/mapred-default.xml
+@@ -269,6 +269,17 @@
+ </property>
+ 
+ <property>
++  <name>mapred.job.restart.recover</name>
++  <value>true</value>
++  <description>A per-job override for job recovery. If set to false for a
++      job then job recovery will not be attempted for that job upon restart
++      even if mapred.jobtracker.restart.recover is enabled. Defaults to true
++      so that jobs are recovered by default if
++      mapred.jobtracker.restart.recover is enabled.
++  </description>
++</property>
++
++<property>
+   <name>mapred.jobtracker.job.history.block.size</name>
+   <value>3145728</value>
+   <description>The block size of the job history file. Since the job recovery
+diff --git a/src/mapred/org/apache/hadoop/mapred/JobTracker.java b/src/mapred/org/apache/hadoop/mapred/JobTracker.java
+index 0edf566..ad5f9be 100644
+--- a/src/mapred/org/apache/hadoop/mapred/JobTracker.java
++++ b/src/mapred/org/apache/hadoop/mapred/JobTracker.java
+@@ -1539,13 +1539,19 @@ public class JobTracker implements MRConstants, JTProtocols, JobTrackerMXBean {
+           final Credentials ts =
+             jobTokenFile.getFileSystem(job).exists(jobTokenFile) ?
+             Credentials.readTokenStorageFile(jobTokenFile, job) : null;
+-          ugi.doAs(new PrivilegedExceptionAction<JobStatus>() {
++          JobStatus status = ugi.doAs(new PrivilegedExceptionAction<JobStatus>() {
+             public JobStatus run() throws IOException, InterruptedException {
+               return submitJob(JobID.downgrade(token.getJobID()), token
+                   .getJobSubmitDir().toString(), ugi, ts, true);
+             }
+           });
+-          recovered++;
++          if (status == null) {
++            LOG.info("Job " + jobId + " was not recovered since it " +
++              "disabled recovery on restart (mapred.job.restart.recover set " +
++              "to false).");
++          } else {
++            recovered++;
++          }
+         } catch (Exception e) {
+           LOG.warn("Could not recover job " + jobId, e);
+         }
+@@ -3475,8 +3481,10 @@ public class JobTracker implements MRConstants, JTProtocols, JobTrackerMXBean {
+    * JobStatus. Those two sub-objects are sometimes shipped outside of the
+    * JobTracker. But JobInProgress adds info that's useful for the JobTracker
+    * alone.
++   * @return null if the job is being recovered but mapred.job.restart.recover
++   * is false.
+    */
+-  public JobStatus submitJob(JobID jobId, String jobSubmitDir,
++  JobStatus submitJob(JobID jobId, String jobSubmitDir,
+       UserGroupInformation ugi, Credentials ts, boolean recovered)
+       throws IOException {
+     JobInfo jobInfo = null;
+@@ -3500,6 +3508,11 @@ public class JobTracker implements MRConstants, JTProtocols, JobTrackerMXBean {
+       throw new IOException(e);
+     }
+     
++    if (recovered && 
++        !job.getJobConf().getBoolean("mapred.job.restart.recover", true)) {
++      return null;
++    }
++    
+     synchronized (this) {
+       String queue = job.getProfile().getQueueName();
+       if (!(queueManager.getQueues().contains(queue))) {
+diff --git a/src/test/org/apache/hadoop/mapred/TestRecoveryManager.java b/src/test/org/apache/hadoop/mapred/TestRecoveryManager.java
+index bfebaf2..de8741a 100644
+--- a/src/test/org/apache/hadoop/mapred/TestRecoveryManager.java
++++ b/src/test/org/apache/hadoop/mapred/TestRecoveryManager.java
+@@ -197,8 +197,8 @@ public class TestRecoveryManager {
+         new Path(TEST_DIR, "output3"), 2, 0, "test-resubmission", signalFile,
+         signalFile);
+ 
+-    JobClient jc = new JobClient(job1);
+-    RunningJob rJob1 = jc.submitJob(job1);
++    JobClient jc1 = new JobClient(job1);
++    RunningJob rJob1 = jc1.submitJob(job1);
+     LOG.info("Submitted first job " + rJob1.getID());
+ 
+     while (rJob1.mapProgress() < 0.5f) {
+@@ -206,6 +206,27 @@ public class TestRecoveryManager {
+       UtilsForTests.waitFor(100);
+     }
+ 
++    // now submit job2
++    JobConf job2 = mr.createJobConf();
++
++    String signalFile1 = new Path(TEST_DIR, "signal1").toString();
++    UtilsForTests.configureWaitingJobConf(job2, 
++        new Path(TEST_DIR, "input"), new Path(TEST_DIR, "output4"), 20, 0, 
++        "test-recovery-manager", signalFile1, signalFile1);
++    job2.setBoolean("mapred.job.restart.recover", false); // don't recover
++    
++    // submit the job
++    RunningJob rJob2 = (new JobClient(job2)).submitJob(job2);
++    LOG.info("Submitted job " + rJob2.getID());
++    
++    // wait for it to init
++    JobInProgress jip2 = jobtracker.getJob(rJob2.getID());
++    
++    while (!jip2.inited()) {
++      LOG.info("Waiting for job " + jip2.getJobID() + " to be inited");
++      UtilsForTests.waitFor(100);
++    }
++
+     // kill the jobtracker
+     LOG.info("Stopping jobtracker");
+     mr.stopJobTracker();
+@@ -213,11 +234,11 @@ public class TestRecoveryManager {
+     // start the jobtracker
+     LOG.info("Starting jobtracker");
+     mr.startJobTracker();
+-    UtilsForTests.waitForJobTracker(jc);
++    UtilsForTests.waitForJobTracker(jc1);
+ 
+     jobtracker = mr.getJobTrackerRunner().getJobTracker();
+ 
+-    // assert that job is recovered by the jobtracker
++    // assert that only job1 is recovered by the jobtracker
+     Assert.assertEquals("Resubmission failed ", 1, 
+         jobtracker.getAllJobs().length);
+ 
+-- 
+1.7.0.4
+

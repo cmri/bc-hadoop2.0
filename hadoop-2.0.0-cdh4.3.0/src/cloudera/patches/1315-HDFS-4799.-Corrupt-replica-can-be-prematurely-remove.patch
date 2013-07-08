@@ -1,0 +1,245 @@
+From ead596d201c77ec4eb47b2b897a12d540780cbed Mon Sep 17 00:00:00 2001
+From: Kihwal Lee <kihwal@apache.org>
+Date: Fri, 10 May 2013 16:36:20 +0000
+Subject: [PATCH 1315/1357] HDFS-4799. Corrupt replica can be prematurely removed from corruptReplicas map. Contributed by Todd Lipcon.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1481084 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 5d40c8c82f7894a1d22041d01441f459a106c625)
+---
+ .../hdfs/server/blockmanagement/BlockManager.java  |   19 +++-
+ .../blockmanagement/TestRBWBlockInvalidation.java  |  109 ++++++++++++++++++++
+ .../hadoop/hdfs/server/namenode/ha/HATestUtil.java |    2 +-
+ 3 files changed, 123 insertions(+), 7 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+index e419f04..7e3a31e 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+@@ -1016,8 +1016,10 @@ public class BlockManager {
+ 
+   /**
+    * Invalidates the given block on the given datanode.
++   * @return true if the block was successfully invalidated and no longer
++   * present in the BlocksMap
+    */
+-  private void invalidateBlock(BlockToMarkCorrupt b, DatanodeInfo dn
++  private boolean invalidateBlock(BlockToMarkCorrupt b, DatanodeInfo dn
+       ) throws IOException {
+     blockLog.info("BLOCK* invalidateBlock: " + b + " on " + dn);
+     DatanodeDescriptor node = getDatanodeManager().getDatanode(dn);
+@@ -1034,7 +1036,7 @@ public class BlockManager {
+           nr.replicasOnStaleNodes() + " replica(s) are located on nodes " +
+           "with potentially out-of-date block reports");
+       postponeBlock(b.corrupted);
+-
++      return false;
+     } else if (nr.liveReplicas() >= 1) {
+       // If we have at least one copy on a live node, then we can delete it.
+       addToInvalidates(b.corrupted, dn);
+@@ -1043,9 +1045,11 @@ public class BlockManager {
+         blockLog.debug("BLOCK* invalidateBlocks: "
+             + b + " on " + dn + " listed for deletion.");
+       }
++      return true;
+     } else {
+       blockLog.info("BLOCK* invalidateBlocks: " + b
+           + " on " + dn + " is the only copy and was not deleted");
++      return false;
+     }
+   }
+ 
+@@ -2148,7 +2152,7 @@ assert storedBlock.findDatanode(dn) < 0 : "Block " + block
+    */
+   private void invalidateCorruptReplicas(BlockInfo blk) {
+     Collection<DatanodeDescriptor> nodes = corruptReplicas.getNodes(blk);
+-    boolean gotException = false;
++    boolean removedFromBlocksMap = true;
+     if (nodes == null)
+       return;
+     // make a copy of the array of nodes in order to avoid
+@@ -2156,16 +2160,19 @@ assert storedBlock.findDatanode(dn) < 0 : "Block " + block
+     DatanodeDescriptor[] nodesCopy = nodes.toArray(new DatanodeDescriptor[0]);
+     for (DatanodeDescriptor node : nodesCopy) {
+       try {
+-        invalidateBlock(new BlockToMarkCorrupt(blk, null), node);
++        if (!invalidateBlock(new BlockToMarkCorrupt(blk, null), node)) {
++          removedFromBlocksMap = false;
++        }
+       } catch (IOException e) {
+         blockLog.info("invalidateCorruptReplicas "
+             + "error in deleting bad block " + blk + " on " + node, e);
+-        gotException = true;
++        removedFromBlocksMap = false;
+       }
+     }
+     // Remove the block from corruptReplicasMap
+-    if (!gotException)
++    if (removedFromBlocksMap) {
+       corruptReplicas.removeFromCorruptReplicasMap(blk);
++    }
+   }
+ 
+   /**
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestRBWBlockInvalidation.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestRBWBlockInvalidation.java
+index c07fae4..aef61bf 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestRBWBlockInvalidation.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestRBWBlockInvalidation.java
+@@ -20,9 +20,13 @@ package org.apache.hadoop.hdfs.server.blockmanagement;
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertTrue;
+ 
++import java.io.Closeable;
+ import java.io.File;
+ import java.io.IOException;
++import java.util.List;
+ 
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FSDataOutputStream;
+ import org.apache.hadoop.fs.FileSystem;
+@@ -31,18 +35,26 @@ import org.apache.hadoop.hdfs.DFSConfigKeys;
+ import org.apache.hadoop.hdfs.DFSTestUtil;
+ import org.apache.hadoop.hdfs.HdfsConfiguration;
+ import org.apache.hadoop.hdfs.MiniDFSCluster;
++import org.apache.hadoop.hdfs.MiniDFSCluster.DataNodeProperties;
+ import org.apache.hadoop.hdfs.protocol.Block;
+ import org.apache.hadoop.hdfs.protocol.ExtendedBlock;
+ import org.apache.hadoop.hdfs.server.datanode.DataNode;
+ import org.apache.hadoop.hdfs.server.datanode.DataNodeTestUtils;
+ import org.apache.hadoop.hdfs.server.namenode.FSNamesystem;
++import org.apache.hadoop.hdfs.server.namenode.ha.HATestUtil;
++import org.apache.hadoop.hdfs.server.namenode.ha.TestDNFencing.RandomDeleterPolicy;
++import org.apache.hadoop.io.IOUtils;
+ import org.junit.Test;
+ 
++import com.google.common.collect.Lists;
++
+ /**
+  * Test when RBW block is removed. Invalidation of the corrupted block happens
+  * and then the under replicated block gets replicated to the datanode.
+  */
+ public class TestRBWBlockInvalidation {
++  private static Log LOG = LogFactory.getLog(TestRBWBlockInvalidation.class);
++  
+   private static NumberReplicas countReplicas(final FSNamesystem namesystem,
+       ExtendedBlock block) {
+     return namesystem.getBlockManager().countNodes(block.getLocalBlock());
+@@ -125,4 +137,101 @@ public class TestRBWBlockInvalidation {
+       cluster.shutdown();
+     }
+   }
++  
++  /**
++   * Regression test for HDFS-4799, a case where, upon restart, if there
++   * were RWR replicas with out-of-date genstamps, the NN could accidentally
++   * delete good replicas instead of the bad replicas.
++   */
++  @Test(timeout=60000)
++  public void testRWRInvalidation() throws Exception {
++    Configuration conf = new HdfsConfiguration();
++
++    // Set the deletion policy to be randomized rather than the default.
++    // The default is based on disk space, which isn't controllable
++    // in the context of the test, whereas a random one is more accurate
++    // to what is seen in real clusters (nodes have random amounts of free
++    // space)
++    conf.setClass("dfs.block.replicator.classname", RandomDeleterPolicy.class,
++        BlockPlacementPolicy.class); 
++
++    // Speed up the test a bit with faster heartbeats.
++    conf.setInt(DFSConfigKeys.DFS_HEARTBEAT_INTERVAL_KEY, 1);
++
++    // Test with a bunch of separate files, since otherwise the test may
++    // fail just due to "good luck", even if a bug is present.
++    List<Path> testPaths = Lists.newArrayList();
++    for (int i = 0; i < 10; i++) {
++      testPaths.add(new Path("/test" + i));
++    }
++    
++    MiniDFSCluster cluster = new MiniDFSCluster.Builder(conf).numDataNodes(2)
++        .build();
++    try {
++      List<FSDataOutputStream> streams = Lists.newArrayList();
++      try {
++        // Open the test files and write some data to each
++        for (Path path : testPaths) {
++          FSDataOutputStream out = cluster.getFileSystem().create(path, (short)2);
++          streams.add(out);
++
++          out.writeBytes("old gs data\n");
++          out.hflush();
++        }
++        
++        
++        // Shutdown one of the nodes in the pipeline
++        DataNodeProperties oldGenstampNode = cluster.stopDataNode(0);
++
++        // Write some more data and flush again. This data will only
++        // be in the latter genstamp copy of the blocks.
++        for (int i = 0; i < streams.size(); i++) {
++          Path path = testPaths.get(i);
++          FSDataOutputStream out = streams.get(i);
++
++          out.writeBytes("new gs data\n");
++          out.hflush();
++
++          // Set replication so that only one node is necessary for this block,
++          // and close it.
++          cluster.getFileSystem().setReplication(path, (short)1);
++          out.close();
++        }
++        
++        // Upon restart, there will be two replicas, one with an old genstamp
++        // and one current copy. This test wants to ensure that the old genstamp
++        // copy is the one that is deleted.
++
++        LOG.info("=========================== restarting cluster");
++        DataNodeProperties otherNode = cluster.stopDataNode(0);
++        cluster.restartNameNode();
++        
++        // Restart the datanode with the corrupt replica first.
++        cluster.restartDataNode(oldGenstampNode);
++        cluster.waitActive();
++
++        // Then the other node
++        cluster.restartDataNode(otherNode);
++        cluster.waitActive();
++        
++        // Compute and send invalidations, waiting until they're fully processed.
++        cluster.getNameNode().getNamesystem().getBlockManager()
++          .computeInvalidateWork(2);
++        cluster.triggerHeartbeats();
++        HATestUtil.waitForDNDeletions(cluster);
++        cluster.triggerDeletionReports();
++        
++        // Make sure we can still read the blocks.
++        for (Path path : testPaths) {
++          String ret = DFSTestUtil.readFile(cluster.getFileSystem(), path);
++          assertEquals("old gs data\n" + "new gs data\n", ret);
++        }
++      } finally {
++        IOUtils.cleanup(LOG, streams.toArray(new Closeable[0]));
++      }
++    } finally {
++      cluster.shutdown();
++    }
++
++  }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/HATestUtil.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/HATestUtil.java
+index 9b87eb7..9e9c181 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/HATestUtil.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/HATestUtil.java
+@@ -91,7 +91,7 @@ public abstract class HATestUtil {
+    * Wait for the datanodes in the cluster to process any block
+    * deletions that have already been asynchronously queued.
+    */
+-  static void waitForDNDeletions(final MiniDFSCluster cluster)
++  public static void waitForDNDeletions(final MiniDFSCluster cluster)
+       throws TimeoutException, InterruptedException {
+     GenericTestUtils.waitFor(new Supplier<Boolean>() {
+       @Override
+-- 
+1.7.0.4
+

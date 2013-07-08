@@ -1,0 +1,584 @@
+From c1aefaaccbd5fa3a00f43a527e8a7139654c5521 Mon Sep 17 00:00:00 2001
+From: Aaron Twining Myers <atm@apache.org>
+Date: Fri, 16 Nov 2012 21:51:39 +0000
+Subject: [PATCH 0906/1357] HDFS-3507. DFS#isInSafeMode needs to execute only on Active NameNode. Contributed by Vinay.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1410587 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 9968fd674c112e0bc5958449faa0b0401571013c)
+---
+ .../java/org/apache/hadoop/hdfs/DFSClient.java     |   19 ++++++-
+ .../apache/hadoop/hdfs/DistributedFileSystem.java  |   30 ++++++++--
+ .../hadoop/hdfs/protocol/ClientProtocol.java       |   13 +++--
+ ...ientNamenodeProtocolServerSideTranslatorPB.java |    3 +-
+ .../ClientNamenodeProtocolTranslatorPB.java        |    6 +-
+ .../hdfs/server/namenode/NameNodeRpcServer.java    |   13 ++++-
+ .../org/apache/hadoop/hdfs/tools/DFSAdmin.java     |    3 +-
+ .../src/main/proto/ClientNamenodeProtocol.proto    |    1 +
+ .../org/apache/hadoop/hdfs/TestFetchImage.java     |    6 ++-
+ .../org/apache/hadoop/hdfs/TestLeaseRecovery.java  |    6 ++-
+ .../org/apache/hadoop/hdfs/UpgradeUtilities.java   |    4 +-
+ .../server/namenode/NNThroughputBenchmark.java     |   12 +++--
+ .../hdfs/server/namenode/TestCheckpoint.java       |   12 ++--
+ .../server/namenode/TestListCorruptFileBlocks.java |    8 ++--
+ .../namenode/TestNNStorageRetentionFunctional.java |    4 +-
+ .../hadoop/hdfs/server/namenode/TestStartup.java   |    4 +-
+ .../hdfs/server/namenode/ha/TestHASafeMode.java    |   57 ++++++++++++++++++--
+ .../namenode/metrics/TestNameNodeMetrics.java      |    4 +-
+ .../offlineImageViewer/TestOfflineImageViewer.java |    3 +-
+ 19 files changed, 157 insertions(+), 51 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClient.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClient.java
+index 27d5874..f23c00a 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClient.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClient.java
+@@ -1960,10 +1960,25 @@ public class DFSClient implements java.io.Closeable {
+   /**
+    * Enter, leave or get safe mode.
+    * 
+-   * @see ClientProtocol#setSafeMode(HdfsConstants.SafeModeAction)
++   * @see ClientProtocol#setSafeMode(HdfsConstants.SafeModeAction,boolean)
+    */
+   public boolean setSafeMode(SafeModeAction action) throws IOException {
+-    return namenode.setSafeMode(action);
++    return setSafeMode(action, false);
++  }
++  
++  /**
++   * Enter, leave or get safe mode.
++   * 
++   * @param action
++   *          One of SafeModeAction.GET, SafeModeAction.ENTER and
++   *          SafeModeActiob.LEAVE
++   * @param isChecked
++   *          If true, then check only active namenode's safemode status, else
++   *          check first namenode's status.
++   * @see ClientProtocol#setSafeMode(HdfsConstants.SafeModeActio,boolean)
++   */
++  public boolean setSafeMode(SafeModeAction action, boolean isChecked) throws IOException{
++    return namenode.setSafeMode(action, isChecked);    
+   }
+ 
+   /**
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DistributedFileSystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DistributedFileSystem.java
+index f0a99c7..03753b0 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DistributedFileSystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DistributedFileSystem.java
+@@ -673,11 +673,27 @@ public class DistributedFileSystem extends FileSystem {
+    * Enter, leave or get safe mode.
+    *  
+    * @see org.apache.hadoop.hdfs.protocol.ClientProtocol#setSafeMode(
+-   *    HdfsConstants.SafeModeAction)
++   *    HdfsConstants.SafeModeAction,boolean)
+    */
+   public boolean setSafeMode(HdfsConstants.SafeModeAction action) 
+   throws IOException {
+-    return dfs.setSafeMode(action);
++    return setSafeMode(action, false);
++  }
++
++  /**
++   * Enter, leave or get safe mode.
++   * 
++   * @param action
++   *          One of SafeModeAction.ENTER, SafeModeAction.LEAVE and
++   *          SafeModeAction.GET
++   * @param isChecked
++   *          If true check only for Active NNs status, else check first NN's
++   *          status
++   * @see org.apache.hadoop.hdfs.protocol.ClientProtocol#setSafeMode(SafeModeAction, boolean)
++   */
++  public boolean setSafeMode(HdfsConstants.SafeModeAction action,
++      boolean isChecked) throws IOException {
++    return dfs.setSafeMode(action, isChecked);
+   }
+ 
+   /**
+@@ -929,12 +945,14 @@ public class DistributedFileSystem extends FileSystem {
+   }
+ 
+   /**
+-   * Utility function that returns if the NameNode is in safemode or not.
+-   *
++   * Utility function that returns if the NameNode is in safemode or not. In HA
++   * mode, this API will return only ActiveNN's safemode status.
++   * 
+    * @return true if NameNode is in safemode, false otherwise.
+-   * @throws IOException when there is an issue communicating with the NameNode
++   * @throws IOException
++   *           when there is an issue communicating with the NameNode
+    */
+   public boolean isInSafeMode() throws IOException {
+-    return setSafeMode(SafeModeAction.SAFEMODE_GET);
++    return setSafeMode(SafeModeAction.SAFEMODE_GET, true);
+   }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/ClientProtocol.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/ClientProtocol.java
+index d980f44..0f22c12 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/ClientProtocol.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/ClientProtocol.java
+@@ -612,7 +612,7 @@ public interface ClientProtocol {
+    * <p>
+    * Safe mode is entered automatically at name node startup.
+    * Safe mode can also be entered manually using
+-   * {@link #setSafeMode(HdfsConstants.SafeModeAction) setSafeMode(SafeModeAction.SAFEMODE_GET)}.
++   * {@link #setSafeMode(HdfsConstants.SafeModeAction,boolean) setSafeMode(SafeModeAction.SAFEMODE_ENTER,false)}.
+    * <p>
+    * At startup the name node accepts data node reports collecting
+    * information about block locations.
+@@ -628,11 +628,11 @@ public interface ClientProtocol {
+    * Then the name node leaves safe mode.
+    * <p>
+    * If safe mode is turned on manually using
+-   * {@link #setSafeMode(HdfsConstants.SafeModeAction) setSafeMode(SafeModeAction.SAFEMODE_ENTER)}
++   * {@link #setSafeMode(HdfsConstants.SafeModeAction,boolean) setSafeMode(SafeModeAction.SAFEMODE_ENTER,false)}
+    * then the name node stays in safe mode until it is manually turned off
+-   * using {@link #setSafeMode(HdfsConstants.SafeModeAction) setSafeMode(SafeModeAction.SAFEMODE_LEAVE)}.
++   * using {@link #setSafeMode(HdfsConstants.SafeModeAction,boolean) setSafeMode(SafeModeAction.SAFEMODE_LEAVE,false)}.
+    * Current state of the name node can be verified using
+-   * {@link #setSafeMode(HdfsConstants.SafeModeAction) setSafeMode(SafeModeAction.SAFEMODE_GET)}
++   * {@link #setSafeMode(HdfsConstants.SafeModeAction,boolean) setSafeMode(SafeModeAction.SAFEMODE_GET,false)}
+    * <h4>Configuration parameters:</h4>
+    * <tt>dfs.safemode.threshold.pct</tt> is the threshold parameter.<br>
+    * <tt>dfs.safemode.extension</tt> is the safe mode extension parameter.<br>
+@@ -650,12 +650,15 @@ public interface ClientProtocol {
+    * @param action  <ul> <li>0 leave safe mode;</li>
+    *                <li>1 enter safe mode;</li>
+    *                <li>2 get safe mode state.</li></ul>
++   * @param isChecked If true then action will be done only in ActiveNN.
++   * 
+    * @return <ul><li>0 if the safe mode is OFF or</li> 
+    *         <li>1 if the safe mode is ON.</li></ul>
+    *                   
+    * @throws IOException
+    */
+-  public boolean setSafeMode(HdfsConstants.SafeModeAction action) 
++  @Idempotent
++  public boolean setSafeMode(HdfsConstants.SafeModeAction action, boolean isChecked) 
+       throws IOException;
+ 
+   /**
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/ClientNamenodeProtocolServerSideTranslatorPB.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/ClientNamenodeProtocolServerSideTranslatorPB.java
+index 204952f..162cfe8 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/ClientNamenodeProtocolServerSideTranslatorPB.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/ClientNamenodeProtocolServerSideTranslatorPB.java
+@@ -521,7 +521,8 @@ public class ClientNamenodeProtocolServerSideTranslatorPB implements
+   public SetSafeModeResponseProto setSafeMode(RpcController controller,
+       SetSafeModeRequestProto req) throws ServiceException {
+     try {
+-      boolean result = server.setSafeMode(PBHelper.convert(req.getAction()));
++      boolean result = server.setSafeMode(PBHelper.convert(req.getAction()),
++          req.getChecked());
+       return SetSafeModeResponseProto.newBuilder().setResult(result).build();
+     } catch (IOException e) {
+       throw new ServiceException(e);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/ClientNamenodeProtocolTranslatorPB.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/ClientNamenodeProtocolTranslatorPB.java
+index c00a7c9..3ee34d9 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/ClientNamenodeProtocolTranslatorPB.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/ClientNamenodeProtocolTranslatorPB.java
+@@ -512,9 +512,9 @@ public class ClientNamenodeProtocolTranslatorPB implements
+   }
+ 
+   @Override
+-  public boolean setSafeMode(SafeModeAction action) throws IOException {
+-    SetSafeModeRequestProto req = SetSafeModeRequestProto.newBuilder().
+-        setAction(PBHelper.convert(action)).build();
++  public boolean setSafeMode(SafeModeAction action, boolean isChecked) throws IOException {
++    SetSafeModeRequestProto req = SetSafeModeRequestProto.newBuilder()
++        .setAction(PBHelper.convert(action)).setChecked(isChecked).build();
+     try {
+       return rpcProxy.setSafeMode(null, req).getResult();
+     } catch (ServiceException e) {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java
+index f459a72..9e0cee0 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java
+@@ -698,8 +698,17 @@ class NameNodeRpcServer implements NamenodeProtocols {
+   }
+     
+   @Override // ClientProtocol
+-  public boolean setSafeMode(SafeModeAction action) throws IOException {
+-    namesystem.checkOperation(OperationCategory.UNCHECKED);
++  public boolean setSafeMode(SafeModeAction action, boolean isChecked)
++      throws IOException {
++    OperationCategory opCategory = OperationCategory.UNCHECKED;
++    if (isChecked) {
++      if (action == SafeModeAction.SAFEMODE_GET) {
++        opCategory = OperationCategory.READ;
++      } else {
++        opCategory = OperationCategory.WRITE;
++      }
++    }
++    namesystem.checkOperation(opCategory);
+     return namesystem.setSafeMode(action);
+   }
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/tools/DFSAdmin.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/tools/DFSAdmin.java
+index 2a1a4d2..8d8bcac 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/tools/DFSAdmin.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/tools/DFSAdmin.java
+@@ -50,6 +50,7 @@ import org.apache.hadoop.hdfs.protocol.HdfsConstants;
+ import org.apache.hadoop.hdfs.protocol.HdfsConstants.DatanodeReportType;
+ import org.apache.hadoop.hdfs.protocol.HdfsConstants.UpgradeAction;
+ import org.apache.hadoop.hdfs.server.common.UpgradeStatusReport;
++import org.apache.hadoop.hdfs.protocol.HdfsConstants.SafeModeAction;
+ import org.apache.hadoop.hdfs.server.namenode.NameNode;
+ import org.apache.hadoop.hdfs.server.namenode.TransferFsImage;
+ import org.apache.hadoop.ipc.RPC;
+@@ -407,7 +408,7 @@ public class DFSAdmin extends FsShell {
+         } catch (java.lang.InterruptedException e) {
+           throw new IOException("Wait Interrupted");
+         }
+-        inSafeMode = dfs.isInSafeMode();
++        inSafeMode = dfs.setSafeMode(SafeModeAction.SAFEMODE_GET);
+       }
+     }
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/ClientNamenodeProtocol.proto b/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/ClientNamenodeProtocol.proto
+index df849db..7699b5c 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/ClientNamenodeProtocol.proto
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/ClientNamenodeProtocol.proto
+@@ -264,6 +264,7 @@ enum SafeModeActionProto {
+ 
+ message SetSafeModeRequestProto {
+   required SafeModeActionProto action = 1;
++  optional bool checked = 2 [default = false];
+ }
+ 
+ message SetSafeModeResponseProto {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestFetchImage.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestFetchImage.java
+index fa21635..e7935fb 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestFetchImage.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestFetchImage.java
+@@ -61,9 +61,11 @@ public class TestFetchImage {
+       fs.mkdirs(new Path("/foo2"));
+       fs.mkdirs(new Path("/foo3"));
+       
+-      cluster.getNameNodeRpc().setSafeMode(SafeModeAction.SAFEMODE_ENTER);
++      cluster.getNameNodeRpc()
++          .setSafeMode(SafeModeAction.SAFEMODE_ENTER, false);
+       cluster.getNameNodeRpc().saveNamespace();
+-      cluster.getNameNodeRpc().setSafeMode(SafeModeAction.SAFEMODE_LEAVE);
++      cluster.getNameNodeRpc()
++          .setSafeMode(SafeModeAction.SAFEMODE_LEAVE, false);
+       
+       runFetchImage(dfsAdmin, cluster);
+     } finally {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestLeaseRecovery.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestLeaseRecovery.java
+index e739f61..2dbe6e8 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestLeaseRecovery.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestLeaseRecovery.java
+@@ -133,14 +133,16 @@ public class TestLeaseRecovery {
+       filestr = "/foo.safemode";
+       filepath = new Path(filestr);
+       dfs.create(filepath, (short)1);
+-      cluster.getNameNodeRpc().setSafeMode(HdfsConstants.SafeModeAction.SAFEMODE_ENTER);
++      cluster.getNameNodeRpc().setSafeMode(
++          HdfsConstants.SafeModeAction.SAFEMODE_ENTER, false);
+       assertTrue(dfs.dfs.exists(filestr));
+       DFSTestUtil.waitReplication(dfs, filepath, (short)1);
+       waitLeaseRecovery(cluster);
+       // verify that we still cannot recover the lease
+       LeaseManager lm = NameNodeAdapter.getLeaseManager(cluster.getNamesystem());
+       assertTrue("Found " + lm.countLease() + " lease, expected 1", lm.countLease() == 1);
+-      cluster.getNameNodeRpc().setSafeMode(HdfsConstants.SafeModeAction.SAFEMODE_LEAVE);
++      cluster.getNameNodeRpc().setSafeMode(
++          HdfsConstants.SafeModeAction.SAFEMODE_LEAVE, false);
+     }
+     finally {
+       if (cluster != null) {cluster.shutdown();}
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/UpgradeUtilities.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/UpgradeUtilities.java
+index 7f792f4..f418724 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/UpgradeUtilities.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/UpgradeUtilities.java
+@@ -142,9 +142,9 @@ public class UpgradeUtilities {
+       writeFile(fs, new Path(baseDir, "file2"), buffer, bufferSize);
+       
+       // save image
+-      namenode.setSafeMode(SafeModeAction.SAFEMODE_ENTER);
++      namenode.setSafeMode(SafeModeAction.SAFEMODE_ENTER, false);
+       namenode.saveNamespace();
+-      namenode.setSafeMode(SafeModeAction.SAFEMODE_LEAVE);
++      namenode.setSafeMode(SafeModeAction.SAFEMODE_LEAVE, false);
+       
+       // write more files
+       writeFile(fs, new Path(baseDir, "file3"), buffer, bufferSize);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/NNThroughputBenchmark.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/NNThroughputBenchmark.java
+index db92102..a744b0b 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/NNThroughputBenchmark.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/NNThroughputBenchmark.java
+@@ -278,7 +278,8 @@ public class NNThroughputBenchmark {
+     }
+ 
+     void cleanUp() throws IOException {
+-      nameNodeProto.setSafeMode(HdfsConstants.SafeModeAction.SAFEMODE_LEAVE);
++      nameNodeProto.setSafeMode(HdfsConstants.SafeModeAction.SAFEMODE_LEAVE,
++          false);
+       if(!keepResults)
+         nameNodeProto.delete(getBaseDir(), true);
+     }
+@@ -479,7 +480,8 @@ public class NNThroughputBenchmark {
+     @Override
+     long executeOp(int daemonId, int inputIdx, String ignore) 
+     throws IOException {
+-      nameNodeProto.setSafeMode(HdfsConstants.SafeModeAction.SAFEMODE_LEAVE);
++      nameNodeProto.setSafeMode(HdfsConstants.SafeModeAction.SAFEMODE_LEAVE,
++          false);
+       long start = Time.now();
+       nameNodeProto.delete(BASE_DIR_NAME, true);
+       long end = Time.now();
+@@ -547,7 +549,8 @@ public class NNThroughputBenchmark {
+     @Override
+     void generateInputs(int[] opsPerThread) throws IOException {
+       assert opsPerThread.length == numThreads : "Error opsPerThread.length"; 
+-      nameNodeProto.setSafeMode(HdfsConstants.SafeModeAction.SAFEMODE_LEAVE);
++      nameNodeProto.setSafeMode(HdfsConstants.SafeModeAction.SAFEMODE_LEAVE,
++          false);
+       // int generatedFileIdx = 0;
+       LOG.info("Generate " + numOpsRequired + " intputs for " + getOpName());
+       fileNames = new String[numThreads][];
+@@ -1035,7 +1038,8 @@ public class NNThroughputBenchmark {
+       FileNameGenerator nameGenerator;
+       nameGenerator = new FileNameGenerator(getBaseDir(), 100);
+       String clientName = getClientName(007);
+-      nameNodeProto.setSafeMode(HdfsConstants.SafeModeAction.SAFEMODE_LEAVE);
++      nameNodeProto.setSafeMode(HdfsConstants.SafeModeAction.SAFEMODE_LEAVE,
++          false);
+       for(int idx=0; idx < nrFiles; idx++) {
+         String fileName = nameGenerator.getNextFileName("ThroughputBench");
+         nameNodeProto.create(fileName, FsPermission.getDefault(), clientName,
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestCheckpoint.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestCheckpoint.java
+index 6d9f159..bad91e2 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestCheckpoint.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestCheckpoint.java
+@@ -1836,11 +1836,11 @@ public class TestCheckpoint {
+ 
+       // Now primary NN saves namespace 3 times
+       NamenodeProtocols nn = cluster.getNameNodeRpc();
+-      nn.setSafeMode(SafeModeAction.SAFEMODE_ENTER);
++      nn.setSafeMode(SafeModeAction.SAFEMODE_ENTER, false);
+       for (int i = 0; i < 3; i++) {
+         nn.saveNamespace();
+       }
+-      nn.setSafeMode(SafeModeAction.SAFEMODE_LEAVE);
++      nn.setSafeMode(SafeModeAction.SAFEMODE_LEAVE, false);
+       
+       // Now the secondary tries to checkpoint again with its
+       // old image in memory.
+@@ -1927,9 +1927,9 @@ public class TestCheckpoint {
+       // Perform a saveNamespace, so that the NN has a new fsimage, and the 2NN
+       // therefore needs to download a new fsimage the next time it performs a
+       // checkpoint.
+-      cluster.getNameNodeRpc().setSafeMode(SafeModeAction.SAFEMODE_ENTER);
++      cluster.getNameNodeRpc().setSafeMode(SafeModeAction.SAFEMODE_ENTER, false);
+       cluster.getNameNodeRpc().saveNamespace();
+-      cluster.getNameNodeRpc().setSafeMode(SafeModeAction.SAFEMODE_LEAVE);
++      cluster.getNameNodeRpc().setSafeMode(SafeModeAction.SAFEMODE_LEAVE, false);
+       
+       // Ensure that the 2NN can still perform a checkpoint.
+       secondary.doCheckpoint();
+@@ -1974,9 +1974,9 @@ public class TestCheckpoint {
+       // Perform a saveNamespace, so that the NN has a new fsimage, and the 2NN
+       // therefore needs to download a new fsimage the next time it performs a
+       // checkpoint.
+-      cluster.getNameNodeRpc().setSafeMode(SafeModeAction.SAFEMODE_ENTER);
++      cluster.getNameNodeRpc().setSafeMode(SafeModeAction.SAFEMODE_ENTER, false);
+       cluster.getNameNodeRpc().saveNamespace();
+-      cluster.getNameNodeRpc().setSafeMode(SafeModeAction.SAFEMODE_LEAVE);
++      cluster.getNameNodeRpc().setSafeMode(SafeModeAction.SAFEMODE_LEAVE, false);
+       
+       // Ensure that the 2NN can still perform a checkpoint.
+       secondary.doCheckpoint();
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestListCorruptFileBlocks.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestListCorruptFileBlocks.java
+index f124879..7c8a712 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestListCorruptFileBlocks.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestListCorruptFileBlocks.java
+@@ -149,8 +149,8 @@ public class TestListCorruptFileBlocks {
+       conf.setFloat(DFSConfigKeys.DFS_NAMENODE_REPL_QUEUE_THRESHOLD_PCT_KEY,
+                     0f);
+       cluster = new MiniDFSCluster.Builder(conf).waitSafeMode(false).build();
+-      cluster.getNameNodeRpc().
+-        setSafeMode(HdfsConstants.SafeModeAction.SAFEMODE_LEAVE);
++      cluster.getNameNodeRpc().setSafeMode(
++          HdfsConstants.SafeModeAction.SAFEMODE_LEAVE, false);
+       FileSystem fs = cluster.getFileSystem();
+ 
+       // create two files with one block each
+@@ -247,8 +247,8 @@ public class TestListCorruptFileBlocks {
+                  cluster.getNameNode().isInSafeMode());
+ 
+       // now leave safe mode so that we can clean up
+-      cluster.getNameNodeRpc().
+-        setSafeMode(HdfsConstants.SafeModeAction.SAFEMODE_LEAVE);
++      cluster.getNameNodeRpc().setSafeMode(
++          HdfsConstants.SafeModeAction.SAFEMODE_LEAVE, false);
+ 
+       util.cleanup(fs, "/srcdat10");
+     } catch (Exception e) {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestNNStorageRetentionFunctional.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestNNStorageRetentionFunctional.java
+index d256768..dcc6b2d 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestNNStorageRetentionFunctional.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestNNStorageRetentionFunctional.java
+@@ -149,8 +149,8 @@ public class TestNNStorageRetentionFunctional {
+ 
+   private static void doSaveNamespace(NameNode nn) throws IOException {
+     LOG.info("Saving namespace...");
+-    nn.getRpcServer().setSafeMode(SafeModeAction.SAFEMODE_ENTER);
++    nn.getRpcServer().setSafeMode(SafeModeAction.SAFEMODE_ENTER, false);
+     nn.getRpcServer().saveNamespace();
+-    nn.getRpcServer().setSafeMode(SafeModeAction.SAFEMODE_LEAVE);
++    nn.getRpcServer().setSafeMode(SafeModeAction.SAFEMODE_LEAVE, false);
+   }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestStartup.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestStartup.java
+index 28e22aa..4cfee79 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestStartup.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestStartup.java
+@@ -397,7 +397,7 @@ public class TestStartup {
+         new PermissionStatus("hairong", null, FsPermission.getDefault()), true);
+     NamenodeProtocols nnRpc = namenode.getRpcServer();
+     assertTrue(nnRpc.getFileInfo("/test").isDir());
+-    nnRpc.setSafeMode(SafeModeAction.SAFEMODE_ENTER);
++    nnRpc.setSafeMode(SafeModeAction.SAFEMODE_ENTER, false);
+     nnRpc.saveNamespace();
+     namenode.stop();
+     namenode.join();
+@@ -427,7 +427,7 @@ public class TestStartup {
+     NameNode namenode = new NameNode(conf);
+     NamenodeProtocols nnRpc = namenode.getRpcServer();
+     assertTrue(nnRpc.getFileInfo("/test").isDir());
+-    nnRpc.setSafeMode(SafeModeAction.SAFEMODE_ENTER);
++    nnRpc.setSafeMode(SafeModeAction.SAFEMODE_ENTER, false);
+     nnRpc.saveNamespace();
+     namenode.stop();
+     namenode.join();
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestHASafeMode.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestHASafeMode.java
+index 7c5f7f9..6c39134 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestHASafeMode.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestHASafeMode.java
+@@ -17,10 +17,11 @@
+  */
+ package org.apache.hadoop.hdfs.server.namenode.ha;
+ 
+-import static org.junit.Assert.assertEquals;
+-import static org.junit.Assert.assertTrue;
++import static org.junit.Assert.*;
+ 
+ import java.io.IOException;
++import java.net.InetSocketAddress;
++import java.net.URI;
+ import java.util.List;
+ 
+ import org.apache.commons.logging.Log;
+@@ -34,6 +35,7 @@ import org.apache.hadoop.ha.HAServiceProtocol.RequestSource;
+ import org.apache.hadoop.ha.HAServiceProtocol.StateChangeRequestInfo;
+ import org.apache.hadoop.hdfs.DFSConfigKeys;
+ import org.apache.hadoop.hdfs.DFSTestUtil;
++import org.apache.hadoop.hdfs.DistributedFileSystem;
+ import org.apache.hadoop.hdfs.MiniDFSCluster;
+ import org.apache.hadoop.hdfs.MiniDFSNNTopology;
+ import org.apache.hadoop.hdfs.protocol.HdfsConstants.SafeModeAction;
+@@ -43,6 +45,8 @@ import org.apache.hadoop.hdfs.server.namenode.FSNamesystem;
+ import org.apache.hadoop.hdfs.server.namenode.NameNode;
+ import org.apache.hadoop.hdfs.server.namenode.NameNodeAdapter;
+ import org.apache.hadoop.io.IOUtils;
++import org.apache.hadoop.ipc.RemoteException;
++import org.apache.hadoop.ipc.StandbyException;
+ import org.apache.hadoop.test.GenericTestUtils;
+ import org.apache.log4j.Level;
+ import org.junit.After;
+@@ -603,9 +607,9 @@ public class TestHASafeMode {
+     HATestUtil.waitForStandbyToCatchUp(nn0, nn1);
+     
+     // get some blocks in the SBN's image
+-    nn1.getRpcServer().setSafeMode(SafeModeAction.SAFEMODE_ENTER);
++    nn1.getRpcServer().setSafeMode(SafeModeAction.SAFEMODE_ENTER, false);
+     NameNodeAdapter.saveNamespace(nn1);
+-    nn1.getRpcServer().setSafeMode(SafeModeAction.SAFEMODE_LEAVE);
++    nn1.getRpcServer().setSafeMode(SafeModeAction.SAFEMODE_LEAVE, false);
+ 
+     // and some blocks in the edit logs
+     DFSTestUtil.createFile(fs, new Path("/test2"), 15*BLOCK_SIZE, (short)3, 1L);
+@@ -664,5 +668,50 @@ public class TestHASafeMode {
+         string + "\n" +
+         "==================================================\n\n");
+   }
++  
++  /**
++   * DFS#isInSafeMode should check the ActiveNNs safemode in HA enabled cluster. HDFS-3507
++   * 
++   * @throws Exception
++   */
++  @Test
++  public void testIsInSafemode() throws Exception {
++    // Check for the standby nn without client failover.
++    NameNode nn2 = cluster.getNameNode(1);
++    assertTrue("nn2 should be in standby state", nn2.isStandbyState());
++
++    InetSocketAddress nameNodeAddress = nn2.getNameNodeAddress();
++    Configuration conf = new Configuration();
++    DistributedFileSystem dfs = new DistributedFileSystem();
++    try {
++      dfs.initialize(
++          URI.create("hdfs://" + nameNodeAddress.getHostName() + ":"
++              + nameNodeAddress.getPort()), conf);
++      dfs.isInSafeMode();
++      fail("StandBy should throw exception for isInSafeMode");
++    } catch (IOException e) {
++      if (e instanceof RemoteException) {
++        IOException sbExcpetion = ((RemoteException) e).unwrapRemoteException();
++        assertTrue("StandBy nn should not support isInSafeMode",
++            sbExcpetion instanceof StandbyException);
++      } else {
++        throw e;
++      }
++    } finally {
++      if (null != dfs) {
++        dfs.close();
++      }
++    }
++
++    // Check with Client FailOver
++    cluster.transitionToStandby(0);
++    cluster.transitionToActive(1);
++    cluster.getNameNodeRpc(1).setSafeMode(SafeModeAction.SAFEMODE_ENTER, false);
++    DistributedFileSystem dfsWithFailOver = (DistributedFileSystem) fs;
++    assertTrue("ANN should be in SafeMode", dfsWithFailOver.isInSafeMode());
++
++    cluster.getNameNodeRpc(1).setSafeMode(SafeModeAction.SAFEMODE_LEAVE, false);
++    assertFalse("ANN should be out of SafeMode", dfsWithFailOver.isInSafeMode());
++  }
+ 
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/metrics/TestNameNodeMetrics.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/metrics/TestNameNodeMetrics.java
+index 2c5c7f2..edb3bf5 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/metrics/TestNameNodeMetrics.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/metrics/TestNameNodeMetrics.java
+@@ -380,9 +380,9 @@ public class TestNameNodeMetrics {
+     assertGauge("TransactionsSinceLastCheckpoint", 4L, getMetrics(NS_METRICS));
+     assertGauge("TransactionsSinceLastLogRoll", 1L, getMetrics(NS_METRICS));
+     
+-    cluster.getNameNodeRpc().setSafeMode(SafeModeAction.SAFEMODE_ENTER);
++    cluster.getNameNodeRpc().setSafeMode(SafeModeAction.SAFEMODE_ENTER, false);
+     cluster.getNameNodeRpc().saveNamespace();
+-    cluster.getNameNodeRpc().setSafeMode(SafeModeAction.SAFEMODE_LEAVE);
++    cluster.getNameNodeRpc().setSafeMode(SafeModeAction.SAFEMODE_LEAVE, false);
+     updateMetrics();
+     
+     long newLastCkptTime = MetricsAsserts.getLongGauge("LastCheckpointTime",
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/tools/offlineImageViewer/TestOfflineImageViewer.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/tools/offlineImageViewer/TestOfflineImageViewer.java
+index 32b625e..ea93506 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/tools/offlineImageViewer/TestOfflineImageViewer.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/tools/offlineImageViewer/TestOfflineImageViewer.java
+@@ -135,7 +135,8 @@ public class TestOfflineImageViewer {
+       }
+ 
+       // Write results to the fsimage file
+-      cluster.getNameNodeRpc().setSafeMode(SafeModeAction.SAFEMODE_ENTER);
++      cluster.getNameNodeRpc()
++          .setSafeMode(SafeModeAction.SAFEMODE_ENTER, false);
+       cluster.getNameNodeRpc().saveNamespace();
+       
+       // Determine location of fsimage file
+-- 
+1.7.0.4
+

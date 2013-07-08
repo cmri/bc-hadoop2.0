@@ -1,0 +1,364 @@
+From 8fa0af7d5c15d77fe3939aaec32a864eac20cc92 Mon Sep 17 00:00:00 2001
+From: Aaron Twining Myers <atm@apache.org>
+Date: Mon, 6 Aug 2012 21:04:33 +0000
+Subject: [PATCH 0293/1357] Add two new files missed by last commit of HDFS-3579.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1370017 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit ea575e5ac8b6f0687094fe5851e4cfff4dcf6981)
+---
+ .../src/main/native/libhdfs/exception.c            |  195 ++++++++++++++++++++
+ .../src/main/native/libhdfs/exception.h            |  140 ++++++++++++++
+ 2 files changed, 335 insertions(+), 0 deletions(-)
+ create mode 100644 hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/exception.c
+ create mode 100644 hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/exception.h
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/exception.c b/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/exception.c
+new file mode 100644
+index 0000000..2095e2c
+--- /dev/null
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/exception.c
+@@ -0,0 +1,195 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "exception.h"
++#include "hdfs.h"
++#include "jni_helper.h"
++
++#include <inttypes.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define EXCEPTION_INFO_LEN (sizeof(gExceptionInfo)/sizeof(gExceptionInfo[0]))
++
++struct ExceptionInfo {
++    const char * const name;
++    int noPrintFlag;
++    int excErrno;
++};
++
++static const struct ExceptionInfo gExceptionInfo[] = {
++    {
++        .name = "java/io/FileNotFoundException",
++        .noPrintFlag = NOPRINT_EXC_FILE_NOT_FOUND,
++        .excErrno = ENOENT,
++    },
++    {
++        .name = "org/apache/hadoop/security/AccessControlException",
++        .noPrintFlag = NOPRINT_EXC_ACCESS_CONTROL,
++        .excErrno = EACCES,
++    },
++    {
++        .name = "org/apache/hadoop/fs/UnresolvedLinkException",
++        .noPrintFlag = NOPRINT_EXC_UNRESOLVED_LINK,
++        .excErrno = ENOLINK,
++    },
++    {
++        .name = "org/apache/hadoop/fs/ParentNotDirectoryException",
++        .noPrintFlag = NOPRINT_EXC_PARENT_NOT_DIRECTORY,
++        .excErrno = ENOTDIR,
++    },
++    {
++        .name = "java/lang/IllegalArgumentException",
++        .noPrintFlag = NOPRINT_EXC_ILLEGAL_ARGUMENT,
++        .excErrno = EINVAL,
++    },
++    {
++        .name = "java/lang/OutOfMemoryError",
++        .noPrintFlag = 0,
++        .excErrno = ENOMEM,
++    },
++    
++};
++
++int printExceptionAndFreeV(JNIEnv *env, jthrowable exc, int noPrintFlags,
++        const char *fmt, va_list ap)
++{
++    int i, noPrint, excErrno;
++    char *className = NULL;
++    jstring jStr = NULL;
++    jvalue jVal;
++    jthrowable jthr;
++
++    jthr = classNameOfObject(exc, env, &className);
++    if (jthr) {
++        fprintf(stderr, "PrintExceptionAndFree: error determining class name "
++            "of exception.\n");
++        className = strdup("(unknown)");
++        destroyLocalReference(env, jthr);
++    }
++    for (i = 0; i < EXCEPTION_INFO_LEN; i++) {
++        if (!strcmp(gExceptionInfo[i].name, className)) {
++            break;
++        }
++    }
++    if (i < EXCEPTION_INFO_LEN) {
++        noPrint = (gExceptionInfo[i].noPrintFlag & noPrintFlags);
++        excErrno = gExceptionInfo[i].excErrno;
++    } else {
++        noPrint = 0;
++        excErrno = EINTERNAL;
++    }
++    if (!noPrint) {
++        vfprintf(stderr, fmt, ap);
++        fprintf(stderr, " error:\n");
++
++        // We don't want to  use ExceptionDescribe here, because that requires a
++        // pending exception.  Instead, use ExceptionUtils.
++        jthr = invokeMethod(env, &jVal, STATIC, NULL, 
++            "org/apache/commons/lang/exception/ExceptionUtils",
++            "getStackTrace", "(Ljava/lang/Throwable;)Ljava/lang/String;", exc);
++        if (jthr) {
++            fprintf(stderr, "(unable to get stack trace for %s exception: "
++                    "ExceptionUtils::getStackTrace error.)\n", className);
++            destroyLocalReference(env, jthr);
++        } else {
++            jStr = jVal.l;
++            const char *stackTrace = (*env)->GetStringUTFChars(env, jStr, NULL);
++            if (!stackTrace) {
++                fprintf(stderr, "(unable to get stack trace for %s exception: "
++                        "GetStringUTFChars error.)\n", className);
++            } else {
++                fprintf(stderr, "%s", stackTrace);
++                (*env)->ReleaseStringUTFChars(env, jStr, stackTrace);
++            }
++        }
++    }
++    destroyLocalReference(env, jStr);
++    destroyLocalReference(env, exc);
++    free(className);
++    return excErrno;
++}
++
++int printExceptionAndFree(JNIEnv *env, jthrowable exc, int noPrintFlags,
++        const char *fmt, ...)
++{
++    va_list ap;
++    int ret;
++
++    va_start(ap, fmt);
++    ret = printExceptionAndFreeV(env, exc, noPrintFlags, fmt, ap);
++    va_end(ap);
++    return ret;
++}
++
++int printPendingExceptionAndFree(JNIEnv *env, int noPrintFlags,
++        const char *fmt, ...)
++{
++    va_list ap;
++    int ret;
++    jthrowable exc;
++
++    exc = (*env)->ExceptionOccurred(env);
++    if (!exc) {
++        va_start(ap, fmt);
++        vfprintf(stderr, fmt, ap);
++        va_end(ap);
++        fprintf(stderr, " error: (no exception)");
++        ret = 0;
++    } else {
++        (*env)->ExceptionClear(env);
++        va_start(ap, fmt);
++        ret = printExceptionAndFreeV(env, exc, noPrintFlags, fmt, ap);
++        va_end(ap);
++    }
++    return ret;
++}
++
++jthrowable getPendingExceptionAndClear(JNIEnv *env)
++{
++    jthrowable jthr = (*env)->ExceptionOccurred(env);
++    if (!jthr)
++        return NULL;
++    (*env)->ExceptionClear(env);
++    return jthr;
++}
++
++jthrowable newRuntimeError(JNIEnv *env, const char *fmt, ...)
++{
++    char buf[512];
++    jobject out, exc;
++    jstring jstr;
++    va_list ap;
++
++    va_start(ap, fmt);
++    vsnprintf(buf, sizeof(buf), fmt, ap);
++    va_end(ap);
++    jstr = (*env)->NewStringUTF(env, buf);
++    if (!jstr) {
++        // We got an out of memory exception rather than a RuntimeException.
++        // Too bad...
++        return getPendingExceptionAndClear(env);
++    }
++    exc = constructNewObjectOfClass(env, &out, "RuntimeException",
++        "(java/lang/String;)V", jstr);
++    (*env)->DeleteLocalRef(env, jstr);
++    // Again, we'll either get an out of memory exception or the
++    // RuntimeException we wanted.
++    return (exc) ? exc : out;
++}
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/exception.h b/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/exception.h
+new file mode 100644
+index 0000000..54e170b
+--- /dev/null
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/exception.h
+@@ -0,0 +1,140 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef LIBHDFS_EXCEPTION_H
++#define LIBHDFS_EXCEPTION_H
++
++/**
++ * Exception handling routines for libhdfs.
++ *
++ * The convention we follow here is to clear pending exceptions as soon as they
++ * are raised.  Never assume that the caller of your function will clean up
++ * after you-- do it yourself.  Unhandled exceptions can lead to memory leaks
++ * and other undefined behavior.
++ *
++ * If you encounter an exception, return a local reference to it.  The caller is
++ * responsible for freeing the local reference, by calling a function like
++ * PrintExceptionAndFree.  (You can also free exceptions directly by calling
++ * DeleteLocalRef.  However, that would not produce an error message, so it's
++ * usually not what you want.)
++ */
++
++#include <jni.h>
++#include <stdio.h>
++
++#include <stdlib.h>
++#include <stdarg.h>
++#include <search.h>
++#include <pthread.h>
++#include <errno.h>
++
++/**
++ * Exception noprint flags
++ *
++ * Theses flags determine which exceptions should NOT be printed to stderr by
++ * the exception printing routines.  For example, if you expect to see
++ * FileNotFound, you might use NOPRINT_EXC_FILE_NOT_FOUND, to avoid filling the
++ * logs with messages about routine events.
++ *
++ * On the other hand, if you don't expect any failures, you might pass
++ * PRINT_EXC_ALL.
++ *
++ * You can OR these flags together to avoid printing multiple classes of
++ * exceptions.
++ */
++#define PRINT_EXC_ALL                           0x00
++#define NOPRINT_EXC_FILE_NOT_FOUND              0x01
++#define NOPRINT_EXC_ACCESS_CONTROL              0x02
++#define NOPRINT_EXC_UNRESOLVED_LINK             0x04
++#define NOPRINT_EXC_PARENT_NOT_DIRECTORY        0x08
++#define NOPRINT_EXC_ILLEGAL_ARGUMENT            0x10
++
++/**
++ * Print out information about an exception and free it.
++ *
++ * @param env             The JNI environment
++ * @param exc             The exception to print and free
++ * @param noPrintFlags    Flags which determine which exceptions we should NOT
++ *                        print.
++ * @param fmt             Printf-style format list
++ * @param ap              Printf-style varargs
++ *
++ * @return                The POSIX error number associated with the exception
++ *                        object.
++ */
++int printExceptionAndFreeV(JNIEnv *env, jthrowable exc, int noPrintFlags,
++        const char *fmt, va_list ap);
++
++/**
++ * Print out information about an exception and free it.
++ *
++ * @param env             The JNI environment
++ * @param exc             The exception to print and free
++ * @param noPrintFlags    Flags which determine which exceptions we should NOT
++ *                        print.
++ * @param fmt             Printf-style format list
++ * @param ...             Printf-style varargs
++ *
++ * @return                The POSIX error number associated with the exception
++ *                        object.
++ */
++int printExceptionAndFree(JNIEnv *env, jthrowable exc, int noPrintFlags,
++        const char *fmt, ...) __attribute__((format(printf, 4, 5)));  
++
++/**
++ * Print out information about the pending exception and free it.
++ *
++ * @param env             The JNI environment
++ * @param noPrintFlags    Flags which determine which exceptions we should NOT
++ *                        print.
++ * @param fmt             Printf-style format list
++ * @param ...             Printf-style varargs
++ *
++ * @return                The POSIX error number associated with the exception
++ *                        object.
++ */
++int printPendingExceptionAndFree(JNIEnv *env, int noPrintFlags,
++        const char *fmt, ...) __attribute__((format(printf, 3, 4)));  
++
++/**
++ * Get a local reference to the pending exception and clear it.
++ *
++ * Once it is cleared, the exception will no longer be pending.  The caller will
++ * have to decide what to do with the exception object.
++ *
++ * @param env             The JNI environment
++ *
++ * @return                The exception, or NULL if there was no exception
++ */
++jthrowable getPendingExceptionAndClear(JNIEnv *env);
++
++/**
++ * Create a new runtime error.
++ *
++ * This creates (but does not throw) a new RuntimeError.
++ *
++ * @param env             The JNI environment
++ * @param fmt             Printf-style format list
++ * @param ...             Printf-style varargs
++ *
++ * @return                A local reference to a RuntimeError
++ */
++jthrowable newRuntimeError(JNIEnv *env, const char *fmt, ...)
++        __attribute__((format(printf, 2, 3)));
++
++#endif
+-- 
+1.7.0.4
+

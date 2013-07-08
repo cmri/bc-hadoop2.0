@@ -1,0 +1,404 @@
+From 5cce98177a36ceb2f3030fc524d1d1f09b802645 Mon Sep 17 00:00:00 2001
+From: Alejandro Abdelnur <tucu@apache.org>
+Date: Fri, 25 Jan 2013 01:05:12 +0000
+Subject: [PATCH 1269/1357] MR1: MAPREDUCE-2264. Job status exceeds 100% in some cases. (devaraj.k and sandyr via tucu)
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/branch-1@1438286 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 142e1b8b722c53be5264310f64c81e8afcda5457)
+
+Reason: Customer/support request
+Ref: CDH-7179
+Author: Sandy Ryza
+---
+ .../mapred/org/apache/hadoop/mapred/Merger.java    |   20 +++-
+ .../org/apache/hadoop/mapred/ReduceTask.java       |   65 ++++++++--
+ src/test/org/apache/hadoop/mapred/TestMerger.java  |  135 ++++++++++++++++++++
+ 3 files changed, 205 insertions(+), 15 deletions(-)
+ create mode 100644 src/test/org/apache/hadoop/mapred/TestMerger.java
+
+diff --git a/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/Merger.java b/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/Merger.java
+index 8774cc1..2a8594c 100644
+--- a/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/Merger.java
++++ b/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/Merger.java
+@@ -174,6 +174,7 @@ class Merger {
+     CompressionCodec codec = null;
+     long segmentOffset = 0;
+     long segmentLength = -1;
++    long rawDataLength = -1;
+     
+     public Segment(Configuration conf, FileSystem fs, Path file,
+                    CompressionCodec codec, boolean preserve) throws IOException {
+@@ -181,6 +182,12 @@ class Merger {
+     }
+ 
+     public Segment(Configuration conf, FileSystem fs, Path file,
++            CompressionCodec codec, boolean preserve, long rawDataLength) throws IOException {
++      this(conf, fs, file, 0, fs.getFileStatus(file).getLen(), codec, preserve);
++      this.rawDataLength = rawDataLength;
++    }
++
++    public Segment(Configuration conf, FileSystem fs, Path file,
+         long segmentOffset, long segmentLength, CompressionCodec codec,
+         boolean preserve) throws IOException {
+       this.conf = conf;
+@@ -200,6 +207,14 @@ class Merger {
+       this.segmentLength = reader.getLength();
+     }
+ 
++    public Segment(Reader<K, V> reader, boolean preserve, long rawDataLength) {
++      this.reader = reader;
++      this.preserve = preserve;
++
++      this.segmentLength = reader.getLength();
++      this.rawDataLength = rawDataLength;
++    }
++
+     private void init(Counters.Counter readsCounter) throws IOException {
+       if (reader == null) {
+         FSDataInputStream in = fs.open(file);
+@@ -216,6 +231,9 @@ class Merger {
+         segmentLength : reader.getLength();
+     }
+     
++    long getRawDataLength() {
++      return (rawDataLength > 0) ? rawDataLength : getLength();
++    }
+     boolean next() throws IOException {
+       return reader.next(key, value);
+     }
+@@ -460,7 +478,7 @@ class Merger {
+           //calculating the merge progress
+           long totalBytes = 0;
+           for (int i = 0; i < segmentsToMerge.size(); i++) {
+-            totalBytes += segmentsToMerge.get(i).getLength();
++            totalBytes += segmentsToMerge.get(i).getRawDataLength();
+           }
+           if (totalBytes != 0) //being paranoid
+             progPerByte = 1.0f / (float)totalBytes;
+diff --git a/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/ReduceTask.java b/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/ReduceTask.java
+index 49a15c7..248acf7 100644
+--- a/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/ReduceTask.java
++++ b/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/ReduceTask.java
+@@ -148,8 +148,8 @@ class ReduceTask extends Task {
+   };
+   
+   // A sorted set for keeping a set of map output files on disk
+-  private final SortedSet<FileStatus> mapOutputFilesOnDisk = 
+-    new TreeSet<FileStatus>(mapOutputFileComparator);
++  private final SortedSet<CompressAwareFileStatus> mapOutputFilesOnDisk = 
++    new TreeSet<CompressAwareFileStatus>(mapOutputFileComparator);
+ 
+   private static boolean sslShuffle;
+   private static SSLFactory sslFactory;
+@@ -619,7 +619,7 @@ class ReduceTask extends Task {
+     private TaskUmbilicalProtocol umbilical;
+     private JobConf conf;
+     private TaskReporter reporter;
+-    private SortedSet<FileStatus> mapOutputFilesOnDisk;
++    private SortedSet<CompressAwareFileStatus> mapOutputFilesOnDisk;
+ 
+     /** Reference to the task object */
+     
+@@ -1000,6 +1000,7 @@ class ReduceTask extends Task {
+       byte[] data;
+       final boolean inMemory;
+       long compressedSize;
++      long decompressedSize;
+       
+       public MapOutput(TaskID mapId, TaskAttemptID mapAttemptId, 
+                        Configuration conf, Path file, long size) {
+@@ -1401,7 +1402,10 @@ class ReduceTask extends Task {
+             }
+ 
+             synchronized (mapOutputFilesOnDisk) {        
+-              addToMapOutputFilesOnDisk(localFileSys.getFileStatus(filename));
++              FileStatus fileStatus = localFileSys.getFileStatus(filename);
++              CompressAwareFileStatus compressedFileStatus = new CompressAwareFileStatus(
++                  fileStatus, mapOutput.decompressedSize);
++              addToMapOutputFilesOnDisk(compressedFileStatus);
+             }
+           }
+ 
+@@ -2366,6 +2370,7 @@ class ReduceTask extends Task {
+         mapOutput = copier.shuffleToDisk(mapOutputLoc, input, filename, 
+                                   compressedLength);
+       }
++      mapOutput.decompressedSize = decompressedLength;    
+       return mapOutput;
+     }
+ 
+@@ -2463,9 +2468,13 @@ class ReduceTask extends Task {
+               keyClass, valueClass, reduceTask.codec, null);
+           try {
+             Merger.writeFile(rIter, writer, reporter, conf);
++            long decompressedBytesWritten = writer.decompressedBytesWritten;
+             writer.close();
+             writer = null;
+-            addToMapOutputFilesOnDisk(fs.getFileStatus(outputPath));
++            FileStatus fileStatus = fs.getFileStatus(outputPath);
++            CompressAwareFileStatus compressedFileStatus = new CompressAwareFileStatus(
++                fileStatus, decompressedBytesWritten);
++            addToMapOutputFilesOnDisk(compressedFileStatus);
+           } catch (Exception e) {
+             if (null != outputPath) {
+               fs.delete(outputPath, true);
+@@ -2491,12 +2500,17 @@ class ReduceTask extends Task {
+       // segments on disk
+       List<Segment<K,V>> diskSegments = new ArrayList<Segment<K,V>>();
+       long onDiskBytes = inMemToDiskBytes;
+-      Path[] onDisk = reduceTask.getMapFiles(fs, false);
+-      for (Path file : onDisk) {
+-        onDiskBytes += fs.getFileStatus(file).getLen();
+-        diskSegments.add(new Segment<K, V>(conf, fs, file, reduceTask.codec, keepInputs));
++      long totalDecompressedBytes = inMemToDiskBytes;
++
++      for (CompressAwareFileStatus filestatus : mapOutputFilesOnDisk) {
++        long len = filestatus.getLen();
++        onDiskBytes += len;
++        diskSegments.add(new Segment<K, V>(conf, fs, filestatus.getPath(),
++            reduceTask.codec, keepInputs, filestatus.getDecompressedSize()));
++        totalDecompressedBytes += (filestatus.getDecompressedSize() > 0) ? filestatus
++            .getDecompressedSize() : len;
+       }
+-      LOG.info("Merging " + onDisk.length + " files, " +
++      LOG.info("Merging " + mapOutputFilesOnDisk.size() + " files, " +
+                onDiskBytes + " bytes from disk");
+       Collections.sort(diskSegments, new Comparator<Segment<K,V>>() {
+         public int compare(Segment<K, V> o1, Segment<K, V> o2) {
+@@ -2525,7 +2539,7 @@ class ReduceTask extends Task {
+           return diskMerge;
+         }
+         finalSegments.add(new Segment<K,V>(
+-              new RawKVIteratorReader(diskMerge, onDiskBytes), true));
++              new RawKVIteratorReader(diskMerge, onDiskBytes), true, totalDecompressedBytes));
+       }
+       return Merger.merge(conf, fs, keyClass, valueClass,
+                    finalSegments, finalSegments.size(), tmpDir,
+@@ -2609,7 +2623,7 @@ class ReduceTask extends Task {
+       }    
+     }
+     
+-    private void addToMapOutputFilesOnDisk(FileStatus status) {
++    private void addToMapOutputFilesOnDisk(CompressAwareFileStatus status) {
+       synchronized (mapOutputFilesOnDisk) {
+         mapOutputFilesOnDisk.add(status);
+         mapOutputFilesOnDisk.notify();
+@@ -2687,6 +2701,7 @@ class ReduceTask extends Task {
+                          reduceTask.codec, null);
+             RawKeyValueIterator iter  = null;
+             Path tmpDir = new Path(reduceTask.getTaskID().toString());
++            long decompressedBytesWritten;
+             try {
+               iter = Merger.merge(conf, rfs,
+                                   conf.getMapOutputKeyClass(),
+@@ -2697,6 +2712,7 @@ class ReduceTask extends Task {
+                                   reduceTask.spilledRecordsCounter, null);
+               
+               Merger.writeFile(iter, writer, reporter, conf);
++              decompressedBytesWritten = writer.decompressedBytesWritten;
+               writer.close();
+             } catch (Exception e) {
+               localFileSys.delete(outputPath, true);
+@@ -2704,7 +2720,10 @@ class ReduceTask extends Task {
+             }
+             
+             synchronized (mapOutputFilesOnDisk) {
+-              addToMapOutputFilesOnDisk(localFileSys.getFileStatus(outputPath));
++              FileStatus fileStatus = localFileSys.getFileStatus(outputPath);
++              CompressAwareFileStatus compressedFileStatus = new CompressAwareFileStatus(
++                  fileStatus, decompressedBytesWritten);
++              addToMapOutputFilesOnDisk(compressedFileStatus);
+             }
+             
+             LOG.info(reduceTask.getTaskID() +
+@@ -2788,6 +2807,7 @@ class ReduceTask extends Task {
+                      conf.getMapOutputValueClass(),
+                      reduceTask.codec, null);
+ 
++        long decompressedBytesWritten;
+         RawKeyValueIterator rIter = null;
+         try {
+           LOG.info("Initiating in-memory merge with " + noInMemorySegments + 
+@@ -2807,6 +2827,7 @@ class ReduceTask extends Task {
+             combineCollector.setWriter(writer);
+             combinerRunner.combine(rIter, combineCollector);
+           }
++          decompressedBytesWritten = writer.decompressedBytesWritten;
+           writer.close();
+ 
+           LOG.info(reduceTask.getTaskID() + 
+@@ -2824,8 +2845,10 @@ class ReduceTask extends Task {
+ 
+         // Note the output of the merge
+         FileStatus status = localFileSys.getFileStatus(outputPath);
++        CompressAwareFileStatus compressedFileStatus = new CompressAwareFileStatus(
++            status, decompressedBytesWritten);
+         synchronized (mapOutputFilesOnDisk) {
+-          addToMapOutputFilesOnDisk(status);
++          addToMapOutputFilesOnDisk(compressedFileStatus);
+         }
+       }
+     }
+@@ -2993,4 +3016,18 @@ class ReduceTask extends Task {
+     return Integer.numberOfTrailingZeros(hob) +
+       (((hob >>> 1) & value) == 0 ? 0 : 1);
+   }
++  static class CompressAwareFileStatus extends FileStatus {
++	private long decompressedSize;
++	CompressAwareFileStatus(FileStatus fileStatus, long decompressedSize) {
++	  super(fileStatus.getLen(), fileStatus.isDir(), fileStatus.getReplication(),
++				  fileStatus.getBlockSize(), fileStatus.getModificationTime(),
++				  fileStatus.getAccessTime(), fileStatus.getPermission(),
++				  fileStatus.getOwner(), fileStatus.getGroup(), fileStatus.getPath());
++	  this.decompressedSize = decompressedSize;
++	}
++
++	public long getDecompressedSize() {
++	  return decompressedSize;
++	}
++  }
+ }
+diff --git a/src/test/org/apache/hadoop/mapred/TestMerger.java b/src/test/org/apache/hadoop/mapred/TestMerger.java
+new file mode 100644
+index 0000000..501a826
+--- /dev/null
++++ b/src/test/org/apache/hadoop/mapred/TestMerger.java
+@@ -0,0 +1,135 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.mapred;
++
++import static org.mockito.Matchers.any;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.when;
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.List;
++
++import junit.framework.Assert;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.io.DataInputBuffer;
++import org.apache.hadoop.io.RawComparator;
++import org.apache.hadoop.io.Text;
++import org.apache.hadoop.mapred.Counters.Counter;
++import org.apache.hadoop.mapred.IFile.Reader;
++import org.apache.hadoop.mapred.Merger.Segment;
++import org.apache.hadoop.util.Progressable;
++import org.junit.Test;
++import org.mockito.invocation.InvocationOnMock;
++import org.mockito.stubbing.Answer;
++
++public class TestMerger {
++
++  @Test
++  public void testUncompressed() throws IOException {
++    testMergeShouldReturnProperProgress(getUncompressedSegments());
++  }
++  
++  @Test
++  public void testCompressed() throws IOException {
++    testMergeShouldReturnProperProgress(getCompressedSegments());
++  }
++  
++  @SuppressWarnings( { "deprecation", "unchecked" })
++  public void testMergeShouldReturnProperProgress(
++      List<Segment<Text, Text>> segments) throws IOException {
++    Configuration conf = new Configuration();
++    JobConf jobConf = new JobConf();
++    FileSystem fs = FileSystem.getLocal(conf);
++    Path tmpDir = new Path("localpath");
++    Class<Text> keyClass = (Class<Text>) jobConf.getMapOutputKeyClass();
++    Class<Text> valueClass = (Class<Text>) jobConf.getMapOutputValueClass();
++    RawComparator<Text> comparator = jobConf.getOutputKeyComparator();
++    Counter readsCounter = new Counter();
++    Counter writesCounter = new Counter();
++    RawKeyValueIterator mergeQueue = Merger.merge(conf, fs, keyClass,
++        valueClass, segments, 2, tmpDir, comparator, getReporter(),
++        readsCounter, writesCounter);
++    Assert.assertEquals(1.0f, mergeQueue.getProgress().get());
++  }
++
++  private Progressable getReporter() {
++    Progressable reporter = new Progressable() {
++      @Override
++      public void progress() {
++      }
++    };
++    return reporter;
++  }
++
++  private List<Segment<Text, Text>> getUncompressedSegments() throws IOException {
++    List<Segment<Text, Text>> segments = new ArrayList<Segment<Text, Text>>();
++    for (int i = 1; i < 10; i++) {
++      segments.add(getUncompressedSegment(i));
++    }
++    return segments;
++  }
++
++  private List<Segment<Text, Text>> getCompressedSegments() throws IOException {
++    List<Segment<Text, Text>> segments = new ArrayList<Segment<Text, Text>>();
++    for (int i = 1; i < 10; i++) {
++      segments.add(getCompressedSegment(i));
++    }
++    return segments;
++  }
++  
++  private Segment<Text, Text> getUncompressedSegment(int i) throws IOException {
++    return new Segment<Text, Text>(getReader(i), false);
++  }
++  
++  private Segment<Text, Text> getCompressedSegment(int i) throws IOException {
++    return new Segment<Text, Text>(getReader(i), false, 3000l);
++  }
++
++  @SuppressWarnings("unchecked")
++  private Reader<Text, Text> getReader(int i) throws IOException {
++    Reader<Text, Text> readerMock = mock(Reader.class);
++    when(readerMock.getPosition()).thenReturn(0l).thenReturn(10l).thenReturn(
++        20l);
++    when(
++        readerMock.next(any(DataInputBuffer.class), any(DataInputBuffer.class)))
++        .thenAnswer(getAnswer("Segment" + i));
++    return readerMock;
++  }
++
++  private Answer<?> getAnswer(final String segmentName) {
++    return new Answer<Object>() {
++      int i = 0;
++
++      public Boolean answer(InvocationOnMock invocation) {
++        Object[] args = invocation.getArguments();
++        DataInputBuffer key = (DataInputBuffer) args[0];
++        DataInputBuffer value = (DataInputBuffer) args[1];
++        if (i++ == 2) {
++          return false;
++        }
++        key.reset(("Segement Key " + segmentName + i).getBytes(), 20);
++        value.reset(("Segement Value" + segmentName + i).getBytes(), 20);
++        return true;
++      }
++    };
++  }
++}
+-- 
+1.7.0.4
+

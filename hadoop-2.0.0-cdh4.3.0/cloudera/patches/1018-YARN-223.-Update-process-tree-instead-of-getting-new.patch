@@ -1,0 +1,582 @@
+From 4182901be3884e2e49000fb6958f22b42a59d76b Mon Sep 17 00:00:00 2001
+From: Luke Lu <llu@apache.org>
+Date: Thu, 20 Dec 2012 00:20:53 +0000
+Subject: [PATCH 1018/1357] YARN-223. Update process tree instead of getting new process trees. (Radim Kolar via llu)
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1424244 13f79535-47bb-0310-9956-ffa450edef68
+---
+ .../main/java/org/apache/hadoop/mapred/Task.java   |   37 ++++++++---------
+ .../java/org/apache/hadoop/mapreduce/MRConfig.java |    4 +-
+ .../util/LinuxResourceCalculatorPlugin.java        |    2 +-
+ .../mapreduce/util/ProcfsBasedProcessTree.java     |   11 ++---
+ .../mapreduce/util/TestProcfsBasedProcessTree.java |   18 ++++----
+ .../mapred/gridmix/TestResourceUsageEmulators.java |    1 -
+ .../yarn/util/LinuxResourceCalculatorPlugin.java   |   14 -------
+ .../hadoop/yarn/util/ProcfsBasedProcessTree.java   |   10 ++---
+ .../hadoop/yarn/util/ResourceCalculatorPlugin.java |   42 --------------------
+ .../yarn/util/ResourceCalculatorProcessTree.java   |    6 +--
+ .../yarn/util/TestProcfsBasedProcessTree.java      |   18 ++++----
+ .../util/TestResourceCalculatorProcessTree.java    |    3 +-
+ .../monitor/ContainersMonitorImpl.java             |    4 +-
+ .../monitor/TestContainersMonitor.java             |   10 ++--
+ 14 files changed, 56 insertions(+), 124 deletions(-)
+
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapred/Task.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapred/Task.java
+index ce53da8..f983a8d 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapred/Task.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapred/Task.java
+@@ -61,8 +61,7 @@ import org.apache.hadoop.mapreduce.MRConfig;
+ import org.apache.hadoop.mapreduce.MRJobConfig;
+ import org.apache.hadoop.mapreduce.lib.reduce.WrappedReducer;
+ import org.apache.hadoop.mapreduce.task.ReduceContextImpl;
+-import org.apache.hadoop.yarn.util.ResourceCalculatorPlugin;
+-import org.apache.hadoop.yarn.util.ResourceCalculatorPlugin.*;
++import org.apache.hadoop.yarn.util.ResourceCalculatorProcessTree;
+ import org.apache.hadoop.net.NetUtils;
+ import org.apache.hadoop.util.Progress;
+ import org.apache.hadoop.util.Progressable;
+@@ -169,7 +168,7 @@ abstract public class Task implements Writable, Configurable {
+   private Iterator<Long> currentRecIndexIterator = 
+     skipRanges.skipRangeIterator();
+ 
+-  private ResourceCalculatorPlugin resourceCalculator = null;
++  private ResourceCalculatorProcessTree pTree;
+   private long initCpuCumulativeTime = 0;
+ 
+   protected JobConf conf;
+@@ -372,7 +371,7 @@ abstract public class Task implements Writable, Configurable {
+    * Return current state of the task. 
+    * needs to be synchronized as communication thread 
+    * sends the state every second
+-   * @return
++   * @return task state
+    */
+   synchronized TaskStatus.State getState(){
+     return this.taskStatus.getRunState(); 
+@@ -558,15 +557,15 @@ abstract public class Task implements Writable, Configurable {
+       }
+     }
+     committer.setupTask(taskContext);
+-    Class<? extends ResourceCalculatorPlugin> clazz =
+-        conf.getClass(MRConfig.RESOURCE_CALCULATOR_PLUGIN,
+-            null, ResourceCalculatorPlugin.class);
+-    resourceCalculator = ResourceCalculatorPlugin
+-            .getResourceCalculatorPlugin(clazz, conf);
+-    LOG.info(" Using ResourceCalculatorPlugin : " + resourceCalculator);
+-    if (resourceCalculator != null) {
+-      initCpuCumulativeTime =
+-        resourceCalculator.getProcResourceValues().getCumulativeCpuTime();
++    Class<? extends ResourceCalculatorProcessTree> clazz =
++        conf.getClass(MRConfig.RESOURCE_CALCULATOR_PROCESS_TREE,
++            null, ResourceCalculatorProcessTree.class);
++    pTree = ResourceCalculatorProcessTree
++            .getResourceCalculatorProcessTree(System.getenv().get("JVM_PID"), clazz, conf);
++    LOG.info(" Using ResourceCalculatorProcessTree : " + pTree);
++    if (pTree != null) {
++      pTree.updateProcessTree();
++      initCpuCumulativeTime = pTree.getCumulativeCpuTime();
+     }
+   }
+ 
+@@ -817,14 +816,14 @@ abstract public class Task implements Writable, Configurable {
+     // Update generic resource counters
+     updateHeapUsageCounter();
+ 
+-    // Updating resources specified in ResourceCalculatorPlugin
+-    if (resourceCalculator == null) {
++    // Updating resources specified in ResourceCalculatorProcessTree
++    if (pTree == null) {
+       return;
+     }
+-    ProcResourceValues res = resourceCalculator.getProcResourceValues();
+-    long cpuTime = res.getCumulativeCpuTime();
+-    long pMem = res.getPhysicalMemorySize();
+-    long vMem = res.getVirtualMemorySize();
++    pTree.updateProcessTree();
++    long cpuTime = pTree.getCumulativeCpuTime();
++    long pMem = pTree.getCumulativeRssmem();
++    long vMem = pTree.getCumulativeVmem();
+     // Remove the CPU time consumed previously by JVM reuse
+     cpuTime -= initCpuCumulativeTime;
+     counters.findCounter(TaskCounter.CPU_MILLISECONDS).setValue(cpuTime);
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/MRConfig.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/MRConfig.java
+index dc1ff65..3753913 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/MRConfig.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/MRConfig.java
+@@ -55,8 +55,8 @@ public interface MRConfig {
+   public static final long    DELEGATION_TOKEN_MAX_LIFETIME_DEFAULT = 
+     7*24*60*60*1000; // 7 days
+   
+-  public static final String RESOURCE_CALCULATOR_PLUGIN = 
+-    "mapreduce.job.resourcecalculatorplugin";
++  public static final String RESOURCE_CALCULATOR_PROCESS_TREE =
++    "mapreduce.job.process-tree.class";
+   public static final String STATIC_RESOLUTIONS = 
+     "mapreduce.job.net.static.resolutions";
+ 
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/util/LinuxResourceCalculatorPlugin.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/util/LinuxResourceCalculatorPlugin.java
+index 7898dca..c7bdea1 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/util/LinuxResourceCalculatorPlugin.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/util/LinuxResourceCalculatorPlugin.java
+@@ -409,7 +409,7 @@ public class LinuxResourceCalculatorPlugin extends ResourceCalculatorPlugin {
+ 
+   @Override
+   public ProcResourceValues getProcResourceValues() {
+-    pTree = pTree.getProcessTree();
++    pTree.updateProcessTree();
+     long cpuTime = pTree.getCumulativeCpuTime();
+     long pMem = pTree.getCumulativeRssmem();
+     long vMem = pTree.getCumulativeVmem();
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/util/ProcfsBasedProcessTree.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/util/ProcfsBasedProcessTree.java
+index 99c2e7e..a510eb5 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/util/ProcfsBasedProcessTree.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/util/ProcfsBasedProcessTree.java
+@@ -166,12 +166,10 @@ public class ProcfsBasedProcessTree extends ProcessTree {
+   }
+ 
+   /**
+-   * Get the process-tree with latest state. If the root-process is not alive,
+-   * an empty tree will be returned.
+-   * 
+-   * @return the process-tree with latest state.
++   * Update the process-tree with latest state. If the root-process is not alive,
++   * tree will become empty.
+    */
+-  public ProcfsBasedProcessTree getProcessTree() {
++  public void updateProcessTree() {
+     if (!pid.equals(deadPid)) {
+       // Get the list of processes
+       List<String> processList = getProcessList();
+@@ -197,7 +195,7 @@ public class ProcfsBasedProcessTree extends ProcessTree {
+       }
+ 
+       if (me == null) {
+-        return this; 
++        return;
+       }
+ 
+       // Add each process to its parent.
+@@ -239,7 +237,6 @@ public class ProcfsBasedProcessTree extends ProcessTree {
+         LOG.debug(this.toString());
+       }
+     }
+-    return this;
+   }
+ 
+   /**
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/test/java/org/apache/hadoop/mapreduce/util/TestProcfsBasedProcessTree.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/test/java/org/apache/hadoop/mapreduce/util/TestProcfsBasedProcessTree.java
+index 54e1302..a80ee67 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/test/java/org/apache/hadoop/mapreduce/util/TestProcfsBasedProcessTree.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/test/java/org/apache/hadoop/mapreduce/util/TestProcfsBasedProcessTree.java
+@@ -151,7 +151,7 @@ public class TestProcfsBasedProcessTree extends TestCase {
+     ProcfsBasedProcessTree p = new ProcfsBasedProcessTree(pid,
+                                ProcessTree.isSetsidAvailable,
+                                ProcessTree.DEFAULT_SLEEPTIME_BEFORE_SIGKILL);
+-    p = p.getProcessTree(); // initialize
++    p.updateProcessTree(); // initialize
+     LOG.info("ProcessTree: " + p.toString());
+ 
+     File leaf = new File(lowestDescendant);
+@@ -164,7 +164,7 @@ public class TestProcfsBasedProcessTree extends TestCase {
+       }
+     }
+ 
+-    p = p.getProcessTree(); // reconstruct
++    p.updateProcessTree(); // reconstruct
+     LOG.info("ProcessTree: " + p.toString());
+ 
+     // Get the process-tree dump
+@@ -203,7 +203,7 @@ public class TestProcfsBasedProcessTree extends TestCase {
+     }
+ 
+     // ProcessTree is gone now. Any further calls should be sane.
+-    p = p.getProcessTree();
++    p.updateProcessTree();
+     assertFalse("ProcessTree must have been gone", p.isAlive());
+     assertTrue("Cumulative vmem for the gone-process is "
+         + p.getCumulativeVmem() + " . It should be zero.", p
+@@ -336,7 +336,7 @@ public class TestProcfsBasedProcessTree extends TestCase {
+           new ProcfsBasedProcessTree("100", true, 100L, 
+                                   procfsRootDir.getAbsolutePath());
+       // build the process tree.
+-      processTree.getProcessTree();
++      processTree.updateProcessTree();
+       
+       // verify cumulative memory
+       assertEquals("Cumulative virtual memory does not match", 600000L,
+@@ -362,7 +362,7 @@ public class TestProcfsBasedProcessTree extends TestCase {
+       writeStatFiles(procfsRootDir, pids, procInfos);
+ 
+       // build the process tree.
+-      processTree.getProcessTree();
++      processTree.updateProcessTree();
+ 
+       // verify cumulative cpu time again
+       cumuCpuTime = ProcfsBasedProcessTree.JIFFY_LENGTH_IN_MILLIS > 0 ?
+@@ -409,7 +409,7 @@ public class TestProcfsBasedProcessTree extends TestCase {
+           new ProcfsBasedProcessTree("100", true, 100L, 
+                                   procfsRootDir.getAbsolutePath());
+       // build the process tree.
+-      processTree.getProcessTree();
++      processTree.updateProcessTree();
+       
+       // verify cumulative memory
+       assertEquals("Cumulative memory does not match",
+@@ -425,7 +425,7 @@ public class TestProcfsBasedProcessTree extends TestCase {
+       writeStatFiles(procfsRootDir, newPids, newProcInfos);
+       
+       // check memory includes the new process.
+-      processTree.getProcessTree();
++      processTree.updateProcessTree();
+       assertEquals("Cumulative vmem does not include new process",
+                    1200000L, processTree.getCumulativeVmem());
+       long cumuRssMem = ProcfsBasedProcessTree.PAGE_SIZE > 0 ?
+@@ -451,7 +451,7 @@ public class TestProcfsBasedProcessTree extends TestCase {
+       writeStatFiles(procfsRootDir, newPids, newProcInfos);
+ 
+       // refresh process tree
+-      processTree.getProcessTree();
++      processTree.updateProcessTree();
+       
+       // processes older than 2 iterations should be same as before.
+       assertEquals("Cumulative vmem shouldn't have included new processes",
+@@ -555,7 +555,7 @@ public class TestProcfsBasedProcessTree extends TestCase {
+           new ProcfsBasedProcessTree("100", true, 100L, procfsRootDir
+               .getAbsolutePath());
+       // build the process tree.
+-      processTree.getProcessTree();
++      processTree.updateProcessTree();
+ 
+       // Get the process-tree dump
+       String processTreeDump = processTree.getProcessTreeDump();
+diff --git a/hadoop-tools/hadoop-gridmix/src/test/java/org/apache/hadoop/mapred/gridmix/TestResourceUsageEmulators.java b/hadoop-tools/hadoop-gridmix/src/test/java/org/apache/hadoop/mapred/gridmix/TestResourceUsageEmulators.java
+index 35db026..dde25cf 100644
+--- a/hadoop-tools/hadoop-gridmix/src/test/java/org/apache/hadoop/mapred/gridmix/TestResourceUsageEmulators.java
++++ b/hadoop-tools/hadoop-gridmix/src/test/java/org/apache/hadoop/mapred/gridmix/TestResourceUsageEmulators.java
+@@ -32,7 +32,6 @@ import org.apache.hadoop.mapreduce.TaskType;
+ import org.apache.hadoop.mapreduce.server.tasktracker.TTConfig;
+ import org.apache.hadoop.mapreduce.task.MapContextImpl;
+ import org.apache.hadoop.mapreduce.util.ResourceCalculatorPlugin;
+-import org.apache.hadoop.yarn.util.ResourceCalculatorPlugin.ProcResourceValues;
+ import org.apache.hadoop.tools.rumen.ResourceUsageMetrics;
+ import org.apache.hadoop.mapred.DummyResourceCalculatorPlugin;
+ import org.apache.hadoop.mapred.gridmix.LoadJob.ResourceUsageMatcherRunner;
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/util/LinuxResourceCalculatorPlugin.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/util/LinuxResourceCalculatorPlugin.java
+index 21c66c2..56a81cd 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/util/LinuxResourceCalculatorPlugin.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/util/LinuxResourceCalculatorPlugin.java
+@@ -91,7 +91,6 @@ public class LinuxResourceCalculatorPlugin extends ResourceCalculatorPlugin {
+   private float cpuUsage = UNAVAILABLE;
+   private long sampleTime = UNAVAILABLE;
+   private long lastSampleTime = UNAVAILABLE;
+-  private ResourceCalculatorProcessTree pTree = null;
+ 
+   boolean readMemInfoFile = false;
+   boolean readCpuInfoFile = false;
+@@ -109,8 +108,6 @@ public class LinuxResourceCalculatorPlugin extends ResourceCalculatorPlugin {
+     procfsCpuFile = PROCFS_CPUINFO;
+     procfsStatFile = PROCFS_STAT;
+     jiffyLengthInMillis = ProcfsBasedProcessTree.JIFFY_LENGTH_IN_MILLIS;
+-    String pid = System.getenv().get("JVM_PID");
+-    pTree = new ProcfsBasedProcessTree(pid);
+   }
+ 
+   /**
+@@ -129,8 +126,6 @@ public class LinuxResourceCalculatorPlugin extends ResourceCalculatorPlugin {
+     this.procfsCpuFile = procfsCpuFile;
+     this.procfsStatFile = procfsStatFile;
+     this.jiffyLengthInMillis = jiffyLengthInMillis;
+-    String pid = System.getenv().get("JVM_PID");
+-    pTree = new ProcfsBasedProcessTree(pid);
+   }
+ 
+   /**
+@@ -400,13 +395,4 @@ public class LinuxResourceCalculatorPlugin extends ResourceCalculatorPlugin {
+     }
+     System.out.println("CPU usage % : " + plugin.getCpuUsage());
+   }
+-
+-  @Override
+-  public ProcResourceValues getProcResourceValues() {
+-    pTree = pTree.getProcessTree();
+-    long cpuTime = pTree.getCumulativeCpuTime();
+-    long pMem = pTree.getCumulativeRssmem();
+-    long vMem = pTree.getCumulativeVmem();
+-    return new ProcResourceValues(cpuTime, pMem, vMem);
+-  }
+ }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/util/ProcfsBasedProcessTree.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/util/ProcfsBasedProcessTree.java
+index 158dcd5..7123042 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/util/ProcfsBasedProcessTree.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/util/ProcfsBasedProcessTree.java
+@@ -140,13 +140,12 @@ public class ProcfsBasedProcessTree extends ResourceCalculatorProcessTree {
+   }
+ 
+   /**
+-   * Get the process-tree with latest state. If the root-process is not alive,
+-   * an empty tree will be returned.
++   * Update process-tree with latest state. If the root-process is not alive,
++   * tree will be empty.
+    *
+-   * @return the process-tree with latest state.
+    */
+   @Override
+-  public ResourceCalculatorProcessTree getProcessTree() {
++  public void updateProcessTree() {
+     if (!pid.equals(deadPid)) {
+       // Get the list of processes
+       List<String> processList = getProcessList();
+@@ -172,7 +171,7 @@ public class ProcfsBasedProcessTree extends ResourceCalculatorProcessTree {
+       }
+ 
+       if (me == null) {
+-        return this;
++        return;
+       }
+ 
+       // Add each process to its parent.
+@@ -214,7 +213,6 @@ public class ProcfsBasedProcessTree extends ResourceCalculatorProcessTree {
+         LOG.debug(this.toString());
+       }
+     }
+-    return this;
+   }
+ 
+   /** Verify that the given process id is same as its process group id.
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/util/ResourceCalculatorPlugin.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/util/ResourceCalculatorPlugin.java
+index b759446..2e43812 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/util/ResourceCalculatorPlugin.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/util/ResourceCalculatorPlugin.java
+@@ -91,48 +91,6 @@ public abstract class ResourceCalculatorPlugin extends Configured {
+   public abstract float getCpuUsage();
+ 
+   /**
+-   * Obtain resource status used by current process tree.
+-   */
+-  @InterfaceAudience.Private
+-  @InterfaceStability.Unstable
+-  public abstract ProcResourceValues getProcResourceValues();
+-
+-  public static class ProcResourceValues {
+-    private final long cumulativeCpuTime;
+-    private final long physicalMemorySize;
+-    private final long virtualMemorySize;
+-    public ProcResourceValues(long cumulativeCpuTime, long physicalMemorySize,
+-                              long virtualMemorySize) {
+-      this.cumulativeCpuTime = cumulativeCpuTime;
+-      this.physicalMemorySize = physicalMemorySize;
+-      this.virtualMemorySize = virtualMemorySize;
+-    }
+-    /**
+-     * Obtain the physical memory size used by current process tree.
+-     * @return physical memory size in bytes.
+-     */
+-    public long getPhysicalMemorySize() {
+-      return physicalMemorySize;
+-    }
+-
+-    /**
+-     * Obtain the virtual memory size used by a current process tree.
+-     * @return virtual memory size in bytes.
+-     */
+-    public long getVirtualMemorySize() {
+-      return virtualMemorySize;
+-    }
+-
+-    /**
+-     * Obtain the cumulative CPU time used by a current process tree.
+-     * @return cumulative CPU time in milliseconds
+-     */
+-    public long getCumulativeCpuTime() {
+-      return cumulativeCpuTime;
+-    }
+-  }
+-
+-  /**
+    * Create the ResourceCalculatorPlugin from the class name and configure it. If
+    * class name is null, this method will try and return a memory calculator
+    * plugin available for this system.
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/util/ResourceCalculatorProcessTree.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/util/ResourceCalculatorProcessTree.java
+index e5b4e87..2ecc1ce 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/util/ResourceCalculatorProcessTree.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/util/ResourceCalculatorProcessTree.java
+@@ -43,16 +43,14 @@ public abstract class ResourceCalculatorProcessTree extends Configured {
+   }
+ 
+   /**
+-   * Get the process-tree with latest state. If the root-process is not alive,
+-   * an empty tree will be returned.
++   * Update the process-tree with latest state.
+    *
+    * Each call to this function should increment the age of the running
+    * processes that already exist in the process tree. Age is used other API's
+    * of the interface.
+    *
+-   * @return the process-tree with latest state.
+    */
+-  public abstract ResourceCalculatorProcessTree getProcessTree();
++  public abstract void updateProcessTree();
+ 
+   /**
+    * Get a dump of the process-tree.
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/test/java/org/apache/hadoop/yarn/util/TestProcfsBasedProcessTree.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/test/java/org/apache/hadoop/yarn/util/TestProcfsBasedProcessTree.java
+index 3ebd6c6..528e03e 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/test/java/org/apache/hadoop/yarn/util/TestProcfsBasedProcessTree.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/test/java/org/apache/hadoop/yarn/util/TestProcfsBasedProcessTree.java
+@@ -161,7 +161,7 @@ public class TestProcfsBasedProcessTree {
+     String pid = getRogueTaskPID();
+     LOG.info("Root process pid: " + pid);
+     ProcfsBasedProcessTree p = createProcessTree(pid);
+-    p.getProcessTree(); // initialize
++    p.updateProcessTree(); // initialize
+     LOG.info("ProcessTree: " + p.toString());
+ 
+     File leaf = new File(lowestDescendant);
+@@ -174,7 +174,7 @@ public class TestProcfsBasedProcessTree {
+       }
+     }
+ 
+-    p.getProcessTree(); // reconstruct
++    p.updateProcessTree(); // reconstruct
+     LOG.info("ProcessTree: " + p.toString());
+ 
+     // Get the process-tree dump
+@@ -213,7 +213,7 @@ public class TestProcfsBasedProcessTree {
+     }
+ 
+     // ProcessTree is gone now. Any further calls should be sane.
+-    p.getProcessTree();
++    p.updateProcessTree();
+     Assert.assertFalse("ProcessTree must have been gone", isAlive(pid));
+     Assert.assertTrue("Cumulative vmem for the gone-process is "
+         + p.getCumulativeVmem() + " . It should be zero.", p
+@@ -358,7 +358,7 @@ public class TestProcfsBasedProcessTree {
+       ProcfsBasedProcessTree processTree =
+           createProcessTree("100", procfsRootDir.getAbsolutePath());
+       // build the process tree.
+-      processTree.getProcessTree();
++      processTree.updateProcessTree();
+ 
+       // verify cumulative memory
+       Assert.assertEquals("Cumulative virtual memory does not match", 600000L,
+@@ -384,7 +384,7 @@ public class TestProcfsBasedProcessTree {
+       writeStatFiles(procfsRootDir, pids, procInfos);
+ 
+       // build the process tree.
+-      processTree.getProcessTree();
++      processTree.updateProcessTree();
+ 
+       // verify cumulative cpu time again
+       cumuCpuTime = ProcfsBasedProcessTree.JIFFY_LENGTH_IN_MILLIS > 0 ?
+@@ -431,7 +431,7 @@ public class TestProcfsBasedProcessTree {
+       ProcfsBasedProcessTree processTree =
+           createProcessTree("100", procfsRootDir.getAbsolutePath());
+       // build the process tree.
+-      processTree.getProcessTree();
++      processTree.updateProcessTree();
+ 
+       // verify cumulative memory
+       Assert.assertEquals("Cumulative memory does not match",
+@@ -447,7 +447,7 @@ public class TestProcfsBasedProcessTree {
+       writeStatFiles(procfsRootDir, newPids, newProcInfos);
+ 
+       // check memory includes the new process.
+-      processTree.getProcessTree();
++      processTree.updateProcessTree();
+       Assert.assertEquals("Cumulative vmem does not include new process",
+                    1200000L, processTree.getCumulativeVmem());
+       long cumuRssMem = ProcfsBasedProcessTree.PAGE_SIZE > 0 ?
+@@ -473,7 +473,7 @@ public class TestProcfsBasedProcessTree {
+       writeStatFiles(procfsRootDir, newPids, newProcInfos);
+ 
+       // refresh process tree
+-      processTree.getProcessTree();
++      processTree.updateProcessTree();
+ 
+       // processes older than 2 iterations should be same as before.
+       Assert.assertEquals("Cumulative vmem shouldn't have included new processes",
+@@ -577,7 +577,7 @@ public class TestProcfsBasedProcessTree {
+       ProcfsBasedProcessTree processTree = createProcessTree(
+           "100", procfsRootDir.getAbsolutePath());
+       // build the process tree.
+-      processTree.getProcessTree();
++      processTree.updateProcessTree();
+ 
+       // Get the process-tree dump
+       String processTreeDump = processTree.getProcessTreeDump();
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/test/java/org/apache/hadoop/yarn/util/TestResourceCalculatorProcessTree.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/test/java/org/apache/hadoop/yarn/util/TestResourceCalculatorProcessTree.java
+index 68b20c9..32ceb23 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/test/java/org/apache/hadoop/yarn/util/TestResourceCalculatorProcessTree.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/test/java/org/apache/hadoop/yarn/util/TestResourceCalculatorProcessTree.java
+@@ -34,8 +34,7 @@ public class TestResourceCalculatorProcessTree {
+       super(pid);
+     }
+ 
+-    public ResourceCalculatorProcessTree getProcessTree() {
+-      return this;
++    public void updateProcessTree() {
+     }
+ 
+     public String getProcessTreeDump() {
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/monitor/ContainersMonitorImpl.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/monitor/ContainersMonitorImpl.java
+index f84252b..d73f52c 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/monitor/ContainersMonitorImpl.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/monitor/ContainersMonitorImpl.java
+@@ -396,9 +396,7 @@ public class ContainersMonitorImpl extends AbstractService implements
+             LOG.debug("Constructing ProcessTree for : PID = " + pId
+                 + " ContainerId = " + containerId);
+             ResourceCalculatorProcessTree pTree = ptInfo.getProcessTree();
+-            pTree = pTree.getProcessTree(); // get the updated process-tree
+-            ptInfo.setProcessTree(pTree); // update ptInfo with proces-tree of
+-                                          // updated state
++            pTree.updateProcessTree();    // update process-tree
+             long currentVmemUsage = pTree.getCumulativeVmem();
+             long currentPmemUsage = pTree.getCumulativeRssmem();
+             // as processes begin with an age 1, we want to see if there
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/monitor/TestContainersMonitor.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/monitor/TestContainersMonitor.java
+index a7216e7..41456fd 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/monitor/TestContainersMonitor.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/monitor/TestContainersMonitor.java
+@@ -134,7 +134,7 @@ public class TestContainersMonitor extends BaseContainerManagerTest {
+       ProcfsBasedProcessTree pTree = new ProcfsBasedProcessTree(
+                                           "100",
+                                           procfsRootDir.getAbsolutePath());
+-      pTree.getProcessTree();
++      pTree.updateProcessTree();
+       assertTrue("tree rooted at 100 should be over limit " +
+                     "after first iteration.",
+                   test.isProcessTreeOverLimit(pTree, "dummyId", limit));
+@@ -142,13 +142,13 @@ public class TestContainersMonitor extends BaseContainerManagerTest {
+       // the tree rooted at 200 is initially below limit.
+       pTree = new ProcfsBasedProcessTree("200",
+                                           procfsRootDir.getAbsolutePath());
+-      pTree.getProcessTree();
++      pTree.updateProcessTree();
+       assertFalse("tree rooted at 200 shouldn't be over limit " +
+                     "after one iteration.",
+                   test.isProcessTreeOverLimit(pTree, "dummyId", limit));
+       // second iteration - now the tree has been over limit twice,
+       // hence it should be declared over limit.
+-      pTree.getProcessTree();
++      pTree.updateProcessTree();
+       assertTrue(
+           "tree rooted at 200 should be over limit after 2 iterations",
+                   test.isProcessTreeOverLimit(pTree, "dummyId", limit));
+@@ -156,12 +156,12 @@ public class TestContainersMonitor extends BaseContainerManagerTest {
+       // the tree rooted at 600 is never over limit.
+       pTree = new ProcfsBasedProcessTree("600",
+                                             procfsRootDir.getAbsolutePath());
+-      pTree.getProcessTree();
++      pTree.updateProcessTree();
+       assertFalse("tree rooted at 600 should never be over limit.",
+                     test.isProcessTreeOverLimit(pTree, "dummyId", limit));
+ 
+       // another iteration does not make any difference.
+-      pTree.getProcessTree();
++      pTree.updateProcessTree();
+       assertFalse("tree rooted at 600 should never be over limit.",
+                     test.isProcessTreeOverLimit(pTree, "dummyId", limit));
+     } finally {
+-- 
+1.7.0.4
+

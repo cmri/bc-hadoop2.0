@@ -1,0 +1,208 @@
+From a37c49a308f25ae576e8a8fc6bc85a0d8d1dde0c Mon Sep 17 00:00:00 2001
+From: Aaron T. Myers <atm@cloudera.com>
+Date: Thu, 17 May 2012 03:37:21 -0700
+Subject: [PATCH 0062/1357] HDFS-3433. GetImageServlet should allow administrative requestors when security is enabled. Contributed by Aaron T. Myers.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/branch-2@1339543 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit f448a430ccc5695d1a60a3d0fd1cbfeeffe0d2f4)
+---
+ .../java/org/apache/hadoop/http/HttpServer.java    |   35 ++++++++++++-----
+ .../hdfs/server/namenode/GetImageServlet.java      |   24 ++++++++----
+ .../hdfs/server/namenode/TestGetImageServlet.java  |   40 ++++++++++++++++++-
+ 3 files changed, 78 insertions(+), 21 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/http/HttpServer.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/http/HttpServer.java
+index a811d27..d11bbfc 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/http/HttpServer.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/http/HttpServer.java
+@@ -95,7 +95,7 @@ public class HttpServer implements FilterContainer {
+   // The ServletContext attribute where the daemon Configuration
+   // gets stored.
+   public static final String CONF_CONTEXT_ATTRIBUTE = "hadoop.conf";
+-  static final String ADMINS_ACL = "admins.acl";
++  public static final String ADMINS_ACL = "admins.acl";
+   public static final String SPNEGO_FILTER = "SpnegoFilter";
+ 
+   public static final String BIND_ADDRESS = "bind.address";
+@@ -744,7 +744,7 @@ public class HttpServer implements FilterContainer {
+    * 
+    * @param servletContext
+    * @param request
+-   * @param response
++   * @param response used to send the error response if user does not have admin access.
+    * @return true if admin-authorized, false otherwise
+    * @throws IOException
+    */
+@@ -766,18 +766,33 @@ public class HttpServer implements FilterContainer {
+                          "authorized to access this page.");
+       return false;
+     }
++    
++    if (servletContext.getAttribute(ADMINS_ACL) != null &&
++        !userHasAdministratorAccess(servletContext, remoteUser)) {
++      response.sendError(HttpServletResponse.SC_UNAUTHORIZED, "User "
++          + remoteUser + " is unauthorized to access this page.");
++      return false;
++    }
++
++    return true;
++  }
++
++  /**
++   * Get the admin ACLs from the given ServletContext and check if the given
++   * user is in the ACL.
++   * 
++   * @param servletContext the context containing the admin ACL.
++   * @param remoteUser the remote user to check for.
++   * @return true if the user is present in the ACL, false if no ACL is set or
++   *         the user is not present
++   */
++  public static boolean userHasAdministratorAccess(ServletContext servletContext,
++      String remoteUser) {
+     AccessControlList adminsAcl = (AccessControlList) servletContext
+         .getAttribute(ADMINS_ACL);
+     UserGroupInformation remoteUserUGI =
+         UserGroupInformation.createRemoteUser(remoteUser);
+-    if (adminsAcl != null) {
+-      if (!adminsAcl.isUserAllowed(remoteUserUGI)) {
+-        response.sendError(HttpServletResponse.SC_UNAUTHORIZED, "User "
+-            + remoteUser + " is unauthorized to access this page.");
+-        return false;
+-      }
+-    }
+-    return true;
++    return adminsAcl != null && adminsAcl.isUserAllowed(remoteUserUGI);
+   }
+ 
+   /**
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/GetImageServlet.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/GetImageServlet.java
+index 0aeadfa..6461dca 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/GetImageServlet.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/GetImageServlet.java
+@@ -44,6 +44,7 @@ import org.apache.hadoop.hdfs.server.common.StorageInfo;
+ import org.apache.hadoop.hdfs.server.protocol.RemoteEditLog;
+ import org.apache.hadoop.hdfs.util.DataTransferThrottler;
+ import org.apache.hadoop.hdfs.util.MD5FileUtils;
++import org.apache.hadoop.http.HttpServer;
+ import org.apache.hadoop.io.MD5Hash;
+ import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.util.StringUtils;
+@@ -85,11 +86,12 @@ public class GetImageServlet extends HttpServlet {
+       final Configuration conf = 
+         (Configuration)getServletContext().getAttribute(JspHelper.CURRENT_CONF);
+       
+-      if(UserGroupInformation.isSecurityEnabled() && 
+-          !isValidRequestor(request.getUserPrincipal().getName(), conf)) {
++      if (UserGroupInformation.isSecurityEnabled() && 
++          !isValidRequestor(context, request.getUserPrincipal().getName(), conf)) {
+         response.sendError(HttpServletResponse.SC_FORBIDDEN, 
+-            "Only Namenode and Secondary Namenode may access this servlet");
+-        LOG.warn("Received non-NN/SNN request for image or edits from " 
++            "Only Namenode, Secondary Namenode, and administrators may access " +
++            "this servlet");
++        LOG.warn("Received non-NN/SNN/administrator request for image or edits from " 
+             + request.getUserPrincipal().getName() + " at " + request.getRemoteHost());
+         return;
+       }
+@@ -209,8 +211,8 @@ public class GetImageServlet extends HttpServlet {
+   }
+   
+   @VisibleForTesting
+-  static boolean isValidRequestor(String remoteUser, Configuration conf)
+-      throws IOException {
++  static boolean isValidRequestor(ServletContext context, String remoteUser,
++      Configuration conf) throws IOException {
+     if(remoteUser == null) { // This really shouldn't happen...
+       LOG.warn("Received null remoteUser while authorizing access to getImage servlet");
+       return false;
+@@ -237,11 +239,17 @@ public class GetImageServlet extends HttpServlet {
+ 
+     for(String v : validRequestors) {
+       if(v != null && v.equals(remoteUser)) {
+-        if(LOG.isInfoEnabled()) LOG.info("GetImageServlet allowing: " + remoteUser);
++        LOG.info("GetImageServlet allowing checkpointer: " + remoteUser);
+         return true;
+       }
+     }
+-    if(LOG.isInfoEnabled()) LOG.info("GetImageServlet rejecting: " + remoteUser);
++    
++    if (HttpServer.userHasAdministratorAccess(context, remoteUser)) {
++      LOG.info("GetImageServlet allowing administrator: " + remoteUser);
++      return true;
++    }
++    
++    LOG.info("GetImageServlet rejecting: " + remoteUser);
+     return false;
+   }
+   
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestGetImageServlet.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestGetImageServlet.java
+index c574cb3..9ab31b3 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestGetImageServlet.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestGetImageServlet.java
+@@ -21,17 +21,26 @@ import static org.junit.Assert.*;
+ 
+ import java.io.IOException;
+ 
++import javax.servlet.ServletContext;
++
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hdfs.DFSConfigKeys;
+ import org.apache.hadoop.hdfs.DFSUtil;
+ import org.apache.hadoop.hdfs.HdfsConfiguration;
++import org.apache.hadoop.http.HttpServer;
++import org.apache.hadoop.security.UserGroupInformation;
++import org.apache.hadoop.security.authentication.util.KerberosName;
++import org.apache.hadoop.security.authorize.AccessControlList;
+ import org.junit.Test;
++import org.mockito.ArgumentMatcher;
++import org.mockito.Mockito;
+ 
+ public class TestGetImageServlet {
+   
+   @Test
+-  public void testIsValidRequestorWithHa() throws IOException {
++  public void testIsValidRequestor() throws IOException {
+     Configuration conf = new HdfsConfiguration();
++    KerberosName.setRules("RULE:[1:$1]\nRULE:[2:$1]");
+     
+     // Set up generic HA configs.
+     conf.set(DFSConfigKeys.DFS_FEDERATION_NAMESERVICES, "ns1");
+@@ -53,8 +62,33 @@ public class TestGetImageServlet {
+     // Initialize this conf object as though we're running on NN1.
+     NameNode.initializeGenericKeys(conf, "ns1", "nn1");
+     
++    AccessControlList acls = Mockito.mock(AccessControlList.class);
++    Mockito.when(acls.isUserAllowed(Mockito.<UserGroupInformation>any())).thenReturn(false);
++    ServletContext context = Mockito.mock(ServletContext.class);
++    Mockito.when(context.getAttribute(HttpServer.ADMINS_ACL)).thenReturn(acls);
++    
+     // Make sure that NN2 is considered a valid fsimage/edits requestor.
+-    assertTrue(GetImageServlet.isValidRequestor("hdfs/host2@TEST-REALM.COM",
+-        conf));
++    assertTrue(GetImageServlet.isValidRequestor(context,
++        "hdfs/host2@TEST-REALM.COM", conf));
++    
++    // Mark atm as an admin.
++    Mockito.when(acls.isUserAllowed(Mockito.argThat(new ArgumentMatcher<UserGroupInformation>() {
++      @Override
++      public boolean matches(Object argument) {
++        return ((UserGroupInformation) argument).getShortUserName().equals("atm");
++      }
++    }))).thenReturn(true);
++    
++    // Make sure that NN2 is still considered a valid requestor.
++    assertTrue(GetImageServlet.isValidRequestor(context,
++        "hdfs/host2@TEST-REALM.COM", conf));
++    
++    // Make sure an admin is considered a valid requestor.
++    assertTrue(GetImageServlet.isValidRequestor(context,
++        "atm@TEST-REALM.COM", conf));
++    
++    // Make sure other users are *not* considered valid requestors.
++    assertFalse(GetImageServlet.isValidRequestor(context,
++        "todd@TEST-REALM.COM", conf));
+   }
+ }
+-- 
+1.7.0.4
+

@@ -1,0 +1,399 @@
+From ec4a40333812ef8ac85ab0027ae620f690c1f6b7 Mon Sep 17 00:00:00 2001
+From: David S. Wang <dsw@cloudera.com>
+Date: Thu, 7 Feb 2013 10:39:27 -0800
+Subject: [PATCH 0912/1357] HDFS-4247 saveNamespace should be tolerant of dangling lease (daryn)
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/branch-2@1416035 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 428f5edb4143c3bcedf0c8d425c1267d45c593eb)
+---
+ .../hadoop/hdfs/server/namenode/FSDirectory.java   |    4 +
+ .../hdfs/server/namenode/FSEditLogLoader.java      |    6 --
+ .../hadoop/hdfs/server/namenode/FSNamesystem.java  |   61 +++----------
+ .../hadoop/hdfs/server/namenode/LeaseManager.java  |   45 ++++++++--
+ .../java/org/apache/hadoop/hdfs/TestLease.java     |   96 ++++++++++++++++++++
+ .../hdfs/server/namenode/TestSaveNamespace.java    |   18 ++++
+ 6 files changed, 166 insertions(+), 64 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
+index 4a29db5..33265e0 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
+@@ -597,6 +597,8 @@ public class FSDirectory implements Closeable {
+         // update modification time of dst and the parent of src
+         srcInodes[srcInodes.length-2].setModificationTime(timestamp);
+         dstInodes[dstInodes.length-2].setModificationTime(timestamp);
++        // update moved leases with new filename
++        getFSNamesystem().unprotectedChangeLease(src, dst);        
+         return true;
+       }
+     } finally {
+@@ -754,6 +756,8 @@ public class FSDirectory implements Closeable {
+         }
+         srcInodes[srcInodes.length - 2].setModificationTime(timestamp);
+         dstInodes[dstInodes.length - 2].setModificationTime(timestamp);
++        // update moved lease with new filename
++        getFSNamesystem().unprotectedChangeLease(src, dst);
+ 
+         // Collect the blocks and remove the lease for previous dst
+         if (removedDst != null) {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLogLoader.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLogLoader.java
+index 2c06ead..f744493 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLogLoader.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLogLoader.java
+@@ -33,7 +33,6 @@ import org.apache.hadoop.classification.InterfaceStability;
+ import org.apache.hadoop.fs.permission.PermissionStatus;
+ import org.apache.hadoop.hdfs.protocol.Block;
+ import org.apache.hadoop.hdfs.protocol.HdfsConstants;
+-import org.apache.hadoop.hdfs.protocol.HdfsFileStatus;
+ import org.apache.hadoop.hdfs.protocol.LayoutVersion;
+ import org.apache.hadoop.hdfs.protocol.LayoutVersion.Feature;
+ import org.apache.hadoop.hdfs.server.blockmanagement.BlockInfo;
+@@ -360,10 +359,8 @@ public class FSEditLogLoader {
+     }
+     case OP_RENAME_OLD: {
+       RenameOldOp renameOp = (RenameOldOp)op;
+-      HdfsFileStatus dinfo = fsDir.getFileInfo(renameOp.dst, false);
+       fsDir.unprotectedRenameTo(renameOp.src, renameOp.dst,
+                                 renameOp.timestamp);
+-      fsNamesys.unprotectedChangeLease(renameOp.src, renameOp.dst, dinfo);
+       break;
+     }
+     case OP_DELETE: {
+@@ -433,11 +430,8 @@ public class FSEditLogLoader {
+     }
+     case OP_RENAME: {
+       RenameOp renameOp = (RenameOp)op;
+-
+-      HdfsFileStatus dinfo = fsDir.getFileInfo(renameOp.dst, false);
+       fsDir.unprotectedRenameTo(renameOp.src, renameOp.dst,
+                                 renameOp.timestamp, renameOp.options);
+-      fsNamesys.unprotectedChangeLease(renameOp.src, renameOp.dst, dinfo);
+       break;
+     }
+     case OP_GET_DELEGATION_TOKEN: {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+index 8efd850..10f4c76 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+@@ -2637,15 +2637,15 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+     if (isPermissionEnabled) {
+       //We should not be doing this.  This is move() not renameTo().
+       //but for now,
++      //NOTE: yes, this is bad!  it's assuming much lower level behavior
++      //      of rewriting the dst
+       String actualdst = dir.isDir(dst)?
+           dst + Path.SEPARATOR + new Path(src).getName(): dst;
+       checkParentAccess(src, FsAction.WRITE);
+       checkAncestorAccess(actualdst, FsAction.WRITE);
+     }
+ 
+-    HdfsFileStatus dinfo = dir.getFileInfo(dst, false);
+     if (dir.renameTo(src, dst)) {
+-      unprotectedChangeLease(src, dst, dinfo);     // update lease with new filename
+       return true;
+     }
+     return false;
+@@ -2696,9 +2696,7 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+       checkAncestorAccess(dst, FsAction.WRITE);
+     }
+ 
+-    HdfsFileStatus dinfo = dir.getFileInfo(dst, false);
+     dir.renameTo(src, dst, options);
+-    unprotectedChangeLease(src, dst, dinfo); // update lease with new filename
+   }
+   
+   /**
+@@ -4980,31 +4978,9 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+ 
+   // rename was successful. If any part of the renamed subtree had
+   // files that were being written to, update with new filename.
+-  void unprotectedChangeLease(String src, String dst, HdfsFileStatus dinfo) {
+-    String overwrite;
+-    String replaceBy;
++  void unprotectedChangeLease(String src, String dst) {
+     assert hasWriteLock();
+-
+-    boolean destinationExisted = true;
+-    if (dinfo == null) {
+-      destinationExisted = false;
+-    }
+-
+-    if (destinationExisted && dinfo.isDir()) {
+-      Path spath = new Path(src);
+-      Path parent = spath.getParent();
+-      if (parent.isRoot()) {
+-        overwrite = parent.toString();
+-      } else {
+-        overwrite = parent.toString() + Path.SEPARATOR;
+-      }
+-      replaceBy = dst + Path.SEPARATOR;
+-    } else {
+-      overwrite = src;
+-      replaceBy = dst;
+-    }
+-
+-    leaseManager.changeLease(src, dst, overwrite, replaceBy);
++    leaseManager.changeLease(src, dst);
+   }
+ 
+   /**
+@@ -5015,28 +4991,13 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+     // lock on our behalf. If we took the read lock here, we could block
+     // for fairness if a writer is waiting on the lock.
+     synchronized (leaseManager) {
+-      out.writeInt(leaseManager.countPath()); // write the size
+-
+-      for (Lease lease : leaseManager.getSortedLeases()) {
+-        for(String path : lease.getPaths()) {
+-          // verify that path exists in namespace
+-          INode node;
+-          try {
+-            node = dir.getFileINode(path);
+-          } catch (UnresolvedLinkException e) {
+-            throw new AssertionError("Lease files should reside on this FS");
+-          }
+-          if (node == null) {
+-            throw new IOException("saveLeases found path " + path +
+-                                  " but no matching entry in namespace.");
+-          }
+-          if (!node.isUnderConstruction()) {
+-            throw new IOException("saveLeases found path " + path +
+-                                  " but is not under construction.");
+-          }
+-          INodeFileUnderConstruction cons = (INodeFileUnderConstruction) node;
+-          FSImageSerialization.writeINodeUnderConstruction(out, cons, path);
+-        }
++      Map<String, INodeFileUnderConstruction> nodes =
++          leaseManager.getINodesUnderConstruction();
++      out.writeInt(nodes.size()); // write the size    
++      for (Map.Entry<String, INodeFileUnderConstruction> entry
++           : nodes.entrySet()) {
++        FSImageSerialization.writeINodeUnderConstruction(
++            out, entry.getValue(), entry.getKey());
+       }
+     }
+   }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/LeaseManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/LeaseManager.java
+index d49311f..d90611f 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/LeaseManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/LeaseManager.java
+@@ -330,21 +330,18 @@ public class LeaseManager {
+     }
+   }
+ 
+-  synchronized void changeLease(String src, String dst,
+-      String overwrite, String replaceBy) {
++  synchronized void changeLease(String src, String dst) {
+     if (LOG.isDebugEnabled()) {
+       LOG.debug(getClass().getSimpleName() + ".changelease: " +
+-               " src=" + src + ", dest=" + dst + 
+-               ", overwrite=" + overwrite +
+-               ", replaceBy=" + replaceBy);
++               " src=" + src + ", dest=" + dst);
+     }
+ 
+-    final int len = overwrite.length();
++    final int len = src.length();
+     for(Map.Entry<String, Lease> entry : findLeaseWithPrefixPath(src, sortedLeasesByPath)) {
+       final String oldpath = entry.getKey();
+       final Lease lease = entry.getValue();
+-      //overwrite must be a prefix of oldpath
+-      final String newpath = replaceBy + oldpath.substring(len);
++      // replace stem of src with new destination
++      final String newpath = dst + oldpath.substring(len);
+       if (LOG.isDebugEnabled()) {
+         LOG.debug("changeLease: replacing " + oldpath + " with " + newpath);
+       }
+@@ -426,6 +423,38 @@ public class LeaseManager {
+     }
+   }
+ 
++  /**
++   * Get the list of inodes corresponding to valid leases.
++   * @return list of inodes
++   * @throws UnresolvedLinkException
++   */
++  Map<String, INodeFileUnderConstruction> getINodesUnderConstruction() {
++    Map<String, INodeFileUnderConstruction> inodes =
++        new TreeMap<String, INodeFileUnderConstruction>();
++    for (String p : sortedLeasesByPath.keySet()) {
++      String error = null;
++      INodeFile node = null;
++      try {
++        node = fsnamesystem.dir.getFileINode(p);
++      } catch (UnresolvedLinkException ule) {
++        error = "file does not reside on this FS";
++      }
++      if (error == null) {
++        if (node == null) {
++          error = "no matching entry in namespace";
++        } else if (!node.isUnderConstruction()) {
++          error = "is not under construction";
++        }
++      }
++      if (error == null) {
++        inodes.put(p, (INodeFileUnderConstruction)node);
++      } else {
++        LOG.error("found path " + p + " but " + error);
++      }
++    }
++    return inodes;
++  }
++
+   /** Check the leases beginning from the oldest.
+    *  @return true is sync is needed.
+    */
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestLease.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestLease.java
+index a718d60..1940b6d 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestLease.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestLease.java
+@@ -30,7 +30,9 @@ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FSDataOutputStream;
++import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.fs.Options;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hdfs.protocol.ClientProtocol;
+ import org.apache.hadoop.hdfs.server.namenode.NameNodeAdapter;
+@@ -49,6 +51,10 @@ public class TestLease {
+         ).getLeaseByPath(src.toString()) != null;
+   }
+ 
++  static int leaseCount(MiniDFSCluster cluster) {
++    return NameNodeAdapter.getLeaseManager(cluster.getNamesystem()).countLease();
++  }
++  
+   static final String dirString = "/test/lease";
+   final Path dir = new Path(dirString);
+   static final Log LOG = LogFactory.getLog(TestLease.class);
+@@ -127,6 +133,96 @@ public class TestLease {
+   }
+ 
+   @Test
++  public void testLeaseAfterRename() throws Exception {
++    MiniDFSCluster cluster = new MiniDFSCluster.Builder(conf).numDataNodes(2).build();
++    try {
++      Path p = new Path("/test-file");
++      Path d = new Path("/test-d");
++      Path d2 = new Path("/test-d-other");
++
++      // open a file to get a lease
++      FileSystem fs = cluster.getFileSystem();
++      FSDataOutputStream out = fs.create(p);
++      out.writeBytes("something");
++      //out.hsync();
++      Assert.assertTrue(hasLease(cluster, p));
++      Assert.assertEquals(1, leaseCount(cluster));
++      
++      // just to ensure first fs doesn't have any logic to twiddle leases
++      DistributedFileSystem fs2 = (DistributedFileSystem) FileSystem.newInstance(fs.getUri(), fs.getConf());
++
++      // rename the file into an existing dir
++      LOG.info("DMS: rename file into dir");
++      Path pRenamed = new Path(d, p.getName());
++      fs2.mkdirs(d);
++      fs2.rename(p, pRenamed);
++      Assert.assertFalse(p+" exists", fs2.exists(p));
++      Assert.assertTrue(pRenamed+" not found", fs2.exists(pRenamed));
++      Assert.assertFalse("has lease for "+p, hasLease(cluster, p));
++      Assert.assertTrue("no lease for "+pRenamed, hasLease(cluster, pRenamed));
++      Assert.assertEquals(1, leaseCount(cluster));
++    
++      // rename the parent dir to a new non-existent dir
++      LOG.info("DMS: rename parent dir");
++      Path pRenamedAgain = new Path(d2, pRenamed.getName());
++      fs2.rename(d, d2);
++      // src gone
++      Assert.assertFalse(d+" exists", fs2.exists(d));
++      Assert.assertFalse("has lease for "+pRenamed, hasLease(cluster, pRenamed));
++      // dst checks
++      Assert.assertTrue(d2+" not found", fs2.exists(d2));
++      Assert.assertTrue(pRenamedAgain+" not found", fs2.exists(pRenamedAgain));
++      Assert.assertTrue("no lease for "+pRenamedAgain, hasLease(cluster, pRenamedAgain));
++      Assert.assertEquals(1, leaseCount(cluster));
++
++      // rename the parent dir to existing dir
++      // NOTE: rename w/o options moves paths into existing dir
++      LOG.info("DMS: rename parent again");
++      pRenamed = pRenamedAgain;
++      pRenamedAgain = new Path(new Path(d, d2.getName()), p.getName());      
++      fs2.mkdirs(d);
++      fs2.rename(d2, d);
++      // src gone
++      Assert.assertFalse(d2+" exists", fs2.exists(d2));
++      Assert.assertFalse("no lease for "+pRenamed, hasLease(cluster, pRenamed));
++      // dst checks
++      Assert.assertTrue(d+" not found", fs2.exists(d));
++      Assert.assertTrue(pRenamedAgain +" not found", fs2.exists(pRenamedAgain));
++      Assert.assertTrue("no lease for "+pRenamedAgain, hasLease(cluster, pRenamedAgain));
++      Assert.assertEquals(1, leaseCount(cluster));
++      
++      // rename with opts to non-existent dir
++      pRenamed = pRenamedAgain;
++      pRenamedAgain = new Path(d2, p.getName());
++      fs2.rename(pRenamed.getParent(), d2, Options.Rename.OVERWRITE);
++      // src gone
++      Assert.assertFalse(pRenamed.getParent() +" not found", fs2.exists(pRenamed.getParent()));
++      Assert.assertFalse("has lease for "+pRenamed, hasLease(cluster, pRenamed));
++      // dst checks
++      Assert.assertTrue(d2+" not found", fs2.exists(d2));
++      Assert.assertTrue(pRenamedAgain+" not found", fs2.exists(pRenamedAgain));
++      Assert.assertTrue("no lease for "+pRenamedAgain, hasLease(cluster, pRenamedAgain));
++      Assert.assertEquals(1, leaseCount(cluster));
++
++      // rename with opts to existing dir
++      // NOTE: rename with options will not move paths into the existing dir
++      pRenamed = pRenamedAgain;
++      pRenamedAgain = new Path(d, p.getName());
++      fs2.rename(pRenamed.getParent(), d, Options.Rename.OVERWRITE);
++      // src gone
++      Assert.assertFalse(pRenamed.getParent() +" not found", fs2.exists(pRenamed.getParent()));
++      Assert.assertFalse("has lease for "+pRenamed, hasLease(cluster, pRenamed));
++      // dst checks
++      Assert.assertTrue(d+" not found", fs2.exists(d));
++      Assert.assertTrue(pRenamedAgain+" not found", fs2.exists(pRenamedAgain));
++      Assert.assertTrue("no lease for "+pRenamedAgain, hasLease(cluster, pRenamedAgain));
++      Assert.assertEquals(1, leaseCount(cluster));
++    } finally {
++      cluster.shutdown();
++    }
++  }
++  
++  @Test
+   public void testLease() throws Exception {
+     MiniDFSCluster cluster = new MiniDFSCluster.Builder(conf).numDataNodes(2).build();
+     try {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestSaveNamespace.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestSaveNamespace.java
+index d0764b9..f837a37 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestSaveNamespace.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestSaveNamespace.java
+@@ -603,6 +603,24 @@ public class TestSaveNamespace {
+     }
+   }
+   
++  @Test
++  public void testSaveNamespaceWithDanglingLease() throws Exception {
++    MiniDFSCluster cluster = new MiniDFSCluster.Builder(new Configuration())
++        .numDataNodes(1).build();
++    cluster.waitActive();
++    DistributedFileSystem fs = (DistributedFileSystem) cluster.getFileSystem();
++    try {
++      cluster.getNamesystem().leaseManager.addLease("me", "/non-existent");      
++      fs.setSafeMode(SafeModeAction.SAFEMODE_ENTER);
++      cluster.getNameNodeRpc().saveNamespace();
++      fs.setSafeMode(SafeModeAction.SAFEMODE_LEAVE);
++    } finally {
++      if (cluster != null) {
++        cluster.shutdown();
++      }
++    }
++  }
++
+   private void doAnEdit(FSNamesystem fsn, int id) throws IOException {
+     // Make an edit
+     fsn.mkdirs(
+-- 
+1.7.0.4
+

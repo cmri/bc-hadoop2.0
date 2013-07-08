@@ -1,0 +1,967 @@
+From e60a5f00f17f32403bca9aec0c7fc35c4c3568c1 Mon Sep 17 00:00:00 2001
+From: Thomas White <tomwhite@apache.org>
+Date: Fri, 9 Nov 2012 12:38:10 +0000
+Subject: [PATCH 0592/1357] YARN-183. Clean up fair scheduler code. Contributed by Sandy Ryza.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1407433 13f79535-47bb-0310-9956-ffa450edef68
+---
+ .../scheduler/fair/AppSchedulable.java             |   14 +-
+ .../resourcemanager/scheduler/fair/FSQueue.java    |    2 +-
+ .../scheduler/fair/FSQueueSchedulable.java         |   14 +-
+ .../scheduler/fair/FSSchedulerApp.java             |   52 ++++----
+ .../scheduler/fair/FSSchedulerNode.java            |   17 ++-
+ .../scheduler/fair/FairScheduler.java              |  138 +++++++++-----------
+ .../scheduler/fair/NewAppWeightBooster.java        |   60 +++++++++
+ .../scheduler/fair/NewJobWeightBooster.java        |   60 ---------
+ .../scheduler/fair/QueueManager.java               |   25 ++--
+ .../scheduler/fair/WeightAdjuster.java             |    2 +-
+ 10 files changed, 185 insertions(+), 199 deletions(-)
+ create mode 100644 hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/NewAppWeightBooster.java
+ delete mode 100644 hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/NewJobWeightBooster.java
+
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/AppSchedulable.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/AppSchedulable.java
+index 831750b..a2c0f85 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/AppSchedulable.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/AppSchedulable.java
+@@ -101,7 +101,7 @@ public class AppSchedulable extends Schedulable {
+ 
+   @Override
+   public Resource getResourceUsage() {
+-    return this.app.getCurrentConsumption();
++    return app.getCurrentConsumption();
+   }
+ 
+ 
+@@ -114,7 +114,7 @@ public class AppSchedulable extends Schedulable {
+    * Get metrics reference from containing queue.
+    */
+   public QueueMetrics getMetrics() {
+-    return this.queue.getQueueSchedulable().getMetrics();
++    return queue.getQueueSchedulable().getMetrics();
+   }
+ 
+   @Override
+@@ -190,9 +190,9 @@ public class AppSchedulable extends Schedulable {
+       RMContainer rmContainer = application.reserve(node, priority, null,
+           container);
+       node.reserveResource(application, priority, rmContainer);
+-      getMetrics().reserveResource(this.app.getUser(),
++      getMetrics().reserveResource(app.getUser(),
+           container.getResource());
+-      scheduler.getRootQueueMetrics().reserveResource(this.app.getUser(),
++      scheduler.getRootQueueMetrics().reserveResource(app.getUser(),
+           container.getResource());
+     }
+ 
+@@ -257,13 +257,13 @@ public class AppSchedulable extends Schedulable {
+         // TODO this should subtract resource just assigned
+         // TEMPROARY
+         getMetrics().setAvailableResourcesToQueue(
+-            this.scheduler.getClusterCapacity());
++            scheduler.getClusterCapacity());
+       }
+ 
+ 
+       // If we had previously made a reservation, delete it
+       if (reserved) {
+-        this.unreserve(application, priority, node);
++        unreserve(application, priority, node);
+       }
+ 
+       // Inform the node
+@@ -290,7 +290,7 @@ public class AppSchedulable extends Schedulable {
+ 
+       // Make sure the application still needs requests at this priority
+       if (app.getTotalRequiredResources(priority) == 0) {
+-        this.unreserve(app, priority, node);
++        unreserve(app, priority, node);
+         return Resources.none();
+       }
+     } else {
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSQueue.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSQueue.java
+index 31508d3..79395b0 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSQueue.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSQueue.java
+@@ -61,7 +61,7 @@ public class FSQueue {
+     queueSchedulable.addApp(appSchedulable);
+   }
+ 
+-  public void removeJob(FSSchedulerApp app) {
++  public void removeApp(FSSchedulerApp app) {
+     applications.remove(app);
+     queueSchedulable.removeApp(app);
+   }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSQueueSchedulable.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSQueueSchedulable.java
+index 33625a7..3f22b9a 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSQueueSchedulable.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSQueueSchedulable.java
+@@ -69,7 +69,7 @@ public class FSQueueSchedulable extends Schedulable implements Queue {
+     this.scheduler = scheduler;
+     this.queue = queue;
+     this.queueMgr = scheduler.getQueueManager();
+-    this.metrics = QueueMetrics.forQueue(this.getName(), null, true, scheduler.getConf());
++    this.metrics = QueueMetrics.forQueue(getName(), null, true, scheduler.getConf());
+     this.lastTimeAtMinShare = scheduler.getClock().getTime();
+     this.lastTimeAtHalfFairShare = scheduler.getClock().getTime();
+   }
+@@ -98,13 +98,13 @@ public class FSQueueSchedulable extends Schedulable implements Queue {
+       sched.updateDemand();
+       Resource toAdd = sched.getDemand();
+       LOG.debug("Counting resource from " + sched.getName() + " " + toAdd.toString());
+-      LOG.debug("Total resource consumption for " + this.getName() + " now " + demand.toString());
++      LOG.debug("Total resource consumption for " + getName() + " now " + demand.toString());
+       demand = Resources.add(demand, toAdd);
+ 
+     }
+     // if demand exceeds the cap for this queue, limit to the max
+     Resource maxRes = queueMgr.getMaxResources(queue.getName());
+-    if(Resources.greaterThan(demand, maxRes)) {
++    if (Resources.greaterThan(demand, maxRes)) {
+       demand = maxRes;
+     }
+   }
+@@ -145,9 +145,9 @@ public class FSQueueSchedulable extends Schedulable implements Queue {
+ 
+   @Override
+   public Resource assignContainer(FSSchedulerNode node, boolean reserved) {
+-    LOG.debug("Node offered to queue: " + this.getName() + " reserved: " + reserved);
++    LOG.debug("Node offered to queue: " + getName() + " reserved: " + reserved);
+     // If this queue is over its limit, reject
+-    if (Resources.greaterThan(this.getResourceUsage(),
++    if (Resources.greaterThan(getResourceUsage(),
+         queueMgr.getMaxResources(queue.getName()))) {
+       return Resources.none();
+     }
+@@ -239,7 +239,7 @@ public class FSQueueSchedulable extends Schedulable implements Queue {
+ 
+   @Override
+   public Map<QueueACL, AccessControlList> getQueueAcls() {
+-    Map<QueueACL, AccessControlList> acls = this.queueMgr.getQueueAcls(this.getName());
++    Map<QueueACL, AccessControlList> acls = queueMgr.getQueueAcls(getName());
+     return new HashMap<QueueACL, AccessControlList>(acls);
+   }
+ 
+@@ -265,7 +265,7 @@ public class FSQueueSchedulable extends Schedulable implements Queue {
+       recordFactory.newRecordInstance(QueueUserACLInfo.class);
+     List<QueueACL> operations = new ArrayList<QueueACL>();
+     for (QueueACL operation : QueueACL.values()) {
+-      Map<QueueACL, AccessControlList> acls = this.queueMgr.getQueueAcls(this.getName());
++      Map<QueueACL, AccessControlList> acls = queueMgr.getQueueAcls(getName());
+       if (acls.get(operation).isUserAllowed(user)) {
+         operations.add(operation);
+       }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSSchedulerApp.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSSchedulerApp.java
+index e2a385f..4e164e5 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSSchedulerApp.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSSchedulerApp.java
+@@ -112,12 +112,12 @@ public class FSSchedulerApp extends SchedulerApplication {
+   }
+ 
+   public ApplicationId getApplicationId() {
+-    return this.appSchedulingInfo.getApplicationId();
++    return appSchedulingInfo.getApplicationId();
+   }
+ 
+   @Override
+   public ApplicationAttemptId getApplicationAttemptId() {
+-    return this.appSchedulingInfo.getApplicationAttemptId();
++    return appSchedulingInfo.getApplicationAttemptId();
+   }
+   
+   public void setAppSchedulable(AppSchedulable appSchedulable) {
+@@ -129,7 +129,7 @@ public class FSSchedulerApp extends SchedulerApplication {
+   }
+ 
+   public String getUser() {
+-    return this.appSchedulingInfo.getUser();
++    return appSchedulingInfo.getUser();
+   }
+ 
+   public synchronized void updateResourceRequests(
+@@ -138,19 +138,19 @@ public class FSSchedulerApp extends SchedulerApplication {
+   }
+ 
+   public Map<String, ResourceRequest> getResourceRequests(Priority priority) {
+-    return this.appSchedulingInfo.getResourceRequests(priority);
++    return appSchedulingInfo.getResourceRequests(priority);
+   }
+ 
+   public int getNewContainerId() {
+-    return this.appSchedulingInfo.getNewContainerId();
++    return appSchedulingInfo.getNewContainerId();
+   }
+   
+   public Collection<Priority> getPriorities() {
+-    return this.appSchedulingInfo.getPriorities();
++    return appSchedulingInfo.getPriorities();
+   }
+ 
+   public ResourceRequest getResourceRequest(Priority priority, String nodeAddress) {
+-    return this.appSchedulingInfo.getResourceRequest(priority, nodeAddress);
++    return appSchedulingInfo.getResourceRequest(priority, nodeAddress);
+   }
+ 
+   public synchronized int getTotalRequiredResources(Priority priority) {
+@@ -158,7 +158,7 @@ public class FSSchedulerApp extends SchedulerApplication {
+   }
+   
+   public Resource getResource(Priority priority) {
+-    return this.appSchedulingInfo.getResource(priority);
++    return appSchedulingInfo.getResource(priority);
+   }
+ 
+   /**
+@@ -167,11 +167,11 @@ public class FSSchedulerApp extends SchedulerApplication {
+    */
+   @Override
+   public boolean isPending() {
+-    return this.appSchedulingInfo.isPending();
++    return appSchedulingInfo.isPending();
+   }
+ 
+   public String getQueueName() {
+-    return this.appSchedulingInfo.getQueueName();
++    return appSchedulingInfo.getQueueName();
+   }
+ 
+   /**
+@@ -185,7 +185,7 @@ public class FSSchedulerApp extends SchedulerApplication {
+ 
+   public synchronized void stop(RMAppAttemptState rmAppAttemptFinalState) {
+     // Cleanup all scheduling information
+-    this.appSchedulingInfo.stop(rmAppAttemptFinalState);
++    appSchedulingInfo.stop(rmAppAttemptFinalState);
+   }
+ 
+   @SuppressWarnings("unchecked")
+@@ -196,7 +196,7 @@ public class FSSchedulerApp extends SchedulerApplication {
+         getRMContainer(containerId);
+     if (rmContainer == null) {
+       // Some unknown container sneaked into the system. Kill it.
+-      this.rmContext.getDispatcher().getEventHandler()
++      rmContext.getDispatcher().getEventHandler()
+         .handle(new RMNodeCleanContainerEvent(nodeId, containerId));
+       return;
+     }
+@@ -272,7 +272,7 @@ public class FSSchedulerApp extends SchedulerApplication {
+   }
+ 
+   synchronized public void addSchedulingOpportunity(Priority priority) {
+-    this.schedulingOpportunities.setCount(priority,
++    schedulingOpportunities.setCount(priority,
+         schedulingOpportunities.count(priority) + 1);
+   }
+ 
+@@ -282,19 +282,19 @@ public class FSSchedulerApp extends SchedulerApplication {
+    * successfully did so.
+    */
+   synchronized public int getSchedulingOpportunities(Priority priority) {
+-    return this.schedulingOpportunities.count(priority);
++    return schedulingOpportunities.count(priority);
+   }
+ 
+   synchronized void resetReReservations(Priority priority) {
+-    this.reReservations.setCount(priority, 0);
++    reReservations.setCount(priority, 0);
+   }
+ 
+   synchronized void addReReservation(Priority priority) {
+-    this.reReservations.add(priority);
++    reReservations.add(priority);
+   }
+ 
+   synchronized public int getReReservations(Priority priority) {
+-    return this.reReservations.count(priority);
++    return reReservations.count(priority);
+   }
+ 
+   public synchronized int getNumReservedContainers(Priority priority) {
+@@ -458,8 +458,8 @@ public class FSSchedulerApp extends SchedulerApplication {
+    * @param priority The priority of the container scheduled.
+    */
+   synchronized public void resetSchedulingOpportunities(Priority priority) {
+-    this.lastScheduledContainer.put(priority, System.currentTimeMillis());
+-    this.schedulingOpportunities.setCount(priority, 0);
++    lastScheduledContainer.put(priority, System.currentTimeMillis());
++    schedulingOpportunities.setCount(priority, 0);
+   }
+ 
+   /**
+@@ -494,14 +494,14 @@ public class FSSchedulerApp extends SchedulerApplication {
+       rackLocalityThreshold;
+ 
+     // Relax locality constraints once we've surpassed threshold.
+-    if (this.getSchedulingOpportunities(priority) > (numNodes * threshold)) {
++    if (getSchedulingOpportunities(priority) > (numNodes * threshold)) {
+       if (allowed.equals(NodeType.NODE_LOCAL)) {
+         allowedLocalityLevel.put(priority, NodeType.RACK_LOCAL);
+-        this.resetSchedulingOpportunities(priority);
++        resetSchedulingOpportunities(priority);
+       }
+       else if (allowed.equals(NodeType.RACK_LOCAL)) {
+         allowedLocalityLevel.put(priority, NodeType.OFF_SWITCH);
+-        this.resetSchedulingOpportunities(priority);
++        resetSchedulingOpportunities(priority);
+       }
+     }
+     return allowedLocalityLevel.get(priority);
+@@ -512,7 +512,7 @@ public class FSSchedulerApp extends SchedulerApplication {
+       Priority priority, ResourceRequest request,
+       Container container) {
+     // Update allowed locality level
+-    NodeType allowed = this.allowedLocalityLevel.get(priority);
++    NodeType allowed = allowedLocalityLevel.get(priority);
+     if (allowed != null) {
+       if (allowed.equals(NodeType.OFF_SWITCH) &&
+           (type.equals(NodeType.NODE_LOCAL) ||
+@@ -532,9 +532,9 @@ public class FSSchedulerApp extends SchedulerApplication {
+     }
+     
+     // Create RMContainer
+-    RMContainer rmContainer = new RMContainerImpl(container, this
+-        .getApplicationAttemptId(), node.getNodeID(), this.rmContext
+-        .getDispatcher().getEventHandler(), this.rmContext
++    RMContainer rmContainer = new RMContainerImpl(container, 
++        getApplicationAttemptId(), node.getNodeID(), rmContext
++        .getDispatcher().getEventHandler(), rmContext
+         .getContainerAllocationExpirer());
+ 
+     // Add it to allContainers list.
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSSchedulerNode.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSSchedulerNode.java
+index b8cef42..2833ca6 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSSchedulerNode.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSSchedulerNode.java
+@@ -67,25 +67,25 @@ public class FSSchedulerNode extends SchedulerNode {
+   }
+ 
+   public RMNode getRMNode() {
+-    return this.rmNode;
++    return rmNode;
+   }
+ 
+   public NodeId getNodeID() {
+-    return this.rmNode.getNodeID();
++    return rmNode.getNodeID();
+   }
+ 
+   public String getHttpAddress() {
+-    return this.rmNode.getHttpAddress();
++    return rmNode.getHttpAddress();
+   }
+ 
+   @Override
+   public String getHostName() {
+-    return this.rmNode.getHostName();
++    return rmNode.getHostName();
+   }
+ 
+   @Override
+   public String getRackName() {
+-    return this.rmNode.getRackName();
++    return rmNode.getRackName();
+   }
+ 
+   /**
+@@ -112,17 +112,18 @@ public class FSSchedulerNode extends SchedulerNode {
+ 
+   @Override
+   public synchronized Resource getAvailableResource() {
+-    return this.availableResource;
++    return availableResource;
+   }
+ 
+   @Override
+   public synchronized Resource getUsedResource() {
+-    return this.usedResource;
++    return usedResource;
+   }
+ 
+   private synchronized boolean isValidContainer(Container c) {    
+-    if (launchedContainers.containsKey(c.getId()))
++    if (launchedContainers.containsKey(c.getId())) {
+       return true;
++    }
+     return false;
+   }
+ 
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
+index 0201399..88dbe83 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
+@@ -140,11 +140,11 @@ public class FairScheduler implements ResourceScheduler {
+ 
+ 
+   public FairSchedulerConfiguration getConf() {
+-    return this.conf;
++    return conf;
+   }
+ 
+   public QueueManager getQueueManager() {
+-    return this.queueMgr;
++    return queueMgr;
+   }
+ 
+   public List<FSQueueSchedulable> getQueueSchedulables() {
+@@ -184,36 +184,34 @@ public class FairScheduler implements ResourceScheduler {
+   * fair shares, deficits, minimum slot allocations, and amount of used and
+   * required resources per job.
+   */
+-  protected void update() {
+-    synchronized (this) {
+-      queueMgr.reloadAllocsIfNecessary(); // Relaod alloc file
+-      updateRunnability(); // Set job runnability based on user/queue limits
+-      updatePreemptionVariables(); // Determine if any queues merit preemption
+-
+-      // Update demands of apps and queues
+-      for (FSQueue queue: queueMgr.getQueues()) {
+-        queue.getQueueSchedulable().updateDemand();
+-      }
++  protected synchronized void update() {
++    queueMgr.reloadAllocsIfNecessary(); // Relaod alloc file
++    updateRunnability(); // Set job runnability based on user/queue limits
++    updatePreemptionVariables(); // Determine if any queues merit preemption
+ 
+-      // Compute fair shares based on updated demands
+-      List<FSQueueSchedulable> queueScheds = this.getQueueSchedulables();
+-      SchedulingAlgorithms.computeFairShares(
+-          queueScheds, clusterCapacity);
++    // Update demands of apps and queues
++    for (FSQueue queue: queueMgr.getQueues()) {
++      queue.getQueueSchedulable().updateDemand();
++    }
+ 
+-      // Update queue metrics for this queue
+-      for (FSQueueSchedulable sched : queueScheds) {
+-        sched.getMetrics().setAvailableResourcesToQueue(sched.getFairShare());
+-      }
++    // Compute fair shares based on updated demands
++    List<FSQueueSchedulable> queueScheds = getQueueSchedulables();
++    SchedulingAlgorithms.computeFairShares(
++        queueScheds, clusterCapacity);
+ 
+-      // Use the computed shares to assign shares within each queue
+-      for (FSQueue queue: queueMgr.getQueues()) {
+-        queue.getQueueSchedulable().redistributeShare();
+-      }
++    // Update queue metrics for this queue
++    for (FSQueueSchedulable sched : queueScheds) {
++      sched.getMetrics().setAvailableResourcesToQueue(sched.getFairShare());
++    }
+ 
+-      // Update recorded capacity of root queue (child queues are updated
+-      // when fair share is calculated).
+-      rootMetrics.setAvailableResourcesToQueue(clusterCapacity);
++    // Use the computed shares to assign shares within each queue
++    for (FSQueue queue: queueMgr.getQueues()) {
++      queue.getQueueSchedulable().redistributeShare();
+     }
++
++    // Update recorded capacity of root queue (child queues are updated
++    // when fair share is calculated).
++    rootMetrics.setAvailableResourcesToQueue(clusterCapacity);
+   }
+ 
+   /**
+@@ -258,17 +256,16 @@ public class FairScheduler implements ResourceScheduler {
+    * have been below half their fair share for the fairSharePreemptionTimeout.
+    * If such queues exist, compute how many tasks of each type need to be
+    * preempted and then select the right ones using preemptTasks.
+-   *
+-   * This method computes and logs the number of tasks we want to preempt even
+-   * if preemption is disabled, for debugging purposes.
+    */
+   protected void preemptTasksIfNecessary() {
+-    if (!preemptionEnabled)
++    if (!preemptionEnabled) {
+       return;
++    }
+ 
+     long curTime = clock.getTime();
+-    if (curTime - lastPreemptCheckTime < preemptionInterval)
++    if (curTime - lastPreemptCheckTime < preemptionInterval) {
+       return;
++    }
+     lastPreemptCheckTime = curTime;
+ 
+     Resource resToPreempt = Resources.none();
+@@ -289,8 +286,9 @@ public class FairScheduler implements ResourceScheduler {
+    * lowest priority to preempt.
+    */
+   protected void preemptResources(List<FSQueueSchedulable> scheds, Resource toPreempt) {
+-    if (scheds.isEmpty() || Resources.equals(toPreempt, Resources.none()))
++    if (scheds.isEmpty() || Resources.equals(toPreempt, Resources.none())) {
+       return;
++    }
+ 
+     Map<RMContainer, FSSchedulerApp> apps = 
+         new HashMap<RMContainer, FSSchedulerApp>();
+@@ -331,7 +329,7 @@ public class FairScheduler implements ResourceScheduler {
+ 
+         // TODO: Not sure if this ever actually adds this to the list of cleanup
+         // containers on the RMNode (see SchedulerNode.releaseContainer()).
+-        this.completedContainer(container, status, RMContainerEventType.KILL);
++        completedContainer(container, status, RMContainerEventType.KILL);
+ 
+         toPreempt = Resources.subtract(toPreempt,
+             container.getContainer().getResource());
+@@ -438,28 +436,28 @@ public class FairScheduler implements ResourceScheduler {
+ 
+   @Override
+   public Resource getMinimumResourceCapability() {
+-    return this.minimumAllocation;
++    return minimumAllocation;
+   }
+ 
+   @Override
+   public Resource getMaximumResourceCapability() {
+-    return this.maximumAllocation;
++    return maximumAllocation;
+   }
+ 
+   public double getNodeLocalityThreshold() {
+-    return this.nodeLocalityThreshold;
++    return nodeLocalityThreshold;
+   }
+ 
+   public double getRackLocalityThreshold() {
+-    return this.rackLocalityThreshold;
++    return rackLocalityThreshold;
+   }
+ 
+   public Resource getClusterCapacity() {
+-    return this.clusterCapacity;
++    return clusterCapacity;
+   }
+ 
+   public Clock getClock() {
+-    return this.clock;
++    return clock;
+   }
+ 
+   protected void setClock(Clock clock) {
+@@ -479,11 +477,11 @@ public class FairScheduler implements ResourceScheduler {
+   addApplication(ApplicationAttemptId applicationAttemptId,
+       String queueName, String user) {
+ 
+-    FSQueue queue = this.queueMgr.getQueue(queueName);
++    FSQueue queue = queueMgr.getQueue(queueName);
+ 
+     FSSchedulerApp schedulerApp =
+         new FSSchedulerApp(applicationAttemptId, user,
+-            queue.getQueueSchedulable(), new ActiveUsersManager(this.getRootQueueMetrics()),
++            queue.getQueueSchedulable(), new ActiveUsersManager(getRootQueueMetrics()),
+             rmContext, null);
+ 
+     // Inforce ACLs
+@@ -554,8 +552,8 @@ public class FairScheduler implements ResourceScheduler {
+     application.stop(rmAppAttemptFinalState);
+ 
+     // Inform the queue
+-    FSQueue queue = this.queueMgr.getQueue(application.getQueue().getQueueName());
+-    queue.removeJob(application);
++    FSQueue queue = queueMgr.getQueue(application.getQueue().getQueueName());
++    queue.removeApp(application);
+ 
+     // Remove from our data-structure
+     applications.remove(applicationAttemptId);
+@@ -601,7 +599,7 @@ public class FairScheduler implements ResourceScheduler {
+   }
+ 
+   private synchronized void addNode(RMNode node) {
+-    this.nodes.put(node.getNodeID(), new FSSchedulerNode(node));
++    nodes.put(node.getNodeID(), new FSSchedulerNode(node));
+     Resources.addTo(clusterCapacity, node.getTotalCapability());
+ 
+     LOG.info("Added node " + node.getNodeAddress() +
+@@ -609,7 +607,7 @@ public class FairScheduler implements ResourceScheduler {
+   }
+ 
+   private synchronized void removeNode(RMNode rmNode) {
+-    FSSchedulerNode node = this.nodes.get(rmNode.getNodeID());
++    FSSchedulerNode node = nodes.get(rmNode.getNodeID());
+     Resources.subtractFrom(clusterCapacity, rmNode.getTotalCapability());
+ 
+     // Remove running containers
+@@ -632,7 +630,7 @@ public class FairScheduler implements ResourceScheduler {
+           RMContainerEventType.KILL);
+     }
+ 
+-    this.nodes.remove(rmNode.getNodeID());
++    nodes.remove(rmNode.getNodeID());
+     LOG.info("Removed node " + rmNode.getNodeAddress() +
+         " cluster capacity: " + clusterCapacity);
+   }
+@@ -670,10 +668,8 @@ public class FairScheduler implements ResourceScheduler {
+     }
+ 
+     synchronized (application) {
+-
+       if (!ask.isEmpty()) {
+-
+-        if(LOG.isDebugEnabled()) {
++        if (LOG.isDebugEnabled()) {
+           LOG.debug("allocate: pre-update" +
+             " applicationAttemptId=" + appAttemptId +
+             " application=" + application.getApplicationId());
+@@ -687,7 +683,7 @@ public class FairScheduler implements ResourceScheduler {
+         application.showRequests();
+       }
+ 
+-      if(LOG.isDebugEnabled()) {
++      if (LOG.isDebugEnabled()) {
+         LOG.debug("allocate:" +
+           " applicationAttemptId=" + appAttemptId +
+           " #ask=" + ask.size());
+@@ -765,7 +761,7 @@ public class FairScheduler implements ResourceScheduler {
+       int assignedContainers = 0;
+       while (true) {
+         // At most one task is scheduled each iteration of this loop
+-        List<FSQueueSchedulable> scheds = this.getQueueSchedulables();
++        List<FSQueueSchedulable> scheds = getQueueSchedulables();
+         Collections.sort(scheds, new SchedulingAlgorithms.FairShareComparator());
+         boolean assignedContainer = false;
+         for (FSQueueSchedulable sched : scheds) {
+@@ -797,11 +793,11 @@ public class FairScheduler implements ResourceScheduler {
+   @Override
+   public SchedulerAppReport getSchedulerAppInfo(
+       ApplicationAttemptId appAttemptId) {
+-    if (!this.applications.containsKey(appAttemptId)) {
++    if (!applications.containsKey(appAttemptId)) {
+       LOG.error("Request for appInfo of unknown attempt" + appAttemptId);
+       return null;
+     }
+-    return new SchedulerAppReport(this.applications.get(appAttemptId));
++    return new SchedulerAppReport(applications.get(appAttemptId));
+   }
+ 
+   @Override
+@@ -813,37 +809,30 @@ public class FairScheduler implements ResourceScheduler {
+   public void handle(SchedulerEvent event) {
+     switch(event.getType()) {
+     case NODE_ADDED:
+-    {
+       if (!(event instanceof NodeAddedSchedulerEvent)) {
+         throw new RuntimeException("Unexpected event type: " + event);
+       }
+       NodeAddedSchedulerEvent nodeAddedEvent = (NodeAddedSchedulerEvent)event;
+       addNode(nodeAddedEvent.getAddedRMNode());
+-    }
+-    break;
++      break;
+     case NODE_REMOVED:
+-    {
+       if (!(event instanceof NodeRemovedSchedulerEvent)) {
+         throw new RuntimeException("Unexpected event type: " + event);
+       }
+       NodeRemovedSchedulerEvent nodeRemovedEvent = (NodeRemovedSchedulerEvent)event;
+       removeNode(nodeRemovedEvent.getRemovedRMNode());
+-    }
+-    break;
++      break;
+     case NODE_UPDATE:
+-    {
+       if (!(event instanceof NodeUpdateSchedulerEvent)) {
+         throw new RuntimeException("Unexpected event type: " + event);
+       }
+       NodeUpdateSchedulerEvent nodeUpdatedEvent =
+       (NodeUpdateSchedulerEvent)event;
+-      this.nodeUpdate(nodeUpdatedEvent.getRMNode(),
++      nodeUpdate(nodeUpdatedEvent.getRMNode(),
+           nodeUpdatedEvent.getNewlyLaunchedContainers(),
+           nodeUpdatedEvent.getCompletedContainers());
+-    }
+-    break;
++      break;
+     case APP_ADDED:
+-    {
+       if (!(event instanceof AppAddedSchedulerEvent)) {
+         throw new RuntimeException("Unexpected event type: " + event);
+       }
+@@ -858,20 +847,16 @@ public class FairScheduler implements ResourceScheduler {
+ 
+       addApplication(appAddedEvent.getApplicationAttemptId(), queue,
+           appAddedEvent.getUser());
+-    }
+-    break;
++      break;
+     case APP_REMOVED:
+-    {
+       if (!(event instanceof AppRemovedSchedulerEvent)) {
+         throw new RuntimeException("Unexpected event type: " + event);
+       }
+       AppRemovedSchedulerEvent appRemovedEvent = (AppRemovedSchedulerEvent)event;
+-      this.removeApplication(appRemovedEvent.getApplicationAttemptID(),
++      removeApplication(appRemovedEvent.getApplicationAttemptID(),
+           appRemovedEvent.getFinalAttemptState());
+-    }
+-    break;
++      break;
+     case CONTAINER_EXPIRED:
+-    {
+       if (!(event instanceof ContainerExpiredSchedulerEvent)) {
+         throw new RuntimeException("Unexpected event type: " + event);
+       }
+@@ -883,8 +868,7 @@ public class FairScheduler implements ResourceScheduler {
+               containerId,
+               SchedulerUtils.EXPIRED_CONTAINER),
+           RMContainerEventType.EXPIRE);
+-    }
+-    break;
++      break;
+     default:
+       LOG.error("Unknown event arrived at FairScheduler: " + event.toString());
+     }
+@@ -901,9 +885,9 @@ public class FairScheduler implements ResourceScheduler {
+       RMContext rmContext)
+   throws IOException
+   {
+-    if (!this.initialized) {
++    if (!initialized) {
+       this.conf = new FairSchedulerConfiguration(conf);
+-      this.rootMetrics = QueueMetrics.forQueue("root", null, true, conf);
++      rootMetrics = QueueMetrics.forQueue("root", null, true, conf);
+       this.containerTokenSecretManager = containerTokenSecretManager;
+       this.rmContext = rmContext;
+       this.clock = new SystemClock();
+@@ -978,7 +962,7 @@ public class FairScheduler implements ResourceScheduler {
+ 
+   @Override
+   public int getNumClusterNodes() {
+-    return this.nodes.size();
++    return nodes.size();
+   }
+ 
+ }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/NewAppWeightBooster.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/NewAppWeightBooster.java
+new file mode 100644
+index 0000000..e77eed7
+--- /dev/null
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/NewAppWeightBooster.java
+@@ -0,0 +1,60 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair;
++
++import org.apache.hadoop.classification.InterfaceAudience.Private;
++import org.apache.hadoop.classification.InterfaceStability.Unstable;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.conf.Configured;
++
++/**
++ * A {@link WeightAdjuster} implementation that gives a weight boost to new jobs
++ * for a certain amount of time -- by default, a 3x weight boost for 60 seconds.
++ * This can be used to make shorter jobs finish faster, emulating Shortest Job
++ * First scheduling while not starving long jobs.
++ */
++@Private
++@Unstable
++public class NewAppWeightBooster extends Configured implements WeightAdjuster {
++  private static final float DEFAULT_FACTOR = 3;
++  private static final long DEFAULT_DURATION = 5 * 60 * 1000;
++
++  private float factor;
++  private long duration;
++
++  public void setConf(Configuration conf) {
++    if (conf != null) {
++      factor = conf.getFloat("mapred.newjobweightbooster.factor",
++          DEFAULT_FACTOR);
++      duration = conf.getLong("mapred.newjobweightbooster.duration",
++          DEFAULT_DURATION);
++    }
++    super.setConf(conf);
++  }
++
++  public double adjustWeight(AppSchedulable app, double curWeight) {
++    long start = app.getStartTime();
++    long now = System.currentTimeMillis();
++    if (now - start < duration) {
++      return curWeight * factor;
++    } else {
++      return curWeight;
++    }
++  }
++}
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/NewJobWeightBooster.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/NewJobWeightBooster.java
+deleted file mode 100644
+index c643027..0000000
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/NewJobWeightBooster.java
++++ /dev/null
+@@ -1,60 +0,0 @@
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair;
+-
+-import org.apache.hadoop.classification.InterfaceAudience.Private;
+-import org.apache.hadoop.classification.InterfaceStability.Unstable;
+-import org.apache.hadoop.conf.Configuration;
+-import org.apache.hadoop.conf.Configured;
+-
+-/**
+- * A {@link WeightAdjuster} implementation that gives a weight boost to new jobs
+- * for a certain amount of time -- by default, a 3x weight boost for 60 seconds.
+- * This can be used to make shorter jobs finish faster, emulating Shortest Job
+- * First scheduling while not starving long jobs.
+- */
+-@Private
+-@Unstable
+-public class NewJobWeightBooster extends Configured implements WeightAdjuster {
+-  private static final float DEFAULT_FACTOR = 3;
+-  private static final long DEFAULT_DURATION = 5 * 60 * 1000;
+-
+-  private float factor;
+-  private long duration;
+-
+-  public void setConf(Configuration conf) {
+-    if (conf != null) {
+-      factor = conf.getFloat("mapred.newjobweightbooster.factor",
+-          DEFAULT_FACTOR);
+-      duration = conf.getLong("mapred.newjobweightbooster.duration",
+-          DEFAULT_DURATION);
+-    }
+-    super.setConf(conf);
+-  }
+-
+-  public double adjustWeight(AppSchedulable app, double curWeight) {
+-    long start = app.getStartTime();
+-    long now = System.currentTimeMillis();
+-    if (now - start < duration) {
+-      return curWeight * factor;
+-    } else {
+-      return curWeight;
+-    }
+-  }
+-}
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/QueueManager.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/QueueManager.java
+index c765e7f..0395eaa 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/QueueManager.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/QueueManager.java
+@@ -202,7 +202,7 @@ public class QueueManager {
+    * Get the queue for a given AppSchedulable.
+    */
+   public FSQueue getQueueForApp(AppSchedulable app) {
+-    return this.getQueue(app.getApp().getQueueName());
++    return getQueue(app.getApp().getQueueName());
+   }
+ 
+   /**
+@@ -388,7 +388,7 @@ public class QueueManager {
+ 
+     // Commit the reload; also create any queue defined in the alloc file
+     // if it does not already exist, so it can be displayed on the web UI.
+-    synchronized(this) {
++    synchronized (this) {
+       setMinResources(minQueueResources);
+       setMaxResources(maxQueueResources);
+       setQueueMaxApps(queueMaxApps);
+@@ -431,14 +431,14 @@ public class QueueManager {
+     synchronized(minQueueResourcesMO) {
+       if (minQueueResources.containsKey(queue)) {
+         return minQueueResources.get(queue);
+-      } else{
++      } else {
+         return Resources.createResource(0);
+       }
+     }
+   }
+ 
+   private void setMinResources(Map<String, Resource> resources) {
+-    synchronized(minQueueResourcesMO) {
++    synchronized (minQueueResourcesMO) {
+       minQueueResources = resources;
+     }
+   }
+@@ -457,7 +457,7 @@ public class QueueManager {
+   }
+ 
+   private void setMaxResources(Map<String, Resource> resources) {
+-    synchronized(maxQueueResourcesMO) {
++    synchronized (maxQueueResourcesMO) {
+       maxQueueResources = resources;
+     }
+   }
+@@ -472,8 +472,8 @@ public class QueueManager {
+   /**
+    * Remove an app
+    */
+-  public synchronized void removeJob(FSSchedulerApp app) {
+-    getQueue(app.getQueueName()).removeJob(app);
++  public synchronized void removeApp(FSSchedulerApp app) {
++    getQueue(app.getQueueName()).removeApp(app);
+   }
+ 
+   /**
+@@ -543,7 +543,7 @@ public class QueueManager {
+   }
+   
+   private int getQueueMaxAppsDefault(){
+-    synchronized(queueMaxAppsDefaultMO) {
++    synchronized (queueMaxAppsDefaultMO) {
+       return queueMaxAppsDefault;
+     }
+   }
+@@ -575,11 +575,12 @@ public class QueueManager {
+       queueWeights = weights;
+     }
+   }
++  
+   /**
+-  * Get a queue's min share preemption timeout, in milliseconds. This is the
+-  * time after which jobs in the queue may kill other queues' tasks if they
+-  * are below their min share.
+-  */
++   * Get a queue's min share preemption timeout, in milliseconds. This is the
++   * time after which jobs in the queue may kill other queues' tasks if they
++   * are below their min share.
++   */
+   public long getMinSharePreemptionTimeout(String queueName) {
+     synchronized (minSharePreemptionTimeoutsMO) {
+       if (minSharePreemptionTimeouts.containsKey(queueName)) {
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/WeightAdjuster.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/WeightAdjuster.java
+index 2fa71ba..1a9467f 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/WeightAdjuster.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/WeightAdjuster.java
+@@ -24,7 +24,7 @@ import org.apache.hadoop.conf.Configurable;
+ 
+ /**
+  * A pluggable object for altering the weights of apps in the fair scheduler,
+- * which is used for example by {@link NewJobWeightBooster} to give higher
++ * which is used for example by {@link NewAppWeightBooster} to give higher
+  * weight to new jobs so that short jobs finish faster.
+  *
+  * May implement {@link Configurable} to access configuration parameters.
+-- 
+1.7.0.4
+

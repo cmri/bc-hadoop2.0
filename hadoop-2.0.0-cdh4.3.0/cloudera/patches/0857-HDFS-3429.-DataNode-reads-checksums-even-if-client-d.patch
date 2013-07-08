@@ -1,0 +1,456 @@
+From e10affb15921b494e6980603a7a8390b472d6d10 Mon Sep 17 00:00:00 2001
+From: Todd Lipcon <todd@apache.org>
+Date: Mon, 14 Jan 2013 20:47:08 +0000
+Subject: [PATCH 0857/1357] HDFS-3429. DataNode reads checksums even if client does not need them. Contributed by Todd Lipcon.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1433117 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 8360a7a6a4497c47cf6a389a2663a4a2b4867a19)
+
+Conflicts:
+
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/RemoteBlockReader.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/RemoteBlockReader2.java
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestParallelRead.java
+
+Resolved simple conflicts mostly due to changes in the context area -- this patch was
+applied to trunk upstream, but being applied to CDH4 after HDFS-347 patches have gone in.
+---
+ .../org/apache/hadoop/hdfs/RemoteBlockReader.java  |    3 +-
+ .../org/apache/hadoop/hdfs/RemoteBlockReader2.java |    3 +-
+ .../datatransfer/DataTransferProtocol.java         |    5 +-
+ .../hdfs/protocol/datatransfer/Receiver.java       |    3 +-
+ .../hadoop/hdfs/protocol/datatransfer/Sender.java  |    8 ++-
+ .../server/datanode/BlockPoolSliceScanner.java     |    4 +-
+ .../hadoop/hdfs/server/datanode/BlockSender.java   |   61 +++++++++++++-------
+ .../hadoop/hdfs/server/datanode/DataNode.java      |    2 +-
+ .../hadoop/hdfs/server/datanode/DataXceiver.java   |    7 +-
+ .../hadoop-hdfs/src/main/proto/datatransfer.proto  |    1 +
+ .../hadoop/hdfs/TestDataTransferProtocol.java      |   12 ++--
+ .../org/apache/hadoop/hdfs/TestParallelRead.java   |    3 +
+ .../apache/hadoop/hdfs/TestParallelReadUtil.java   |   10 +++-
+ .../java/org/apache/hadoop/hdfs/TestPread.java     |   18 +++++-
+ 14 files changed, 98 insertions(+), 42 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/RemoteBlockReader.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/RemoteBlockReader.java
+index 99f1db9..c1c64c7 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/RemoteBlockReader.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/RemoteBlockReader.java
+@@ -379,7 +379,8 @@ public class RemoteBlockReader extends FSInputChecker implements BlockReader {
+     // in and out will be closed when sock is closed (by the caller)
+     final DataOutputStream out =
+         new DataOutputStream(new BufferedOutputStream(peer.getOutputStream()));
+-    new Sender(out).readBlock(block, blockToken, clientName, startOffset, len);
++    new Sender(out).readBlock(block, blockToken, clientName, startOffset, len,
++        verifyChecksum);
+     
+     //
+     // Get bytes in block, set streams
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/RemoteBlockReader2.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/RemoteBlockReader2.java
+index baa389a..a822df6 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/RemoteBlockReader2.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/RemoteBlockReader2.java
+@@ -372,7 +372,8 @@ public class RemoteBlockReader2  implements BlockReader {
+     // in and out will be closed when sock is closed (by the caller)
+     final DataOutputStream out = new DataOutputStream(new BufferedOutputStream(
+           peer.getOutputStream()));
+-    new Sender(out).readBlock(block, blockToken, clientName, startOffset, len);
++    new Sender(out).readBlock(block, blockToken, clientName, startOffset, len,
++        verifyChecksum);
+ 
+     //
+     // Get bytes in block
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/datatransfer/DataTransferProtocol.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/datatransfer/DataTransferProtocol.java
+index b584f3b..b89b30a 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/datatransfer/DataTransferProtocol.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/datatransfer/DataTransferProtocol.java
+@@ -55,12 +55,15 @@ public interface DataTransferProtocol {
+    * @param clientName client's name.
+    * @param blockOffset offset of the block.
+    * @param length maximum number of bytes for this read.
++   * @param sendChecksum if false, the DN should skip reading and sending
++   *        checksums
+    */
+   public void readBlock(final ExtendedBlock blk,
+       final Token<BlockTokenIdentifier> blockToken,
+       final String clientName,
+       final long blockOffset,
+-      final long length) throws IOException;
++      final long length,
++      final boolean sendChecksum) throws IOException;
+ 
+   /**
+    * Write a block to a datanode pipeline.
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/datatransfer/Receiver.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/datatransfer/Receiver.java
+index 260a0a6..2fcb3e4 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/datatransfer/Receiver.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/datatransfer/Receiver.java
+@@ -93,7 +93,8 @@ public abstract class Receiver implements DataTransferProtocol {
+         fromProto(proto.getHeader().getBaseHeader().getToken()),
+         proto.getHeader().getClientName(),
+         proto.getOffset(),
+-        proto.getLen());
++        proto.getLen(),
++        proto.getSendChecksums());
+   }
+   
+   /** Receive OP_WRITE_BLOCK */
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/datatransfer/Sender.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/datatransfer/Sender.java
+index f117cdf..b050173 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/datatransfer/Sender.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/datatransfer/Sender.java
+@@ -64,6 +64,10 @@ public class Sender implements DataTransferProtocol {
+ 
+   private static void send(final DataOutputStream out, final Op opcode,
+       final Message proto) throws IOException {
++    if (LOG.isTraceEnabled()) {
++      LOG.trace("Sending DataTransferOp " + proto.getClass().getSimpleName()
++          + ": " + proto);
++    }
+     op(out, opcode);
+     proto.writeDelimitedTo(out);
+     out.flush();
+@@ -74,12 +78,14 @@ public class Sender implements DataTransferProtocol {
+       final Token<BlockTokenIdentifier> blockToken,
+       final String clientName,
+       final long blockOffset,
+-      final long length) throws IOException {
++      final long length,
++      final boolean sendChecksum) throws IOException {
+ 
+     OpReadBlockProto proto = OpReadBlockProto.newBuilder()
+       .setHeader(DataTransferProtoUtil.buildClientHeader(blk, clientName, blockToken))
+       .setOffset(blockOffset)
+       .setLen(length)
++      .setSendChecksums(sendChecksum)
+       .build();
+ 
+     send(out, Op.READ_BLOCK, proto);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockPoolSliceScanner.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockPoolSliceScanner.java
+index 2d61891..9c05df9 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockPoolSliceScanner.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockPoolSliceScanner.java
+@@ -388,8 +388,8 @@ class BlockPoolSliceScanner {
+       try {
+         adjustThrottler();
+         
+-        blockSender = new BlockSender(block, 0, -1, false, true, datanode,
+-            null);
++        blockSender = new BlockSender(block, 0, -1, false, true, true, 
++            datanode, null);
+ 
+         DataOutputStream out = 
+                 new DataOutputStream(new IOUtils.NullOutputStream());
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockSender.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockSender.java
+index 49eb7dc..cbe3bd0 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockSender.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockSender.java
+@@ -45,6 +45,8 @@ import org.apache.hadoop.io.nativeio.NativeIO;
+ import org.apache.hadoop.net.SocketOutputStream;
+ import org.apache.hadoop.util.DataChecksum;
+ 
++import com.google.common.base.Preconditions;
++
+ /**
+  * Reads a block from the disk and sends it to a recipient.
+  * 
+@@ -158,12 +160,14 @@ class BlockSender implements java.io.Closeable {
+    * @param length length of data to read
+    * @param corruptChecksumOk
+    * @param verifyChecksum verify checksum while reading the data
++   * @param sendChecksum send checksum to client.
+    * @param datanode datanode from which the block is being read
+    * @param clientTraceFmt format string used to print client trace logs
+    * @throws IOException
+    */
+   BlockSender(ExtendedBlock block, long startOffset, long length,
+               boolean corruptChecksumOk, boolean verifyChecksum,
++              boolean sendChecksum,
+               DataNode datanode, String clientTraceFmt)
+       throws IOException {
+     try {
+@@ -175,6 +179,13 @@ class BlockSender implements java.io.Closeable {
+       this.shouldDropCacheBehindRead = datanode.getDnConf().dropCacheBehindReads;
+       this.datanode = datanode;
+       
++      if (verifyChecksum) {
++        // To simplify implementation, callers may not specify verification
++        // without sending.
++        Preconditions.checkArgument(sendChecksum,
++            "If verifying checksum, currently must also send it.");
++      }
++      
+       final Replica replica;
+       final long replicaVisibleLength;
+       synchronized(datanode.data) { 
+@@ -213,29 +224,37 @@ class BlockSender implements java.io.Closeable {
+        * False,  True: will verify checksum
+        * False, False: throws IOException file not found
+        */
+-      DataChecksum csum;
+-      final InputStream metaIn = datanode.data.getMetaDataInputStream(block);
+-      if (!corruptChecksumOk || metaIn != null) {
+-      	if (metaIn == null) {
+-          //need checksum but meta-data not found
+-          throw new FileNotFoundException("Meta-data not found for " + block);
+-        } 
+-      	
+-        checksumIn = new DataInputStream(
+-            new BufferedInputStream(metaIn, HdfsConstants.IO_FILE_BUFFER_SIZE));
+-
+-        // read and handle the common header here. For now just a version
+-        BlockMetadataHeader header = BlockMetadataHeader.readHeader(checksumIn);
+-        short version = header.getVersion();
+-        if (version != BlockMetadataHeader.VERSION) {
+-          LOG.warn("Wrong version (" + version + ") for metadata file for "
+-              + block + " ignoring ...");
++      DataChecksum csum = null;
++      if (verifyChecksum || sendChecksum) {
++        final InputStream metaIn = datanode.data.getMetaDataInputStream(block);
++        if (!corruptChecksumOk || metaIn != null) {
++          if (metaIn == null) {
++            //need checksum but meta-data not found
++            throw new FileNotFoundException("Meta-data not found for " + block);
++          }
++
++          checksumIn = new DataInputStream(
++              new BufferedInputStream(metaIn, HdfsConstants.IO_FILE_BUFFER_SIZE));
++  
++          // read and handle the common header here. For now just a version
++          BlockMetadataHeader header = BlockMetadataHeader.readHeader(checksumIn);
++          short version = header.getVersion();
++          if (version != BlockMetadataHeader.VERSION) {
++            LOG.warn("Wrong version (" + version + ") for metadata file for "
++                + block + " ignoring ...");
++          }
++          csum = header.getChecksum();
++        } else {
++          LOG.warn("Could not find metadata file for " + block);
+         }
+-        csum = header.getChecksum();
+-      } else {
+-        LOG.warn("Could not find metadata file for " + block);
+-        // This only decides the buffer size. Use BUFFER_SIZE?
+-        csum = DataChecksum.newDataChecksum(DataChecksum.Type.NULL, 16 * 1024);
++      }
++      if (csum == null) {
++        // The number of bytes per checksum here determines the alignment
++        // of reads: we always start reading at a checksum chunk boundary,
++        // even if the checksum type is NULL. So, choosing too big of a value
++        // would risk sending too much unnecessary data. 512 (1 disk sector)
++        // is likely to result in minimal extra IO.
++        csum = DataChecksum.newDataChecksum(DataChecksum.Type.NULL, 512);
+       }
+ 
+       /*
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNode.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNode.java
+index 12411fe..fe0fc66 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNode.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNode.java
+@@ -1551,7 +1551,7 @@ public class DataNode extends Configured
+             HdfsConstants.SMALL_BUFFER_SIZE));
+         in = new DataInputStream(unbufIn);
+         blockSender = new BlockSender(b, 0, b.getNumBytes(), 
+-            false, false, DataNode.this, null);
++            false, false, true, DataNode.this, null);
+         DatanodeInfo srcNode = new DatanodeInfo(bpReg);
+ 
+         //
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataXceiver.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataXceiver.java
+index 2998cc6..6fe4cd9 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataXceiver.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataXceiver.java
+@@ -305,7 +305,8 @@ class DataXceiver extends Receiver implements Runnable {
+       final Token<BlockTokenIdentifier> blockToken,
+       final String clientName,
+       final long blockOffset,
+-      final long length) throws IOException {
++      final long length,
++      final boolean sendChecksum) throws IOException {
+     previousOpClientName = clientName;
+ 
+     OutputStream baseStream = getOutputStream();
+@@ -330,7 +331,7 @@ class DataXceiver extends Receiver implements Runnable {
+     try {
+       try {
+         blockSender = new BlockSender(block, blockOffset, length,
+-            true, false, datanode, clientTraceFmt);
++            true, false, sendChecksum, datanode, clientTraceFmt);
+       } catch(IOException e) {
+         String msg = "opReadBlock " + block + " received exception " + e; 
+         LOG.info(msg);
+@@ -720,7 +721,7 @@ class DataXceiver extends Receiver implements Runnable {
+ 
+     try {
+       // check if the block exists or not
+-      blockSender = new BlockSender(block, 0, -1, false, false, datanode, 
++      blockSender = new BlockSender(block, 0, -1, false, false, true, datanode, 
+           null);
+ 
+       // set up response stream
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/datatransfer.proto b/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/datatransfer.proto
+index 9c23a60..8525185 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/datatransfer.proto
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/datatransfer.proto
+@@ -50,6 +50,7 @@ message OpReadBlockProto {
+   required ClientOperationHeaderProto header = 1;
+   required uint64 offset = 2;
+   required uint64 len = 3;
++  optional bool sendChecksums = 4 [default = true];
+ }
+ 
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDataTransferProtocol.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDataTransferProtocol.java
+index 92ac17a..b97f7bc 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDataTransferProtocol.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDataTransferProtocol.java
+@@ -450,21 +450,21 @@ public class TestDataTransferProtocol {
+     recvBuf.reset();
+     blk.setBlockId(blkid-1);
+     sender.readBlock(blk, BlockTokenSecretManager.DUMMY_TOKEN, "cl",
+-        0L, fileLen);
++        0L, fileLen, true);
+     sendRecvData("Wrong block ID " + newBlockId + " for read", false); 
+ 
+     // negative block start offset -1L
+     sendBuf.reset();
+     blk.setBlockId(blkid);
+     sender.readBlock(blk, BlockTokenSecretManager.DUMMY_TOKEN, "cl",
+-        -1L, fileLen);
++        -1L, fileLen, true);
+     sendRecvData("Negative start-offset for read for block " + 
+                  firstBlock.getBlockId(), false);
+ 
+     // bad block start offset
+     sendBuf.reset();
+     sender.readBlock(blk, BlockTokenSecretManager.DUMMY_TOKEN, "cl",
+-        fileLen, fileLen);
++        fileLen, fileLen, true);
+     sendRecvData("Wrong start-offset for reading block " +
+                  firstBlock.getBlockId(), false);
+     
+@@ -481,7 +481,7 @@ public class TestDataTransferProtocol {
+     
+     sendBuf.reset();
+     sender.readBlock(blk, BlockTokenSecretManager.DUMMY_TOKEN, "cl",
+-        0L, -1L-random.nextInt(oneMil));
++        0L, -1L-random.nextInt(oneMil), true);
+     sendRecvData("Negative length for reading block " +
+                  firstBlock.getBlockId(), false);
+     
+@@ -494,14 +494,14 @@ public class TestDataTransferProtocol {
+         recvOut);
+     sendBuf.reset();
+     sender.readBlock(blk, BlockTokenSecretManager.DUMMY_TOKEN, "cl",
+-        0L, fileLen+1);
++        0L, fileLen+1, true);
+     sendRecvData("Wrong length for reading block " +
+                  firstBlock.getBlockId(), false);
+     
+     //At the end of all this, read the file to make sure that succeeds finally.
+     sendBuf.reset();
+     sender.readBlock(blk, BlockTokenSecretManager.DUMMY_TOKEN, "cl",
+-        0L, fileLen);
++        0L, fileLen, true);
+     readFile(fileSys, file, fileLen);
+     } finally {
+       cluster.shutdown();
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestParallelRead.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestParallelRead.java
+index 3ec1a06..769551c 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestParallelRead.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestParallelRead.java
+@@ -17,6 +17,9 @@
+  */
+ package org.apache.hadoop.hdfs;
+ 
++import org.apache.commons.logging.impl.Log4JLogger;
++import org.apache.hadoop.hdfs.protocol.datatransfer.DataTransferProtocol;
++import org.apache.log4j.Level;
+ import org.junit.AfterClass;
+ import org.junit.BeforeClass;
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestParallelReadUtil.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestParallelReadUtil.java
+index c8d3ca6..5965fec 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestParallelReadUtil.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestParallelReadUtil.java
+@@ -52,6 +52,7 @@ public class TestParallelReadUtil {
+   static final int FILE_SIZE_K = 256;
+   static Random rand = null;
+   static final int DEFAULT_REPLICATION_FACTOR = 2;
++  protected boolean verifyChecksums = true;
+ 
+   static {
+     // The client-trace log ends up causing a lot of blocking threads
+@@ -323,7 +324,8 @@ public class TestParallelReadUtil {
+ 
+       testInfo.filepath = new Path("/TestParallelRead.dat." + i);
+       testInfo.authenticData = util.writeFile(testInfo.filepath, FILE_SIZE_K);
+-      testInfo.dis = dfsClient.open(testInfo.filepath.toString());
++      testInfo.dis = dfsClient.open(testInfo.filepath.toString(),
++          dfsClient.dfsClientConf.ioBufferSize, verifyChecksums);
+ 
+       for (int j = 0; j < nWorkerEach; ++j) {
+         workers[nWorkers++] = new ReadWorker(testInfo, nWorkers, helper);
+@@ -413,4 +415,10 @@ public class TestParallelReadUtil {
+   public void testParallelReadMixed() throws IOException {
+     runTestWorkload(new MixedWorkloadHelper());
+   }
++  
++  @Test
++  public void testParallelNoChecksums() throws IOException {
++    verifyChecksums = false;
++    runTestWorkload(new MixedWorkloadHelper());
++  }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestPread.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestPread.java
+index 5569541..064039d 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestPread.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestPread.java
+@@ -24,11 +24,14 @@ import java.io.DataOutputStream;
+ import java.io.IOException;
+ import java.util.Random;
+ 
++import org.apache.commons.logging.impl.Log4JLogger;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FSDataInputStream;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hdfs.protocol.datatransfer.DataTransferProtocol;
+ import org.apache.hadoop.hdfs.server.datanode.SimulatedFSDataset;
++import org.apache.log4j.Level;
+ import org.junit.Test;
+ 
+ /**
+@@ -199,11 +202,19 @@ public class TestPread {
+    */
+   @Test
+   public void testPreadDFS() throws IOException {
+-    dfsPreadTest(false); //normal pread
+-    dfsPreadTest(true); //trigger read code path without transferTo.
++    dfsPreadTest(false, true); //normal pread
++    dfsPreadTest(true, true); //trigger read code path without transferTo.
+   }
+   
+-  private void dfsPreadTest(boolean disableTransferTo) throws IOException {
++  @Test
++  public void testPreadDFSNoChecksum() throws IOException {
++    ((Log4JLogger)DataTransferProtocol.LOG).getLogger().setLevel(Level.ALL);
++    dfsPreadTest(false, false);
++    dfsPreadTest(true, false);
++  }
++  
++  private void dfsPreadTest(boolean disableTransferTo, boolean verifyChecksum)
++      throws IOException {
+     Configuration conf = new HdfsConfiguration();
+     conf.setLong(DFSConfigKeys.DFS_BLOCK_SIZE_KEY, 4096);
+     conf.setLong(DFSConfigKeys.DFS_CLIENT_READ_PREFETCH_SIZE_KEY, 4096);
+@@ -215,6 +226,7 @@ public class TestPread {
+     }
+     MiniDFSCluster cluster = new MiniDFSCluster.Builder(conf).numDataNodes(3).build();
+     FileSystem fileSys = cluster.getFileSystem();
++    fileSys.setVerifyChecksum(verifyChecksum);
+     try {
+       Path file1 = new Path("preadtest.dat");
+       writeFile(fileSys, file1);
+-- 
+1.7.0.4
+

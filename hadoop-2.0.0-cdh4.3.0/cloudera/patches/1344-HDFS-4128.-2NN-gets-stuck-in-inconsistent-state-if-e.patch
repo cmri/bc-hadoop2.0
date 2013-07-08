@@ -1,0 +1,335 @@
+From 410ff9d6aa4a2347f067fd55943d6c6127561693 Mon Sep 17 00:00:00 2001
+From: Daryn Sharp <daryn@apache.org>
+Date: Tue, 14 May 2013 20:22:19 -0700
+Subject: [PATCH 1344/1357] HDFS-4128. 2NN gets stuck in inconsistent state if edit log replay fails in the middle (kihwal via daryn)
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/branch-2@1452388 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit a58a955f6a634ff673126fd760284b26039af673)
+---
+ .../java/org/apache/hadoop/hdfs/DFSConfigKeys.java |    2 +
+ .../hdfs/server/namenode/CheckpointConf.java       |    8 ++
+ .../server/namenode/CheckpointFaultInjector.java   |    1 +
+ .../hdfs/server/namenode/SecondaryNameNode.java    |   54 +++++++++-
+ .../src/main/resources/hdfs-default.xml            |    9 ++
+ .../hdfs/server/namenode/TestCheckpoint.java       |  107 ++++++++++++++++++++
+ 6 files changed, 177 insertions(+), 4 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+index f6ada7f..90e2752 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+@@ -123,6 +123,8 @@ public class DFSConfigKeys extends CommonConfigurationKeys {
+   public static final long    DFS_NAMENODE_CHECKPOINT_PERIOD_DEFAULT = 3600;
+   public static final String  DFS_NAMENODE_CHECKPOINT_TXNS_KEY = "dfs.namenode.checkpoint.txns";
+   public static final long    DFS_NAMENODE_CHECKPOINT_TXNS_DEFAULT = 1000000;
++  public static final String  DFS_NAMENODE_CHECKPOINT_MAX_RETRIES_KEY = "dfs.namenode.checkpoint.max-retries";
++  public static final int     DFS_NAMENODE_CHECKPOINT_MAX_RETRIES_DEFAULT = 3;
+   public static final String  DFS_NAMENODE_HEARTBEAT_RECHECK_INTERVAL_KEY = "dfs.namenode.heartbeat.recheck-interval";
+   public static final int     DFS_NAMENODE_HEARTBEAT_RECHECK_INTERVAL_DEFAULT = 5*60*1000;
+   public static final String  DFS_NAMENODE_TOLERATE_HEARTBEAT_MULTIPLIER_KEY = "dfs.namenode.tolerate.heartbeat.multiplier";
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/CheckpointConf.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/CheckpointConf.java
+index 8b3cf04..0bc62d8 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/CheckpointConf.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/CheckpointConf.java
+@@ -39,6 +39,8 @@ public class CheckpointConf {
+   /** checkpoint once every this many transactions, regardless of time */
+   private final long checkpointTxnCount;
+ 
++  /** maxium number of retries when merge errors occur */
++  private final int maxRetriesOnMergeError;
+   
+   public CheckpointConf(Configuration conf) {
+     checkpointCheckPeriod = conf.getLong(
+@@ -49,6 +51,8 @@ public class CheckpointConf {
+                                     DFS_NAMENODE_CHECKPOINT_PERIOD_DEFAULT);
+     checkpointTxnCount = conf.getLong(DFS_NAMENODE_CHECKPOINT_TXNS_KEY, 
+                                   DFS_NAMENODE_CHECKPOINT_TXNS_DEFAULT);
++    maxRetriesOnMergeError = conf.getInt(DFS_NAMENODE_CHECKPOINT_MAX_RETRIES_KEY,
++                                  DFS_NAMENODE_CHECKPOINT_MAX_RETRIES_DEFAULT);
+     warnForDeprecatedConfigs(conf);
+   }
+   
+@@ -75,4 +79,8 @@ public class CheckpointConf {
+   public long getTxnCount() {
+     return checkpointTxnCount;
+   }
++
++  public int getMaxRetriesOnMergeError() {
++    return maxRetriesOnMergeError;
++  }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/CheckpointFaultInjector.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/CheckpointFaultInjector.java
+index 306be67..1852094 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/CheckpointFaultInjector.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/CheckpointFaultInjector.java
+@@ -33,6 +33,7 @@ class CheckpointFaultInjector {
+   
+   public void beforeGetImageSetsHeaders() throws IOException {}
+   public void afterSecondaryCallsRollEditLog() throws IOException {}
++  public void duringMerge() throws IOException {}
+   public void afterSecondaryUploadsNewImage() throws IOException {}
+   public void aboutToSendFile(File localfile) throws IOException {}
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/SecondaryNameNode.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/SecondaryNameNode.java
+index 394ca6a..914db17 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/SecondaryNameNode.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/SecondaryNameNode.java
+@@ -150,6 +150,11 @@ public class SecondaryNameNode implements Runnable {
+   }
+ 
+   @VisibleForTesting
++  int getMergeErrorCount() {
++    return checkpointImage.getMergeErrorCount();
++  }
++
++  @VisibleForTesting
+   FSNamesystem getFSNamesystem() {
+     return namesystem;
+   }
+@@ -327,6 +332,7 @@ public class SecondaryNameNode implements Runnable {
+     // number of transactions in the edit log that haven't yet been checkpointed.
+     //
+     long period = checkpointConf.getCheckPeriod();
++    int maxRetries = checkpointConf.getMaxRetriesOnMergeError();
+ 
+     while (shouldRun) {
+       try {
+@@ -352,6 +358,13 @@ public class SecondaryNameNode implements Runnable {
+       } catch (IOException e) {
+         LOG.error("Exception in doCheckpoint", e);
+         e.printStackTrace();
++        // Prevent a huge number of edits from being created due to
++        // unrecoverable conditions and endless retries.
++        if (checkpointImage.getMergeErrorCount() > maxRetries) {
++          LOG.fatal("Merging failed " + 
++              checkpointImage.getMergeErrorCount() + " times.");
++          terminate(1);
++        }
+       } catch (Throwable e) {
+         LOG.fatal("Throwable Exception in doCheckpoint", e);
+         e.printStackTrace();
+@@ -486,9 +499,21 @@ public class SecondaryNameNode implements Runnable {
+     RemoteEditLogManifest manifest =
+       namenode.getEditLogManifest(sig.mostRecentCheckpointTxId + 1);
+ 
++    // Fetch fsimage and edits. Reload the image if previous merge failed.
+     loadImage |= downloadCheckpointFiles(
+-        fsName, checkpointImage, sig, manifest);   // Fetch fsimage and edits
+-    doMerge(sig, manifest, loadImage, checkpointImage, namesystem);
++        fsName, checkpointImage, sig, manifest) |
++        checkpointImage.hasMergeError();
++    try {
++      doMerge(sig, manifest, loadImage, checkpointImage, namesystem);
++    } catch (IOException ioe) {
++      // A merge error occurred. The in-memory file system state may be
++      // inconsistent, so the image and edits need to be reloaded.
++      checkpointImage.setMergeError();
++      throw ioe;
++    }
++    // Clear any error since merge was successful.
++    checkpointImage.clearMergeError();
++
+     
+     //
+     // Upload the new image into the NameNode. Then tell the Namenode
+@@ -739,6 +764,7 @@ public class SecondaryNameNode implements Runnable {
+   
+   static class CheckpointStorage extends FSImage {
+     
++    private int mergeErrorCount;
+     private static class CheckpointLogPurger implements LogsPurgeable {
+       
+       private NNStorage storage;
+@@ -800,6 +826,7 @@ public class SecondaryNameNode implements Runnable {
+       // we shouldn't have any editLog instance. Setting to null
+       // makes sure we don't accidentally depend on it.
+       editLog = null;
++      mergeErrorCount = 0;
+       
+       // Replace the archival manager with one that can actually work on the
+       // 2NN's edits storage.
+@@ -866,7 +893,24 @@ public class SecondaryNameNode implements Runnable {
+         }
+       }
+     }
+-    
++
++
++    boolean hasMergeError() {
++      return (mergeErrorCount > 0);
++    }
++
++    int getMergeErrorCount() {
++      return mergeErrorCount;
++    }
++
++    void setMergeError() {
++      mergeErrorCount++;
++    }
++
++    void clearMergeError() {
++      mergeErrorCount = 0;
++    }
++ 
+     /**
+      * Ensure that the current/ directory exists in all storage
+      * directories
+@@ -925,7 +969,9 @@ public class SecondaryNameNode implements Runnable {
+       dstImage.reloadFromImageFile(file, dstNamesystem);
+       dstNamesystem.dir.imageLoadComplete();
+     }
+-    
++    // error simulation code for junit test
++    CheckpointFaultInjector.getInstance().duringMerge();   
++
+     Checkpointer.rollForwardByApplyingLogs(manifest, dstImage, dstNamesystem);
+     // The following has the side effect of purging old fsimages/edit logs.
+     dstImage.saveFSImageInAllDirs(dstNamesystem, dstImage.getLastAppliedTxId());
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml b/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+index be8b300..8d1ee88 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+@@ -650,6 +650,15 @@
+ </property>
+ 
+ <property>
++  <name>dfs.namenode.checkpoint.max-retries</name>
++  <value>3</value>
++  <description>The SecondaryNameNode retries failed checkpointing. If the 
++  failure occurs while loading fsimage or replaying edits, the number of
++  retries is limited by this variable. 
++  </description>
++</property>
++
++<property>
+   <name>dfs.namenode.num.checkpoints.retained</name>
+   <value>2</value>
+   <description>The number of image checkpoint files that will be retained by
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestCheckpoint.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestCheckpoint.java
+index 25206c1..385d3ea 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestCheckpoint.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestCheckpoint.java
+@@ -76,6 +76,8 @@ import org.apache.hadoop.net.NetUtils;
+ import org.apache.hadoop.test.GenericTestUtils;
+ import org.apache.hadoop.test.GenericTestUtils.DelayAnswer;
+ import org.apache.hadoop.test.GenericTestUtils.LogCapturer;
++import org.apache.hadoop.util.ExitUtil;
++import org.apache.hadoop.util.ExitUtil.ExitException;
+ import org.apache.hadoop.util.StringUtils;
+ import org.apache.log4j.Level;
+ import org.junit.After;
+@@ -225,6 +227,111 @@ public class TestCheckpoint {
+   }
+ 
+   /*
++   * Simulate exception during edit replay.
++   */
++  @Test(timeout=30000)
++  public void testReloadOnEditReplayFailure () throws IOException {
++    Configuration conf = new HdfsConfiguration();
++    FSDataOutputStream fos = null;
++    SecondaryNameNode secondary = null;
++    MiniDFSCluster cluster = null;
++    FileSystem fs = null;
++
++    try {
++      cluster = new MiniDFSCluster.Builder(conf).numDataNodes(numDatanodes)
++          .build();
++      cluster.waitActive();
++      fs = cluster.getFileSystem();
++      secondary = startSecondaryNameNode(conf);
++      fos = fs.create(new Path("tmpfile0"));
++      fos.write(new byte[] { 0, 1, 2, 3 });
++      secondary.doCheckpoint();
++      fos.write(new byte[] { 0, 1, 2, 3 });
++      fos.hsync();
++
++      // Cause merge to fail in next checkpoint.
++      Mockito.doThrow(new IOException(
++          "Injecting failure during merge"))
++          .when(faultInjector).duringMerge();
++
++      try {
++        secondary.doCheckpoint();
++        fail("Fault injection failed.");
++      } catch (IOException ioe) {
++        // This is expected.
++      } 
++      Mockito.reset(faultInjector);
++ 
++      // The error must be recorded, so next checkpoint will reload image.
++      fos.write(new byte[] { 0, 1, 2, 3 });
++      fos.hsync();
++      
++      assertTrue("Another checkpoint should have reloaded image",
++          secondary.doCheckpoint());
++    } finally {
++      if (secondary != null) {
++        secondary.shutdown();
++      }
++      if (fs != null) {
++        fs.close();
++      }
++      if (cluster != null) {
++        cluster.shutdown();
++      }
++      Mockito.reset(faultInjector);
++    }
++  }
++
++  /*
++   * Simulate 2NN exit due to too many merge failures.
++   */
++  @Test(timeout=30000)
++  public void testTooManyEditReplayFailures() throws IOException {
++    Configuration conf = new HdfsConfiguration();
++    conf.set(DFSConfigKeys.DFS_NAMENODE_CHECKPOINT_MAX_RETRIES_KEY, "1");
++    conf.set(DFSConfigKeys.DFS_NAMENODE_CHECKPOINT_CHECK_PERIOD_KEY, "1");
++
++    FSDataOutputStream fos = null;
++    SecondaryNameNode secondary = null;
++    MiniDFSCluster cluster = null;
++    FileSystem fs = null;
++
++    try {
++      cluster = new MiniDFSCluster.Builder(conf).numDataNodes(numDatanodes)
++          .checkExitOnShutdown(false).build();
++      cluster.waitActive();
++      fs = cluster.getFileSystem();
++      fos = fs.create(new Path("tmpfile0"));
++      fos.write(new byte[] { 0, 1, 2, 3 });
++
++      // Cause merge to fail in next checkpoint.
++      Mockito.doThrow(new IOException(
++          "Injecting failure during merge"))
++          .when(faultInjector).duringMerge();
++
++      secondary = startSecondaryNameNode(conf);
++      secondary.doWork();
++      // Fail if we get here.
++      fail("2NN did not exit.");
++    } catch (ExitException ee) {
++      // ignore
++      ExitUtil.resetFirstExitException();
++      assertEquals("Max retries", 1, secondary.getMergeErrorCount() - 1);
++    } finally {
++      if (secondary != null) {
++        secondary.shutdown();
++      }
++      if (fs != null) {
++        fs.close();
++      }
++      if (cluster != null) {
++        cluster.shutdown();
++      }
++      Mockito.reset(faultInjector);
++    }
++  }
++
++  /*
+    * Simulate namenode crashing after rolling edit log.
+    */
+   @Test
+-- 
+1.7.0.4
+

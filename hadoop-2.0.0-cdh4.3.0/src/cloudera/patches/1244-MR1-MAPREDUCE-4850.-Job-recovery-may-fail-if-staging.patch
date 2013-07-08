@@ -1,0 +1,272 @@
+From 534395696e5633a68e3e15245ce9e4316b5d7627 Mon Sep 17 00:00:00 2001
+From: Tom White <tom@cloudera.com>
+Date: Wed, 5 Dec 2012 15:46:11 +0000
+Subject: [PATCH 1244/1357] MR1: MAPREDUCE-4850. Job recovery may fail if staging directory has been deleted.
+
+---
+ .../org/apache/hadoop/mapred/CleanupQueue.java     |    9 ++-
+ .../org/apache/hadoop/mapred/JobInProgress.java    |   12 +++-
+ src/mapred/org/apache/hadoop/mapred/Task.java      |    8 --
+ .../apache/hadoop/mapred/TestRecoveryManager.java  |   93 ++++++++++++++++++--
+ 4 files changed, 106 insertions(+), 16 deletions(-)
+
+diff --git a/src/mapred/org/apache/hadoop/mapred/CleanupQueue.java b/src/mapred/org/apache/hadoop/mapred/CleanupQueue.java
+index c53aa64..3f7beea 100644
+--- a/src/mapred/org/apache/hadoop/mapred/CleanupQueue.java
++++ b/src/mapred/org/apache/hadoop/mapred/CleanupQueue.java
+@@ -56,10 +56,17 @@ class CleanupQueue {
+   static class PathDeletionContext {
+     final Path fullPath;// full path of file or dir
+     final Configuration conf;
++    final UserGroupInformation ugi;
+ 
+     public PathDeletionContext(Path fullPath, Configuration conf) {
++      this(fullPath, conf, null);
++    }
++
++    public PathDeletionContext(Path fullPath, Configuration conf,
++        UserGroupInformation ugi) {
+       this.fullPath = fullPath;
+       this.conf = conf;
++      this.ugi = ugi;
+     }
+     
+     protected Path getPathForCleanup() {
+@@ -72,7 +79,7 @@ class CleanupQueue {
+      */
+     protected void deletePath() throws IOException, InterruptedException {
+       final Path p = getPathForCleanup();
+-      UserGroupInformation.getLoginUser().doAs(
++      (ugi == null ? UserGroupInformation.getLoginUser() : ugi).doAs(
+           new PrivilegedExceptionAction<Object>() {
+             public Object run() throws IOException {
+              p.getFileSystem(conf).delete(p, true);
+diff --git a/src/mapred/org/apache/hadoop/mapred/JobInProgress.java b/src/mapred/org/apache/hadoop/mapred/JobInProgress.java
+index e4d237c..ff39f57 100644
+--- a/src/mapred/org/apache/hadoop/mapred/JobInProgress.java
++++ b/src/mapred/org/apache/hadoop/mapred/JobInProgress.java
+@@ -3158,7 +3158,17 @@ public class JobInProgress {
+ 
+         Path tempDir = jobtracker.getSystemDirectoryForJob(getJobID());
+         CleanupQueue.getInstance().addToQueue(
+-            new PathDeletionContext(tempDir, conf)); 
++            new PathDeletionContext(tempDir, conf));
++
++        // delete the staging area for the job
++        String jobTempDir = conf.get("mapreduce.job.dir");
++        if (jobTempDir != null && conf.getKeepTaskFilesPattern() == null &&
++            !conf.getKeepFailedTaskFiles()) {
++          Path jobTempDirPath = new Path(jobTempDir);
++          CleanupQueue.getInstance().addToQueue(
++              new PathDeletionContext(jobTempDirPath, conf, userUGI));
++        }
++
+       } catch (IOException e) {
+         LOG.warn("Error cleaning up "+profile.getJobID()+": "+e);
+       }
+diff --git a/src/mapred/org/apache/hadoop/mapred/Task.java b/src/mapred/org/apache/hadoop/mapred/Task.java
+index cc65143..655f59b 100644
+--- a/src/mapred/org/apache/hadoop/mapred/Task.java
++++ b/src/mapred/org/apache/hadoop/mapred/Task.java
+@@ -1064,14 +1064,6 @@ abstract public class Task implements Writable, Configurable {
+                             + JobStatus.State.FAILED + " or "
+                             + JobStatus.State.KILLED);
+     }
+-    // delete the staging area for the job
+-    JobConf conf = new JobConf(jobContext.getConfiguration());
+-    if (!supportIsolationRunner(conf)) {
+-      String jobTempDir = conf.get("mapreduce.job.dir");
+-      Path jobTempDirPath = new Path(jobTempDir);
+-      FileSystem fs = jobTempDirPath.getFileSystem(conf);
+-      fs.delete(jobTempDirPath, true);
+-    }
+     done(umbilical, reporter);
+   }
+ 
+diff --git a/src/test/org/apache/hadoop/mapred/TestRecoveryManager.java b/src/test/org/apache/hadoop/mapred/TestRecoveryManager.java
+index 6fb6891..aa4f3ea 100644
+--- a/src/test/org/apache/hadoop/mapred/TestRecoveryManager.java
++++ b/src/test/org/apache/hadoop/mapred/TestRecoveryManager.java
+@@ -21,10 +21,12 @@ package org.apache.hadoop.mapred;
+ import java.io.IOException;
+ import java.security.PrivilegedExceptionAction;
+ 
++import java.util.concurrent.CountDownLatch;
+ import junit.framework.TestCase;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.examples.SleepJob;
+ import org.apache.hadoop.fs.FSDataOutputStream;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+@@ -46,6 +48,7 @@ public class TestRecoveryManager {
+   private static final Log LOG = 
+     LogFactory.getLog(TestRecoveryManager.class);
+   private static final Path TEST_DIR = new Path("/tmp"); // on HDFS
++  private JobConf conf;
+   private FileSystem fs;
+   private MiniDFSCluster dfs;
+   private MiniMRCluster mr;
+@@ -58,11 +61,11 @@ public class TestRecoveryManager {
+ 
+   @Before
+   public void setUp() throws IOException {
+-    JobConf conf = new JobConf();
+-    
++    conf = new JobConf();
++
+     dfs = new MiniDFSCluster(conf, 1, true, null);
+     fs = dfs.getFileSystem();
+-    
++
+     conf.set("mapreduce.jobtracker.staging.root.dir", "/user");
+     conf.set("mapred.system.dir", "/mapred");
+     Path mapredSysDir =  new Path(conf.get("mapred.system.dir"));
+@@ -70,13 +73,19 @@ public class TestRecoveryManager {
+     fs.setPermission(mapredSysDir, new FsPermission((short) 0700));
+     fs.setOwner(mapredSysDir,
+         UserGroupInformation.getCurrentUser().getUserName(), "mrgroup");
+-    
++
+     mkdir(fs, "/user");
+     mkdir(fs, "/mapred");
+     mkdir(fs, "/tmp");
+-    
++
++  }
++
++  private void startCluster() throws IOException {
++    startCluster(conf);
++  }
++
++  private void startCluster(JobConf conf) throws IOException {
+     mr = new MiniMRCluster(1, dfs.getFileSystem().getUri().toString(), 1, null, null, conf);
+-    
+   }
+ 
+   @After
+@@ -104,6 +113,7 @@ public class TestRecoveryManager {
+   @Test(timeout=120000)
+   public void testJobTrackerRestartsWithMissingJobFile() throws Exception {
+     LOG.info("Testing jobtracker restart with faulty job");
++    startCluster();
+     String signalFile = new Path(TEST_DIR, "signal").toString();
+ 
+     JobConf job1 = mr.createJobConf();
+@@ -185,6 +195,7 @@ public class TestRecoveryManager {
+   @Test(timeout=120000)
+   public void testJobResubmission() throws Exception {
+     LOG.info("Testing Job Resubmission");
++    startCluster();
+     String signalFile = new Path(TEST_DIR, "signal").toString();
+ 
+     // make sure that the jobtracker is in recovery mode
+@@ -257,6 +268,7 @@ public class TestRecoveryManager {
+   @Test
+   public void testJobResubmissionAsDifferentUser() throws Exception {
+     LOG.info("Testing Job Resubmission as a different user to the jobtracker");
++    startCluster();
+     String signalFile = new Path(TEST_DIR, "signal").toString();
+ 
+     // make sure that the jobtracker is in recovery mode
+@@ -313,6 +325,72 @@ public class TestRecoveryManager {
+     Assert.assertTrue("Task should be successful", rJob1.isSuccessful());
+   }
+ 
++  public static class TestJobTrackerInstrumentation extends JobTrackerInstrumentation {
++    static CountDownLatch finalizeCall = new CountDownLatch(1);
++
++    public TestJobTrackerInstrumentation(JobTracker jt, JobConf conf) {
++      super(jt, conf);
++    }
++
++    public void finalizeJob(JobConf conf, JobID id) {
++      if (finalizeCall.getCount() == 0) {
++        return;
++      }
++      finalizeCall.countDown();
++      throw new IllegalStateException("Controlled error finalizing job");
++    }
++  }
++
++  @Test
++  public void testJobTrackerRestartBeforeJobFinalization() throws Exception {
++    LOG.info("Testing Job Resubmission");
++
++    // make sure that the jobtracker is in recovery mode
++    conf.setBoolean("mapred.jobtracker.restart.recover", true);
++
++    // use a test JobTrackerInstrumentation implementation to shut down
++    // the jobtracker after the tasks have all completed, but
++    // before the job is finalized and check that it can be recovered correctly
++    conf.setClass("mapred.jobtracker.instrumentation", TestJobTrackerInstrumentation.class,
++            JobTrackerInstrumentation.class);
++
++    startCluster(conf);
++
++    JobTracker jobtracker = mr.getJobTrackerRunner().getJobTracker();
++
++    SleepJob job = new SleepJob();
++    job.setConf(mr.createJobConf());
++    JobConf job1 = job.setupJobConf(1, 0, 1, 1, 1, 1);
++    JobClient jc = new JobClient(job1);
++    RunningJob rJob1 = jc.submitJob(job1);
++    LOG.info("Submitted first job " + rJob1.getID());
++
++    TestJobTrackerInstrumentation.finalizeCall.await();
++
++    // kill the jobtracker
++    LOG.info("Stopping jobtracker");
++    mr.stopJobTracker();
++
++    // start the jobtracker
++    LOG.info("Starting jobtracker");
++    mr.startJobTracker();
++    UtilsForTests.waitForJobTracker(jc);
++
++    jobtracker = mr.getJobTrackerRunner().getJobTracker();
++
++    // assert that job is recovered by the jobtracker
++    Assert.assertEquals("Resubmission failed ", 1,
++        jobtracker.getAllJobs().length);
++
++    // wait for job 1 to complete
++    JobInProgress jip = jobtracker.getJob(rJob1.getID());
++    while (!jip.isComplete()) {
++      LOG.info("Waiting for job " + rJob1.getID() + " to be successful");
++      UtilsForTests.waitFor(100);
++    }
++    Assert.assertTrue("Task should be successful", rJob1.isSuccessful());
++  }
++
+   /**
+    * Tests the {@link JobTracker.RecoveryManager} against the exceptions thrown 
+    * during recovery. It does the following :
+@@ -328,6 +406,7 @@ public class TestRecoveryManager {
+   @Test(timeout=120000)
+   public void testJobTrackerRestartWithBadJobs() throws Exception {
+     LOG.info("Testing recovery-manager");
++    startCluster();
+     String signalFile = new Path(TEST_DIR, "signal").toString();
+     // make sure that the jobtracker is in recovery mode
+     mr.getJobTrackerConf()
+@@ -459,6 +538,7 @@ public class TestRecoveryManager {
+   @Test(timeout=120000)
+   public void testRestartCount() throws Exception {
+     LOG.info("Testing Job Restart Count");
++    startCluster();
+     String signalFile = new Path(TEST_DIR, "signal").toString();
+     // make sure that the jobtracker is in recovery mode
+     mr.getJobTrackerConf()
+@@ -548,6 +628,7 @@ public class TestRecoveryManager {
+   @Test(timeout=120000)
+   public void testJobTrackerInfoCreation() throws Exception {
+     LOG.info("Testing jobtracker.info file");
++    startCluster();
+     String namenode = (dfs.getFileSystem()).getUri().getHost() + ":"
+                       + (dfs.getFileSystem()).getUri().getPort();
+     // shut down the data nodes
+-- 
+1.7.0.4
+

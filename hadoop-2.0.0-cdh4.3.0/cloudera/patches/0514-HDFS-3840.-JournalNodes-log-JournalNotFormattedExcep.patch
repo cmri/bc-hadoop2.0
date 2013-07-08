@@ -1,0 +1,281 @@
+From fbdd722437068d5cf182c51b9909be5336b20de1 Mon Sep 17 00:00:00 2001
+From: Todd Lipcon <todd@apache.org>
+Date: Tue, 11 Sep 2012 06:33:47 +0000
+Subject: [PATCH 0514/1357] HDFS-3840. JournalNodes log JournalNotFormattedException backtrace error before being formatted. Contributed by Todd Lipcon.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-3077@1383252 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 2e42658f8a5c209bea9325e1019779b4b85bbd3a)
+---
+ .../hadoop-hdfs/CHANGES.HDFS-3077.txt              |    2 +
+ .../hadoop/hdfs/qjournal/client/AsyncLogger.java   |    5 ++++
+ .../hdfs/qjournal/client/AsyncLoggerSet.java       |   24 +-------------------
+ .../hdfs/qjournal/client/IPCLoggerChannel.java     |   10 ++++++++
+ .../hdfs/qjournal/protocol/QJournalProtocol.java   |    6 +++++
+ .../QJournalProtocolServerSideTranslatorPB.java    |   18 +++++++++++++++
+ .../protocolPB/QJournalProtocolTranslatorPB.java   |   16 +++++++++++++
+ .../hadoop/hdfs/qjournal/server/Journal.java       |   10 +++++--
+ .../hdfs/qjournal/server/JournalNodeRpcServer.java |    5 ++++
+ .../src/main/proto/QJournalProtocol.proto          |   13 ++++++++++
+ .../hadoop/hdfs/qjournal/server/TestJournal.java   |    5 +++-
+ 11 files changed, 87 insertions(+), 27 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/CHANGES.HDFS-3077.txt b/hadoop-hdfs-project/hadoop-hdfs/CHANGES.HDFS-3077.txt
+index 9195100..38ad79e 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/CHANGES.HDFS-3077.txt
++++ b/hadoop-hdfs-project/hadoop-hdfs/CHANGES.HDFS-3077.txt
+@@ -68,3 +68,5 @@ HDFS-3914. QJM: acceptRecovery should abort current segment (todd)
+ HDFS-3915. QJM: Failover fails with auth error in secure cluster (todd)
+ 
+ HDFS-3906. QJM: quorum timeout on failover with large log segment (todd)
++
++HDFS-3840. JournalNodes log JournalNotFormattedException backtrace error before being formatted (todd)
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/client/AsyncLogger.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/client/AsyncLogger.java
+index 19206e6..99b9d6b 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/client/AsyncLogger.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/client/AsyncLogger.java
+@@ -91,6 +91,11 @@ interface AsyncLogger {
+   public ListenableFuture<Void> format(NamespaceInfo nsInfo);
+ 
+   /**
++   * @return whether or not the remote node has any valid data.
++   */
++  public ListenableFuture<Boolean> isFormatted();
++  
++  /**
+    * @return the state of the last epoch on the target node.
+    */
+   public ListenableFuture<GetJournalStateResponseProto> getJournalState();
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/client/AsyncLoggerSet.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/client/AsyncLoggerSet.java
+index 8cd6304..40df91c 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/client/AsyncLoggerSet.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/client/AsyncLoggerSet.java
+@@ -216,29 +216,7 @@ class AsyncLoggerSet {
+   public QuorumCall<AsyncLogger, Boolean> isFormatted() {
+     Map<AsyncLogger, ListenableFuture<Boolean>> calls = Maps.newHashMap();
+     for (AsyncLogger logger : loggers) {
+-      final SettableFuture<Boolean> ret = SettableFuture.create();
+-      ListenableFuture<GetJournalStateResponseProto> jstate =
+-          logger.getJournalState();
+-      Futures.addCallback(jstate, new FutureCallback<GetJournalStateResponseProto>() {
+-        @Override
+-        public void onFailure(Throwable t) {
+-          if (t instanceof RemoteException) {
+-            t = ((RemoteException)t).unwrapRemoteException();
+-          }
+-          if (t instanceof JournalNotFormattedException) {
+-            ret.set(false);
+-          } else {
+-            ret.setException(t);
+-          }
+-        }
+-
+-        @Override
+-        public void onSuccess(GetJournalStateResponseProto jstate) {
+-          ret.set(true);
+-        }
+-      });
+-      
+-      calls.put(logger, ret);
++      calls.put(logger, logger.isFormatted());
+     }
+     return QuorumCall.create(calls);
+   }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/client/IPCLoggerChannel.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/client/IPCLoggerChannel.java
+index f627b8a..2186d86 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/client/IPCLoggerChannel.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/client/IPCLoggerChannel.java
+@@ -294,6 +294,16 @@ public class IPCLoggerChannel implements AsyncLogger {
+   }
+ 
+   @Override
++  public ListenableFuture<Boolean> isFormatted() {
++    return executor.submit(new Callable<Boolean>() {
++      @Override
++      public Boolean call() throws IOException {
++        return getProxy().isFormatted(journalId);
++      }
++    });
++  }
++
++  @Override
+   public ListenableFuture<GetJournalStateResponseProto> getJournalState() {
+     return executor.submit(new Callable<GetJournalStateResponseProto>() {
+       @Override
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/protocol/QJournalProtocol.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/protocol/QJournalProtocol.java
+index a6527f1..769d084 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/protocol/QJournalProtocol.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/protocol/QJournalProtocol.java
+@@ -48,6 +48,12 @@ public interface QJournalProtocol {
+   public static final long versionID = 1L;
+ 
+   /**
++   * @return true if the given journal has been formatted and
++   * contains valid data.
++   */
++  public boolean isFormatted(String journalId) throws IOException;
++
++  /**
+    * Get the current state of the journal, including the most recent
+    * epoch number and the HTTP port.
+    */
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/protocolPB/QJournalProtocolServerSideTranslatorPB.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/protocolPB/QJournalProtocolServerSideTranslatorPB.java
+index b689a3d..a232331 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/protocolPB/QJournalProtocolServerSideTranslatorPB.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/protocolPB/QJournalProtocolServerSideTranslatorPB.java
+@@ -32,6 +32,8 @@ import org.apache.hadoop.hdfs.qjournal.protocol.QJournalProtocolProtos.GetJourna
+ import org.apache.hadoop.hdfs.qjournal.protocol.QJournalProtocolProtos.GetJournalStateResponseProto;
+ import org.apache.hadoop.hdfs.qjournal.protocol.QJournalProtocolProtos.HeartbeatRequestProto;
+ import org.apache.hadoop.hdfs.qjournal.protocol.QJournalProtocolProtos.HeartbeatResponseProto;
++import org.apache.hadoop.hdfs.qjournal.protocol.QJournalProtocolProtos.IsFormattedRequestProto;
++import org.apache.hadoop.hdfs.qjournal.protocol.QJournalProtocolProtos.IsFormattedResponseProto;
+ import org.apache.hadoop.hdfs.qjournal.protocol.QJournalProtocolProtos.JournalIdProto;
+ import org.apache.hadoop.hdfs.qjournal.protocol.QJournalProtocolProtos.JournalRequestProto;
+ import org.apache.hadoop.hdfs.qjournal.protocol.QJournalProtocolProtos.JournalResponseProto;
+@@ -67,6 +69,22 @@ public class QJournalProtocolServerSideTranslatorPB implements QJournalProtocolP
+     this.impl = impl;
+   }
+ 
++  
++  @Override
++  public IsFormattedResponseProto isFormatted(RpcController controller,
++      IsFormattedRequestProto request) throws ServiceException {
++    try {
++      boolean ret = impl.isFormatted(
++          convert(request.getJid()));
++      return IsFormattedResponseProto.newBuilder()
++          .setIsFormatted(ret)
++          .build();
++    } catch (IOException ioe) {
++      throw new ServiceException(ioe);
++    }
++  }
++
++
+   @Override
+   public GetJournalStateResponseProto getJournalState(RpcController controller,
+       GetJournalStateRequestProto request) throws ServiceException {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/protocolPB/QJournalProtocolTranslatorPB.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/protocolPB/QJournalProtocolTranslatorPB.java
+index d5177e0..290a62a 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/protocolPB/QJournalProtocolTranslatorPB.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/protocolPB/QJournalProtocolTranslatorPB.java
+@@ -33,6 +33,8 @@ import org.apache.hadoop.hdfs.qjournal.protocol.QJournalProtocolProtos.GetEditLo
+ import org.apache.hadoop.hdfs.qjournal.protocol.QJournalProtocolProtos.GetJournalStateRequestProto;
+ import org.apache.hadoop.hdfs.qjournal.protocol.QJournalProtocolProtos.GetJournalStateResponseProto;
+ import org.apache.hadoop.hdfs.qjournal.protocol.QJournalProtocolProtos.HeartbeatRequestProto;
++import org.apache.hadoop.hdfs.qjournal.protocol.QJournalProtocolProtos.IsFormattedRequestProto;
++import org.apache.hadoop.hdfs.qjournal.protocol.QJournalProtocolProtos.IsFormattedResponseProto;
+ import org.apache.hadoop.hdfs.qjournal.protocol.QJournalProtocolProtos.JournalIdProto;
+ import org.apache.hadoop.hdfs.qjournal.protocol.QJournalProtocolProtos.JournalRequestProto;
+ import org.apache.hadoop.hdfs.qjournal.protocol.QJournalProtocolProtos.NewEpochRequestProto;
+@@ -79,6 +81,20 @@ public class QJournalProtocolTranslatorPB implements ProtocolMetaInterface,
+ 
+ 
+   @Override
++  public boolean isFormatted(String journalId) throws IOException {
++    try {
++      IsFormattedRequestProto req = IsFormattedRequestProto.newBuilder()
++          .setJid(convertJournalId(journalId))
++          .build();
++      IsFormattedResponseProto resp = rpcProxy.isFormatted(
++          NULL_CONTROLLER, req);
++      return resp.getIsFormatted();
++    } catch (ServiceException e) {
++      throw ProtobufHelper.getRemoteException(e);
++    }
++  }
++
++  @Override
+   public GetJournalStateResponseProto getJournalState(String jid)
+       throws IOException {
+     try {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/server/Journal.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/server/Journal.java
+index 6e75bbc..dd11d3a 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/server/Journal.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/server/Journal.java
+@@ -402,10 +402,14 @@ class Journal implements Closeable {
+     }
+   }
+   
++  public synchronized boolean isFormatted() {
++    return storage.isFormatted();
++  }
++
+   private void checkFormatted() throws JournalNotFormattedException {
+-    if (!storage.isFormatted()) {
+-      throw new JournalNotFormattedException("Journal " + storage +
+-          " not formatted");
++    if (!isFormatted()) {
++      throw new JournalNotFormattedException("Journal " +
++          storage.getSingularStorageDir() + " not formatted");
+     }
+   }
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/server/JournalNodeRpcServer.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/server/JournalNodeRpcServer.java
+index 3ff9df8..02d9df0 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/server/JournalNodeRpcServer.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/server/JournalNodeRpcServer.java
+@@ -108,6 +108,11 @@ class JournalNodeRpcServer implements QJournalProtocol {
+   }
+ 
+   @Override
++  public boolean isFormatted(String journalId) throws IOException {
++    return jn.getOrCreateJournal(journalId).isFormatted();
++  }
++
++  @Override
+   public GetJournalStateResponseProto getJournalState(String journalId)
+         throws IOException {
+     long epoch = jn.getOrCreateJournal(journalId).getLastPromisedEpoch(); 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/QJournalProtocol.proto b/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/QJournalProtocol.proto
+index 8a6bd0d..9c448ce 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/QJournalProtocol.proto
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/QJournalProtocol.proto
+@@ -117,6 +117,17 @@ message PurgeLogsResponseProto {
+ }
+ 
+ /**
++ * isFormatted()
++ */
++message IsFormattedRequestProto {
++  required JournalIdProto jid = 1;
++}
++
++message IsFormattedResponseProto {
++  required bool isFormatted = 1;
++}
++
++/**
+  * getJournalState()
+  */
+ message GetJournalStateRequestProto {
+@@ -210,6 +221,8 @@ message AcceptRecoveryResponseProto {
+  * See the request and response for details of rpc call.
+  */
+ service QJournalProtocolService {
++  rpc isFormatted(IsFormattedRequestProto) returns (IsFormattedResponseProto);
++
+   rpc getJournalState(GetJournalStateRequestProto) returns (GetJournalStateResponseProto);
+ 
+   rpc newEpoch(NewEpochRequestProto) returns (NewEpochResponseProto);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/qjournal/server/TestJournal.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/qjournal/server/TestJournal.java
+index 9579193..5aad571 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/qjournal/server/TestJournal.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/qjournal/server/TestJournal.java
+@@ -156,10 +156,13 @@ public class TestJournal {
+ 
+     assertEquals(12345L, journal.getLastPromisedEpoch());
+     assertEquals(12345L, journal.getLastWriterEpoch());
+-
++    assertTrue(journal.isFormatted());
++    
+     journal.format(FAKE_NSINFO_2);
++    
+     assertEquals(0, journal.getLastPromisedEpoch());
+     assertEquals(0, journal.getLastWriterEpoch());
++    assertTrue(journal.isFormatted());
+   }
+   
+   /**
+-- 
+1.7.0.4
+

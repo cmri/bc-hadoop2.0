@@ -1,0 +1,198 @@
+From e3b8f0fa3be4bce0670210be9065a8e9700dbc69 Mon Sep 17 00:00:00 2001
+From: Todd Lipcon <todd@cloudera.com>
+Date: Sat, 7 Apr 2012 17:16:05 -0700
+Subject: [PATCH 0024/1357] HADOOP-8246. Auto-HA: automatically scope znode by nameservice ID. Contributed by Todd Lipcon.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-3042@1310919 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 986e287106f1e3b2a40276db85da8b06421b57bf)
+---
+ .../org/apache/hadoop/ha/ZKFailoverController.java |   27 +++++++++++----
+ .../java/org/apache/hadoop/ha/MiniZKFCCluster.java |   16 +++++++--
+ .../apache/hadoop/ha/TestZKFailoverController.java |   34 ++++++++++++++++++++
+ .../hadoop/hdfs/tools/DFSZKFailoverController.java |    5 +++
+ 4 files changed, 72 insertions(+), 10 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ha/ZKFailoverController.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ha/ZKFailoverController.java
+index bd40605..1411566 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ha/ZKFailoverController.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ha/ZKFailoverController.java
+@@ -80,8 +80,6 @@ public abstract class ZKFailoverController implements Tool {
+ 
+   private HAServiceTarget localTarget;
+ 
+-  private String parentZnode;
+-
+   private State lastHealthState = State.INITIALIZING;
+ 
+   /** Set if a fatal error occurs */
+@@ -95,10 +93,18 @@ public abstract class ZKFailoverController implements Tool {
+   
+ 
+   protected abstract byte[] targetToData(HAServiceTarget target);
+-  protected abstract HAServiceTarget getLocalTarget();  
++  protected abstract HAServiceTarget getLocalTarget();
+   protected abstract HAServiceTarget dataToTarget(byte[] data);
+   protected abstract void loginAsFCUser() throws IOException;
+ 
++  /**
++   * Return the name of a znode inside the configured parent znode in which
++   * the ZKFC will do all of its work. This is so that multiple federated
++   * nameservices can run on the same ZK quorum without having to manually
++   * configure them to separate subdirectories.
++   */
++  protected abstract String getScopeInsideParentNode();
++
+   @Override
+   public Configuration getConf() {
+     return conf;
+@@ -204,6 +210,7 @@ public abstract class ZKFailoverController implements Tool {
+   }
+ 
+   private boolean confirmFormat() {
++    String parentZnode = getParentZnode();
+     System.err.println(
+         "===============================================\n" +
+         "The configured parent znode " + parentZnode + " already exists.\n" +
+@@ -234,9 +241,6 @@ public abstract class ZKFailoverController implements Tool {
+     String zkQuorum = conf.get(ZK_QUORUM_KEY);
+     int zkTimeout = conf.getInt(ZK_SESSION_TIMEOUT_KEY,
+         ZK_SESSION_TIMEOUT_DEFAULT);
+-    parentZnode = conf.get(ZK_PARENT_ZNODE_KEY,
+-        ZK_PARENT_ZNODE_DEFAULT);
+-    
+     // Parse ACLs from configuration.
+     String zkAclConf = conf.get(ZK_ACL_KEY, ZK_ACL_DEFAULT);
+     zkAclConf = HAZKUtil.resolveConfIndirection(zkAclConf);
+@@ -264,10 +268,19 @@ public abstract class ZKFailoverController implements Tool {
+     
+ 
+     elector = new ActiveStandbyElector(zkQuorum,
+-        zkTimeout, parentZnode, zkAcls, zkAuths,
++        zkTimeout, getParentZnode(), zkAcls, zkAuths,
+         new ElectorCallbacks());
+   }
+   
++  private String getParentZnode() {
++    String znode = conf.get(ZK_PARENT_ZNODE_KEY,
++        ZK_PARENT_ZNODE_DEFAULT);
++    if (!znode.endsWith("/")) {
++      znode += "/";
++    }
++    return znode + getScopeInsideParentNode();
++  }
++
+   private synchronized void mainLoop() throws InterruptedException {
+     while (fatalError == null) {
+       wait();
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ha/MiniZKFCCluster.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ha/MiniZKFCCluster.java
+index 3a531b8..be72a41 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ha/MiniZKFCCluster.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ha/MiniZKFCCluster.java
+@@ -187,8 +187,7 @@ public class MiniZKFCCluster {
+       throws NoNodeException {
+     Stat stat = new Stat();
+     byte[] data = zks.getZKDatabase().getData(
+-        ZKFailoverController.ZK_PARENT_ZNODE_DEFAULT + "/" +
+-        ActiveStandbyElector.LOCK_FILENAME, stat, null);
++        DummyZKFC.LOCK_ZNODE, stat, null);
+     
+     assertArrayEquals(Ints.toByteArray(svcs[idx].index), data);
+     long session = stat.getEphemeralOwner();
+@@ -206,7 +205,7 @@ public class MiniZKFCCluster {
+       throws Exception {
+     DummyHAService svc = idx == null ? null : svcs[idx];
+     ActiveStandbyElectorTestUtil.waitForActiveLockData(ctx, zks,
+-        ZKFailoverController.ZK_PARENT_ZNODE_DEFAULT,
++        DummyZKFC.SCOPED_PARENT_ZNODE,
+         (idx == null) ? null : Ints.toByteArray(svc.index));
+   }
+   
+@@ -255,6 +254,12 @@ public class MiniZKFCCluster {
+   }
+   
+   static class DummyZKFC extends ZKFailoverController {
++    private static final String DUMMY_CLUSTER = "dummy-cluster";
++    public static final String SCOPED_PARENT_ZNODE =
++      ZKFailoverController.ZK_PARENT_ZNODE_DEFAULT + "/" +
++      DUMMY_CLUSTER;
++    private static final String LOCK_ZNODE = 
++      SCOPED_PARENT_ZNODE + "/" + ActiveStandbyElector.LOCK_FILENAME;
+     private final DummyHAService localTarget;
+     
+     public DummyZKFC(DummyHAService localTarget) {
+@@ -280,5 +285,10 @@ public class MiniZKFCCluster {
+     @Override
+     protected void loginAsFCUser() throws IOException {
+     }
++
++    @Override
++    protected String getScopeInsideParentNode() {
++      return DUMMY_CLUSTER;
++    }
+   }
+ }
+\ No newline at end of file
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ha/TestZKFailoverController.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ha/TestZKFailoverController.java
+index 4cdc38e..4ec835e 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ha/TestZKFailoverController.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ha/TestZKFailoverController.java
+@@ -94,6 +94,40 @@ public class TestZKFailoverController extends ClientBaseWithFixes {
+     assertEquals(0, runFC(svc, "-formatZK", "-force"));
+   }
+   
++  @Test
++  public void testFormatOneClusterLeavesOtherClustersAlone() throws Exception {
++    DummyHAService svc = cluster.getService(1);
++
++    DummyZKFC zkfcInOtherCluster = new DummyZKFC(cluster.getService(1)) {
++      @Override
++      protected String getScopeInsideParentNode() {
++        return "other-scope";
++      }
++    };
++    zkfcInOtherCluster.setConf(conf);
++    
++    // Run without formatting the base dir,
++    // should barf
++    assertEquals(ZKFailoverController.ERR_CODE_NO_PARENT_ZNODE,
++        runFC(svc));
++
++    // Format the base dir, should succeed
++    assertEquals(0, runFC(svc, "-formatZK"));
++    
++    // Run the other cluster without formatting, should barf because
++    // it uses a different parent znode
++    assertEquals(ZKFailoverController.ERR_CODE_NO_PARENT_ZNODE,
++        zkfcInOtherCluster.run(new String[]{}));
++    
++    // Should succeed in formatting the second cluster
++    assertEquals(0, zkfcInOtherCluster.run(new String[]{"-formatZK"}));
++
++    // But should not have deleted the original base node from the first
++    // cluster
++    assertEquals(ZKFailoverController.ERR_CODE_FORMAT_DENIED,
++        runFC(svc, "-formatZK", "-nonInteractive"));
++  }
++  
+   /**
+    * Test that, if ACLs are specified in the configuration, that
+    * it sets the ACLs when formatting the parent node.
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/tools/DFSZKFailoverController.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/tools/DFSZKFailoverController.java
+index a3c4445..87422a3 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/tools/DFSZKFailoverController.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/tools/DFSZKFailoverController.java
+@@ -117,6 +117,11 @@ public class DFSZKFailoverController extends ZKFailoverController {
+         DFS_NAMENODE_USER_NAME_KEY, socAddr.getHostName());
+   }
+   
++  @Override
++  protected String getScopeInsideParentNode() {
++    return localTarget.getNameServiceId();
++  }
++
+   public static void main(String args[])
+       throws Exception {
+     System.exit(ToolRunner.run(
+-- 
+1.7.0.4
+

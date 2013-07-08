@@ -1,0 +1,128 @@
+From 3c4bfcca980efee1791fa20a7e3d3beb585d72fb Mon Sep 17 00:00:00 2001
+From: Tom White <tom@cloudera.com>
+Date: Mon, 7 Jan 2013 14:48:53 +0000
+Subject: [PATCH 1241/1357] MR1: CLOUDERA-BUILD. JT HA: Further fix to ignore port in logical names.
+
+Reason: Bug
+Ref: CDH-9608
+Author: Tom White
+---
+ .../mapred/ConfiguredFailoverProxyProvider.java    |    3 +-
+ src/mapred/org/apache/hadoop/mapred/HAUtil.java    |   22 +++++++++----------
+ .../apache/hadoop/mapred/JobTrackerProxies.java    |    6 +++-
+ src/test/org/apache/hadoop/mapred/TestHAUtil.java  |    6 +----
+ 4 files changed, 16 insertions(+), 21 deletions(-)
+
+diff --git a/src/mapred/org/apache/hadoop/mapred/ConfiguredFailoverProxyProvider.java b/src/mapred/org/apache/hadoop/mapred/ConfiguredFailoverProxyProvider.java
+index 8f4bf41..8e40a6c 100644
+--- a/src/mapred/org/apache/hadoop/mapred/ConfiguredFailoverProxyProvider.java
++++ b/src/mapred/org/apache/hadoop/mapred/ConfiguredFailoverProxyProvider.java
+@@ -84,9 +84,8 @@ public class ConfiguredFailoverProxyProvider<T> implements
+     try {
+       ugi = UserGroupInformation.getCurrentUser();
+       
+-      Map<String, Map<String, InetSocketAddress>> map = HAUtil.getHaJtRpcAddresses(
++      Map<String, InetSocketAddress> addressesInJT = HAUtil.getHaJtRpcAddresses(
+           conf);
+-      Map<String, InetSocketAddress> addressesInJT = map.get(jtAddress);
+       
+       if (addressesInJT == null || addressesInJT.size() == 0) {
+         throw new RuntimeException("Could not find any configured addresses " +
+diff --git a/src/mapred/org/apache/hadoop/mapred/HAUtil.java b/src/mapred/org/apache/hadoop/mapred/HAUtil.java
+index 97689c3..322ad8a 100644
+--- a/src/mapred/org/apache/hadoop/mapred/HAUtil.java
++++ b/src/mapred/org/apache/hadoop/mapred/HAUtil.java
+@@ -114,17 +114,17 @@ public class HAUtil {
+    * @return true if HA is configured in the configuration; else false.
+    */
+   public static boolean isHAEnabled(Configuration conf, String jtAddress) {
+-    Map<String, Map<String, InetSocketAddress>> addresses =
+-      getHaJtRpcAddresses(conf);
+-    if (addresses == null) return false;
+-    Map<String, InetSocketAddress> jtMap = addresses.get(jtAddress);
+-    return jtMap != null && jtMap.size() > 1;
++    Map<String, InetSocketAddress> jtMap = getHaJtRpcAddresses(conf);
++    return (jtMap != null && jtMap.size() > 1);
++  }
++
++  public static String getLogicalName(String jtAddress) {
++    int index = jtAddress.indexOf(":");
++    return index == -1 ? jtAddress : jtAddress.substring(0, index);
+   }
+   
+   public static String getLogicalName(Configuration conf) {
+-    String jt = conf.get(MR_JOBTRACKER_ADDRESS_KEY);
+-    int index = jt.indexOf(":");
+-    return index == -1 ? jt : jt.substring(0, index);
++    return getLogicalName(conf.get(MR_JOBTRACKER_ADDRESS_KEY));
+   }
+   
+   /**
+@@ -255,12 +255,11 @@ public class HAUtil {
+     }
+   }
+ 
+-  public static Map<String, Map<String, InetSocketAddress>> getHaJtRpcAddresses(
++  public static Map<String, InetSocketAddress> getHaJtRpcAddresses(
+       Configuration conf) {
+     
+     // For JT HA there can only be one logical name (unlike HDFS)
+     String logicalName = getLogicalName(conf);
+-    Map<String, Map<String, InetSocketAddress>> ret = Maps.newHashMap();
+     Map<String, InetSocketAddress> map = Maps.newHashMap();
+     for (String jtId : getJtServiceIds(conf, logicalName)) {
+       String address = conf.get(
+@@ -268,8 +267,7 @@ public class HAUtil {
+       InetSocketAddress isa = NetUtils.createSocketAddr(address);
+       map.put(jtId, isa);
+     }
+-    ret.put(logicalName, map);
+-    return ret;
++    return map;
+   }
+ 
+   private static Collection<String> getJtServiceIds(Configuration conf,
+diff --git a/src/mapred/org/apache/hadoop/mapred/JobTrackerProxies.java b/src/mapred/org/apache/hadoop/mapred/JobTrackerProxies.java
+index efb0fe6..6f6bdb9 100644
+--- a/src/mapred/org/apache/hadoop/mapred/JobTrackerProxies.java
++++ b/src/mapred/org/apache/hadoop/mapred/JobTrackerProxies.java
+@@ -31,6 +31,7 @@ import java.util.concurrent.TimeUnit;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.hdfs.DFSUtil;
+ import org.apache.hadoop.io.Text;
+ import org.apache.hadoop.io.retry.DefaultFailoverProxyProvider;
+ import org.apache.hadoop.io.retry.FailoverProxyProvider;
+@@ -109,8 +110,9 @@ public class JobTrackerProxies {
+     if (jtAddress == null) {
+       return null;
+     }
+-    String configKey = HAUtil.MR_CLIENT_FAILOVER_PROXY_PROVIDER_KEY_PREFIX +
+-      "." + jtAddress;
++    String configKey = DFSUtil.addKeySuffixes(
++        HAUtil.MR_CLIENT_FAILOVER_PROXY_PROVIDER_KEY_PREFIX,
++        HAUtil.getLogicalName(jtAddress));
+     return (Class<FailoverProxyProvider<T>>)
+       conf.getClass(configKey, null, FailoverProxyProvider.class);
+   }
+diff --git a/src/test/org/apache/hadoop/mapred/TestHAUtil.java b/src/test/org/apache/hadoop/mapred/TestHAUtil.java
+index 97f4110..8b71974 100644
+--- a/src/test/org/apache/hadoop/mapred/TestHAUtil.java
++++ b/src/test/org/apache/hadoop/mapred/TestHAUtil.java
+@@ -67,11 +67,7 @@ public class TestHAUtil {
+ 
+   @Test
+   public void testGetHaJtRpcAddresses() throws Exception {
+-    Map<String, Map<String, InetSocketAddress>> map =
+-      getHaJtRpcAddresses(conf);
+-    assertEquals(1, map.size());
+-    
+-    Map<String, InetSocketAddress> jtMap = map.get("logicalName");
++    Map<String, InetSocketAddress> jtMap = getHaJtRpcAddresses(conf);
+     assertEquals(2, jtMap.size());
+     InetSocketAddress addr = jtMap.get("jt1");
+     assertEquals("1.2.3.4", addr.getHostName());
+-- 
+1.7.0.4
+

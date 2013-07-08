@@ -1,0 +1,91 @@
+From ca1468d1a622c244bc4e3cd361968f74bdff9dcd Mon Sep 17 00:00:00 2001
+From: Aaron Twining Myers <atm@apache.org>
+Date: Fri, 17 May 2013 00:06:56 +0000
+Subject: [PATCH 1348/1357] HADOOP-9566. Performing direct read using libhdfs sometimes raises SIGPIPE (which in turn throws SIGABRT) causing client crashes. Contributed by Colin Patrick McCabe.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1483612 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 644b27c66cc7e413a5b3bf870eaabc6c5f9b704f)
+(cherry picked from commit 50a0aad333253731299621f8d36b27b60b3612de)
+---
+ .../src/org/apache/hadoop/net/unix/DomainSocket.c  |   30 +++++++++++++++++--
+ 1 files changed, 26 insertions(+), 4 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/native/src/org/apache/hadoop/net/unix/DomainSocket.c b/hadoop-common-project/hadoop-common/src/main/native/src/org/apache/hadoop/net/unix/DomainSocket.c
+index b8056b6..89eedb7 100644
+--- a/hadoop-common-project/hadoop-common/src/main/native/src/org/apache/hadoop/net/unix/DomainSocket.c
++++ b/hadoop-common-project/hadoop-common/src/main/native/src/org/apache/hadoop/net/unix/DomainSocket.c
+@@ -16,8 +16,7 @@
+  * limitations under the License.
+  */
+ 
+-#define _GNU_SOURCE
+-
++#include "config.h"
+ #include "exception.h"
+ #include "org/apache/hadoop/io/nativeio/file_descriptor.h"
+ #include "org_apache_hadoop.h"
+@@ -31,6 +30,7 @@
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
++#include <string.h>
+ #include <sys/ioctl.h> /* for FIONREAD */
+ #include <sys/socket.h>
+ #include <sys/stat.h>
+@@ -47,6 +47,15 @@
+ #define DEFAULT_SND_TIMEO 120000
+ #define LISTEN_BACKLOG 128
+ 
++/* In Linux, you can pass the MSG_NOSIGNAL flag to send, sendto, etc. to prevent
++ * those functions from generating SIGPIPE.  HDFS-4831 for details.
++ */
++#ifdef MSG_NOSIGNAL
++#define PLATFORM_SEND_FLAGS MSG_NOSIGNAL
++#else
++#define PLATFORM_SEND_FLAGS 0
++#endif
++
+ /**
+  * Can't pass more than this number of file descriptors in a single message.
+  */
+@@ -176,6 +185,19 @@ static jthrowable setup(JNIEnv *env, int *ofd, jobject jpath, int doConnect)
+         "is %zd bytes.", sizeof(addr.sun_path) - 1);
+     goto done;
+   }
++#ifdef SO_NOSIGPIPE
++  /* On MacOS and some BSDs, SO_NOSIGPIPE will keep send and sendto from causing
++   * EPIPE.  Note: this will NOT help when using write or writev, only with
++   * send, sendto, sendmsg, etc.  See HDFS-4831.
++   */
++  ret = 1;
++  if (setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, (void *)&ret, sizeof(ret))) {
++    ret = errno;
++    jthr = newSocketException(env, ret,
++        "error setting SO_NOSIGPIPE on socket: error %s", terror(ret));
++    goto done;
++  }
++#endif
+   if (doConnect) {
+     RETRY_ON_EINTR(ret, connect(fd, 
+         (struct sockaddr*)&addr, sizeof(addr)));
+@@ -583,7 +605,7 @@ static jthrowable write_fully(JNIEnv *env, int fd, int8_t *buf, int amt)
+   int err, res;
+ 
+   while (amt > 0) {
+-    res = write(fd, buf, amt);
++    res = send(fd, buf, amt, PLATFORM_SEND_FLAGS);
+     if (res < 0) {
+       err = errno;
+       if (err == EINTR) {
+@@ -685,7 +707,7 @@ jint offset, jint length)
+       goto done;
+     }
+   }
+-  RETRY_ON_EINTR(ret, sendmsg(fd, &socketMsg, 0));
++  RETRY_ON_EINTR(ret, sendmsg(fd, &socketMsg, PLATFORM_SEND_FLAGS));
+   if (ret < 0) {
+     ret = errno;
+     jthr = newSocketException(env, ret, "sendmsg(2) error: %s", terror(ret));
+-- 
+1.7.0.4
+

@@ -1,0 +1,336 @@
+From d19965554a9a4c79662710e78ff4c155749abbd7 Mon Sep 17 00:00:00 2001
+From: Todd Lipcon <todd@cloudera.com>
+Date: Tue, 4 Sep 2012 22:54:01 -0700
+Subject: [PATCH 0482/1357] HDFS-2793. Add an admin command to trigger an edit log roll. Contributed by Todd Lipcon.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1380982 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit cd24354052e26d70f66c2d1539ea4278c552db38)
+---
+ .../java/org/apache/hadoop/hdfs/DFSClient.java     |   14 ++++++++++
+ .../apache/hadoop/hdfs/DistributedFileSystem.java  |   10 +++++++
+ .../hadoop/hdfs/protocol/ClientProtocol.java       |   12 +++++++++
+ ...ientNamenodeProtocolServerSideTranslatorPB.java |   16 +++++++++++
+ .../ClientNamenodeProtocolTranslatorPB.java        |   13 +++++++++
+ .../hadoop/hdfs/server/namenode/FSNamesystem.java  |    1 +
+ .../hdfs/server/namenode/NameNodeRpcServer.java    |    7 +++++
+ .../org/apache/hadoop/hdfs/tools/DFSAdmin.java     |   27 ++++++++++++++++++++
+ .../src/main/proto/ClientNamenodeProtocol.proto    |    9 ++++++
+ .../src/test/resources/testHDFSConf.xml            |   17 ++++++++++++
+ 10 files changed, 126 insertions(+), 0 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClient.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClient.java
+index 33f9acc..2447d7f 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClient.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClient.java
+@@ -1837,6 +1837,20 @@ public class DFSClient implements java.io.Closeable {
+       throw re.unwrapRemoteException(AccessControlException.class);
+     }
+   }
++
++  /**
++   * Rolls the edit log on the active NameNode.
++   * @return the txid of the new log segment 
++   *
++   * @see ClientProtocol#rollEdits()
++   */
++  long rollEdits() throws AccessControlException, IOException {
++    try {
++      return namenode.rollEdits();
++    } catch(RemoteException re) {
++      throw re.unwrapRemoteException(AccessControlException.class);
++    }
++  }
+   
+   /**
+    * enable/disable restore failed storage.
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DistributedFileSystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DistributedFileSystem.java
+index 5d5709c..9fedf72 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DistributedFileSystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DistributedFileSystem.java
+@@ -668,6 +668,16 @@ public class DistributedFileSystem extends FileSystem {
+   public void saveNamespace() throws AccessControlException, IOException {
+     dfs.saveNamespace();
+   }
++  
++  /**
++   * Rolls the edit log on the active NameNode.
++   * Requires super-user privileges.
++   * @see org.apache.hadoop.hdfs.protocol.ClientProtocol#rollEdits()
++   * @return the transaction ID of the newly created segment
++   */
++  public long rollEdits() throws AccessControlException, IOException {
++    return dfs.rollEdits();
++  }
+ 
+   /**
+    * enable/disable/check restoreFaileStorage
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/ClientProtocol.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/ClientProtocol.java
+index 6aadaa9..d980f44 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/ClientProtocol.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/ClientProtocol.java
+@@ -669,6 +669,18 @@ public interface ClientProtocol {
+    */
+   public void saveNamespace() throws AccessControlException, IOException;
+ 
++  
++  /**
++   * Roll the edit log.
++   * Requires superuser privileges.
++   * 
++   * @throws AccessControlException if the superuser privilege is violated
++   * @throws IOException if log roll fails
++   * @return the txid of the new segment
++   */
++  @Idempotent
++  public long rollEdits() throws AccessControlException, IOException;
++
+   /**
+    * Enable/Disable restore failed storage.
+    * <p>
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/ClientNamenodeProtocolServerSideTranslatorPB.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/ClientNamenodeProtocolServerSideTranslatorPB.java
+index 1a9d4e6..204952f 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/ClientNamenodeProtocolServerSideTranslatorPB.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/ClientNamenodeProtocolServerSideTranslatorPB.java
+@@ -105,6 +105,8 @@ import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.Report
+ import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.ReportBadBlocksResponseProto;
+ import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.RestoreFailedStorageRequestProto;
+ import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.RestoreFailedStorageResponseProto;
++import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.RollEditsRequestProto;
++import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.RollEditsResponseProto;
+ import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.SaveNamespaceRequestProto;
+ import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.SaveNamespaceResponseProto;
+ import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.SetBalancerBandwidthRequestProto;
+@@ -540,6 +542,20 @@ public class ClientNamenodeProtocolServerSideTranslatorPB implements
+     }
+ 
+   }
++  
++  @Override
++  public RollEditsResponseProto rollEdits(RpcController controller,
++      RollEditsRequestProto request) throws ServiceException {
++    try {
++      long txid = server.rollEdits();
++      return RollEditsResponseProto.newBuilder()
++          .setNewSegmentTxId(txid)
++          .build();
++    } catch (IOException e) {
++      throw new ServiceException(e);
++    }
++  }
++
+ 
+   static final RefreshNodesResponseProto VOID_REFRESHNODES_RESPONSE = 
+       RefreshNodesResponseProto.newBuilder().build();
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/ClientNamenodeProtocolTranslatorPB.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/ClientNamenodeProtocolTranslatorPB.java
+index 4f0792e..c00a7c9 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/ClientNamenodeProtocolTranslatorPB.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/ClientNamenodeProtocolTranslatorPB.java
+@@ -90,6 +90,8 @@ import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.RenewD
+ import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.RenewLeaseRequestProto;
+ import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.ReportBadBlocksRequestProto;
+ import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.RestoreFailedStorageRequestProto;
++import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.RollEditsRequestProto;
++import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.RollEditsResponseProto;
+ import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.SaveNamespaceRequestProto;
+ import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.SetBalancerBandwidthRequestProto;
+ import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.SetOwnerRequestProto;
+@@ -530,6 +532,17 @@ public class ClientNamenodeProtocolTranslatorPB implements
+       throw ProtobufHelper.getRemoteException(e);
+     }
+   }
++  
++  @Override
++  public long rollEdits() throws AccessControlException, IOException {
++    RollEditsRequestProto req = RollEditsRequestProto.getDefaultInstance();
++    try {
++      RollEditsResponseProto resp = rpcProxy.rollEdits(null, req);
++      return resp.getNewSegmentTxId();
++    } catch (ServiceException se) {
++      throw ProtobufHelper.getRemoteException(se);
++    }
++  }
+ 
+   @Override
+   public boolean restoreFailedStorage(String arg) 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+index ce8ffcb..9c811b7 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+@@ -4428,6 +4428,7 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+     writeLock();
+     try {
+       checkOperation(OperationCategory.JOURNAL);
++      checkSuperuserPrivilege();
+       if (isInSafeMode()) {
+         throw new SafeModeException("Log not rolled", safeMode);
+       }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java
+index 3ec9a44..c385bb4 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java
+@@ -704,6 +704,13 @@ class NameNodeRpcServer implements NamenodeProtocols {
+     namesystem.checkOperation(OperationCategory.UNCHECKED);
+     namesystem.saveNamespace();
+   }
++  
++  @Override // ClientProtocol
++  public long rollEdits() throws AccessControlException, IOException {
++    namesystem.checkOperation(OperationCategory.JOURNAL);
++    CheckpointSignature sig = namesystem.rollEditLog();
++    return sig.getCurSegmentTxId();
++  }
+ 
+   @Override // ClientProtocol
+   public void refreshNodes() throws IOException {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/tools/DFSAdmin.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/tools/DFSAdmin.java
+index 2112208..7c18ce8 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/tools/DFSAdmin.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/tools/DFSAdmin.java
+@@ -428,6 +428,14 @@ public class DFSAdmin extends FsShell {
+     return exitCode;
+   }
+ 
++  public int rollEdits() throws IOException {
++    DistributedFileSystem dfs = getDFS();
++    long txid = dfs.rollEdits();
++    System.out.println("Successfully rolled edit logs.");
++    System.out.println("New segment starts at txid " + txid);
++    return 0;
++  }
++  
+   /**
+    * Command to enable/disable/check restoring of failed storage replicas in the namenode.
+    * Usage: java DFSAdmin -restoreFailedStorage true|false|check
+@@ -524,6 +532,7 @@ public class DFSAdmin extends FsShell {
+       "The full syntax is: \n\n" +
+       "hadoop dfsadmin [-report] [-safemode <enter | leave | get | wait>]\n" +
+       "\t[-saveNamespace]\n" +
++      "\t[-rollEdits]\n" +
+       "\t[-restoreFailedStorage true|false|check]\n" +
+       "\t[-refreshNodes]\n" +
+       "\t[" + SetQuotaCommand.USAGE + "]\n" +
+@@ -556,6 +565,10 @@ public class DFSAdmin extends FsShell {
+     "Save current namespace into storage directories and reset edits log.\n" +
+     "\t\tRequires superuser permissions and safe mode.\n";
+ 
++    String rollEdits = "-rollEdits:\t" +
++    "Rolls the edit log.\n" +
++    "\t\tRequires superuser permissions.\n";
++    
+     String restoreFailedStorage = "-restoreFailedStorage:\t" +
+     "Set/Unset/Check flag to attempt restore of failed storage replicas if they become available.\n" +
+     "\t\tRequires superuser permissions.\n";
+@@ -637,6 +650,8 @@ public class DFSAdmin extends FsShell {
+       System.out.println(safemode);
+     } else if ("saveNamespace".equals(cmd)) {
+       System.out.println(saveNamespace);
++    } else if ("rollEdits".equals(cmd)) {
++      System.out.println(rollEdits);
+     } else if ("restoreFailedStorage".equals(cmd)) {
+       System.out.println(restoreFailedStorage);
+     } else if ("refreshNodes".equals(cmd)) {
+@@ -678,6 +693,7 @@ public class DFSAdmin extends FsShell {
+       System.out.println(report);
+       System.out.println(safemode);
+       System.out.println(saveNamespace);
++      System.out.println(rollEdits);
+       System.out.println(restoreFailedStorage);
+       System.out.println(refreshNodes);
+       System.out.println(finalizeUpgrade);
+@@ -909,6 +925,9 @@ public class DFSAdmin extends FsShell {
+     } else if ("-saveNamespace".equals(cmd)) {
+       System.err.println("Usage: java DFSAdmin"
+                          + " [-saveNamespace]");
++    } else if ("-rollEdits".equals(cmd)) {
++      System.err.println("Usage: java DFSAdmin"
++                         + " [-rollEdits]");
+     } else if ("-restoreFailedStorage".equals(cmd)) {
+       System.err.println("Usage: java DFSAdmin"
+           + " [-restoreFailedStorage true|false|check ]");
+@@ -966,6 +985,7 @@ public class DFSAdmin extends FsShell {
+       System.err.println("           [-report]");
+       System.err.println("           [-safemode enter | leave | get | wait]");
+       System.err.println("           [-saveNamespace]");
++      System.err.println("           [-rollEdits]");
+       System.err.println("           [-restoreFailedStorage true|false|check]");
+       System.err.println("           [-refreshNodes]");
+       System.err.println("           [-finalizeUpgrade]");
+@@ -1024,6 +1044,11 @@ public class DFSAdmin extends FsShell {
+         printUsage(cmd);
+         return exitCode;
+       }
++    } else if ("-rollEdits".equals(cmd)) {
++      if (argv.length != 1) {
++        printUsage(cmd);
++        return exitCode;
++      }      
+     } else if ("-restoreFailedStorage".equals(cmd)) {
+       if (argv.length != 2) {
+         printUsage(cmd);
+@@ -1107,6 +1132,8 @@ public class DFSAdmin extends FsShell {
+         setSafeMode(argv, i);
+       } else if ("-saveNamespace".equals(cmd)) {
+         exitCode = saveNamespace();
++      } else if ("-rollEdits".equals(cmd)) {
++        exitCode = rollEdits();
+       } else if ("-restoreFailedStorage".equals(cmd)) {
+         exitCode = restoreFaileStorage(argv[i]);
+       } else if ("-refreshNodes".equals(cmd)) {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/ClientNamenodeProtocol.proto b/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/ClientNamenodeProtocol.proto
+index 4fd4e26..df849db 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/ClientNamenodeProtocol.proto
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/ClientNamenodeProtocol.proto
+@@ -276,6 +276,13 @@ message SaveNamespaceRequestProto { // no parameters
+ message SaveNamespaceResponseProto { // void response
+ }
+ 
++message RollEditsRequestProto { // no parameters
++}
++
++message RollEditsResponseProto { // response
++  required uint64 newSegmentTxId = 1;
++}
++
+ message RestoreFailedStorageRequestProto {
+   required string arg = 1;
+ }
+@@ -485,6 +492,8 @@ service ClientNamenodeProtocol {
+       returns(SetSafeModeResponseProto);
+   rpc saveNamespace(SaveNamespaceRequestProto)
+       returns(SaveNamespaceResponseProto);
++  rpc rollEdits(RollEditsRequestProto)
++      returns(RollEditsResponseProto);
+   rpc restoreFailedStorage(RestoreFailedStorageRequestProto)
+       returns(RestoreFailedStorageResponseProto);
+   rpc refreshNodes(RefreshNodesRequestProto) returns(RefreshNodesResponseProto);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/resources/testHDFSConf.xml b/hadoop-hdfs-project/hadoop-hdfs/src/test/resources/testHDFSConf.xml
+index 9106114..f6ad267 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/resources/testHDFSConf.xml
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/resources/testHDFSConf.xml
+@@ -15872,6 +15872,23 @@
+       </comparators>
+     </test>
+ 
++    <!-- Test for rollEdits -->
++    <test> <!-- TESTED -->
++      <description>rollEdits: test rollEdits admin command</description>
++      <test-commands>
++        <dfs-admin-command>-fs NAMENODE -rollEdits</dfs-admin-command>
++      </test-commands>
++      <cleanup-commands>
++        <!-- no cleanup -->
++      </cleanup-commands>
++      <comparators>
++        <comparator>
++          <type>RegexpComparator</type>
++          <expected-output>New segment starts at txid \d+</expected-output>
++        </comparator>
++      </comparators>
++    </test>
++
+     <!-- Test for refreshNodes -->
+     <test> <!-- TESTED -->
+       <description>refreshNodes: to refresh the nodes</description>
+-- 
+1.7.0.4
+

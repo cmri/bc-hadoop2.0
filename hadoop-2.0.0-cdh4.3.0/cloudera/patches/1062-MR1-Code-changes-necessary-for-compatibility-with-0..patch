@@ -1,0 +1,521 @@
+From a13f4bc83c36f9bb332beba78b6544408bc85ff6 Mon Sep 17 00:00:00 2001
+From: Todd Lipcon <todd@cloudera.com>
+Date: Fri, 2 Dec 2011 15:27:56 -0800
+Subject: [PATCH 1062/1357] MR1: Code changes necessary for compatibility with 0.23 common/HDFS APIs
+
+---
+ .../org/apache/hadoop/mapred/IsolationRunner.java  |    9 +++++++
+ src/mapred/org/apache/hadoop/mapred/JobClient.java |    5 ++-
+ .../org/apache/hadoop/mapred/JobTracker.java       |   20 ++++++++++----
+ .../org/apache/hadoop/mapred/LocalJobRunner.java   |   15 +++++++++++
+ .../org/apache/hadoop/mapred/SpillRecord.java      |    2 +-
+ src/mapred/org/apache/hadoop/mapred/TaskLog.java   |    2 +-
+ .../org/apache/hadoop/mapred/TaskTracker.java      |   17 ++++++++++---
+ .../hadoop/mapreduce/security/TokenCache.java      |    4 +-
+ src/test/org/apache/hadoop/fs/TestCopyFiles.java   |    3 +-
+ src/test/org/apache/hadoop/fs/TestFileSystem.java  |    2 +-
+ .../apache/hadoop/mapred/TestMRServerPorts.java    |   26 +++++++++++--------
+ .../org/apache/hadoop/mapred/TestSubmitJob.java    |    5 ++-
+ .../org/apache/hadoop/mapred/TestTaskCommit.java   |    7 +++++
+ .../hadoop/mapreduce/security/TestTokenCache.java  |    4 +-
+ .../TestUmbilicalProtocolWithJobToken.java         |    2 +-
+ .../hadoop/test/MiniHadoopClusterManager.java      |    2 +-
+ src/test/org/apache/hadoop/tools/TestDistCh.java   |    3 +-
+ 17 files changed, 92 insertions(+), 36 deletions(-)
+
+diff --git a/src/mapred/org/apache/hadoop/mapred/IsolationRunner.java b/src/mapred/org/apache/hadoop/mapred/IsolationRunner.java
+index b4f773b..b594fd4 100644
+--- a/src/mapred/org/apache/hadoop/mapred/IsolationRunner.java
++++ b/src/mapred/org/apache/hadoop/mapred/IsolationRunner.java
+@@ -32,6 +32,7 @@ import org.apache.hadoop.util.DiskChecker.DiskErrorException;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.LocalDirAllocator;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.ipc.ProtocolSignature;
+ import org.apache.hadoop.mapred.JvmTask;
+ import org.apache.hadoop.mapreduce.split.JobSplit.TaskSplitIndex;
+ 
+@@ -53,6 +54,13 @@ public class IsolationRunner {
+       return TaskUmbilicalProtocol.versionID;
+     }
+     
++    @Override
++    public ProtocolSignature getProtocolSignature(String protocol,
++        long clientVersion, int clientMethodsHash) throws IOException {
++      // TODO Auto-generated method stub
++      return null;
++    }
++
+     public void done(TaskAttemptID taskid, JvmContext jvmContext)
+         throws IOException {
+       LOG.info("Task " + taskid + " reporting done.");
+@@ -131,6 +139,7 @@ public class IsolationRunner {
+                                        long[] sizes){
+       // NOTHING
+     }
++
+   }
+   
+   private ClassLoader makeClassLoader(JobConf conf, 
+diff --git a/src/mapred/org/apache/hadoop/mapred/JobClient.java b/src/mapred/org/apache/hadoop/mapred/JobClient.java
+index c3bcf19..ee3eba2 100644
+--- a/src/mapred/org/apache/hadoop/mapred/JobClient.java
++++ b/src/mapred/org/apache/hadoop/mapred/JobClient.java
+@@ -885,7 +885,7 @@ public class JobClient extends Configured implements MRConstants, Tool  {
+           String queue = jobCopy.getQueueName();
+           AccessControlList acl = jobSubmitClient.getQueueAdmins(queue);
+           jobCopy.set(QueueManager.toFullPropertyName(queue,
+-              QueueACL.ADMINISTER_JOBS.getAclName()), acl.getACLString());
++              QueueACL.ADMINISTER_JOBS.getAclName()), acl.getAclString());
+ 
+           // Write job file to JobTracker's fs        
+           FSDataOutputStream out = 
+@@ -927,7 +927,8 @@ public class JobClient extends Configured implements MRConstants, Tool  {
+       for(Token<?> token: credentials.getAllTokens()) {
+         if (token.getKind().toString().equals("HDFS_DELEGATION_TOKEN")) {
+           LOG.debug("Submitting with " +
+-              DFSClient.stringifyToken((Token<org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenIdentifier>) token));
++              org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenIdentifier.stringifyToken(
++                  (Token<org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenIdentifier>) token));
+         }
+       }
+     }
+diff --git a/src/mapred/org/apache/hadoop/mapred/JobTracker.java b/src/mapred/org/apache/hadoop/mapred/JobTracker.java
+index 33d93cc..099e1a9 100644
+--- a/src/mapred/org/apache/hadoop/mapred/JobTracker.java
++++ b/src/mapred/org/apache/hadoop/mapred/JobTracker.java
+@@ -71,6 +71,7 @@ import org.apache.hadoop.mapreduce.security.token.delegation.DelegationTokenIden
+ import org.apache.hadoop.mapreduce.security.token.delegation.DelegationTokenSecretManager;
+ import org.apache.hadoop.http.HttpServer;
+ import org.apache.hadoop.io.Text;
++import org.apache.hadoop.ipc.ProtocolSignature;
+ import org.apache.hadoop.ipc.RPC;
+ import org.apache.hadoop.ipc.Server;
+ import org.apache.hadoop.ipc.RPC.VersionMismatch;
+@@ -122,10 +123,7 @@ import org.mortbay.util.ajax.JSON;
+  * tracking MR jobs in a network environment.
+  *
+  *******************************************************/
+-public class JobTracker implements MRConstants, InterTrackerProtocol,
+-    JobSubmissionProtocol, TaskTrackerManager, RefreshUserMappingsProtocol,
+-    RefreshAuthorizationPolicyProtocol, AdminOperationsProtocol,
+-    JobTrackerMXBean, GetUserMappingsProtocol {
++public class JobTracker implements MRConstants, JTProtocols, JobTrackerMXBean {
+ 
+   static{
+     Configuration.addDefaultResource("mapred-default.xml");
+@@ -343,6 +341,14 @@ public class JobTracker implements MRConstants, InterTrackerProtocol,
+     }
+   }
+   
++  @Override // VersionedProtocol
++  public ProtocolSignature getProtocolSignature(String protocol,
++    long clientVersion, int clientMethodsHash) throws IOException {
++    return ProtocolSignature.getProtocolSignature(
++        this, protocol, clientVersion, clientMethodsHash);
++  }
++
++  
+   public DelegationTokenSecretManager getDelegationTokenSecretManager() {
+     return secretManager;
+   }
+@@ -2141,7 +2147,8 @@ public class JobTracker implements MRConstants, InterTrackerProtocol,
+     
+     int handlerCount = conf.getInt("mapred.job.tracker.handler.count", 10);
+     this.interTrackerServer = 
+-      RPC.getServer(this, addr.getHostName(), addr.getPort(), handlerCount, 
++      RPC.getServer(JTProtocols.class, 
++          this, addr.getHostName(), addr.getPort(), handlerCount, 
+           false, conf, secretManager);
+ 
+     // Set service-level authorization security policy
+@@ -2160,7 +2167,7 @@ public class JobTracker implements MRConstants, InterTrackerProtocol,
+     }
+ 
+     String infoAddr = 
+-      NetUtils.getServerAddress(conf, "mapred.job.tracker.info.bindAddress",
++      NetUtils2.getServerAddress(conf, "mapred.job.tracker.info.bindAddress",
+                                 "mapred.job.tracker.info.port",
+                                 "mapred.job.tracker.http.address");
+     InetSocketAddress infoSocAddr = NetUtils.createSocketAddr(infoAddr);
+@@ -5188,4 +5195,5 @@ public class JobTracker implements MRConstants, InterTrackerProtocol,
+     return map;
+   }
+   // End MXbean implementaiton
++
+ }
+diff --git a/src/mapred/org/apache/hadoop/mapred/LocalJobRunner.java b/src/mapred/org/apache/hadoop/mapred/LocalJobRunner.java
+index 85a1379..a8564ee 100644
+--- a/src/mapred/org/apache/hadoop/mapred/LocalJobRunner.java
++++ b/src/mapred/org/apache/hadoop/mapred/LocalJobRunner.java
+@@ -39,6 +39,7 @@ import org.apache.hadoop.io.DataOutputBuffer;
+ import org.apache.hadoop.io.Text;
+ import org.apache.hadoop.io.serializer.SerializationFactory;
+ import org.apache.hadoop.io.serializer.Serializer;
++import org.apache.hadoop.ipc.ProtocolSignature;
+ import org.apache.hadoop.mapreduce.split.SplitMetaInfoReader;
+ import org.apache.hadoop.mapreduce.split.JobSplit.TaskSplitMetaInfo;
+ import org.apache.hadoop.security.UserGroupInformation;
+@@ -68,6 +69,13 @@ class LocalJobRunner implements JobSubmissionProtocol {
+     return JobSubmissionProtocol.versionID;
+   }
+   
++  @Override // VersionedProtocol
++  public ProtocolSignature getProtocolSignature(String protocol,
++      long clientVersion, int clientMethodsHash) throws IOException {
++    return ProtocolSignature.getProtocolSignature(
++        this, protocol, clientVersion, clientMethodsHash);
++  }
++  
+   private class Job extends Thread
+     implements TaskUmbilicalProtocol {
+     // The job directory on the system: JobClient places job configurations here.
+@@ -103,6 +111,13 @@ class LocalJobRunner implements JobSubmissionProtocol {
+       return TaskUmbilicalProtocol.versionID;
+     }
+     
++    @Override // VersionedProtocol
++    public ProtocolSignature getProtocolSignature(String protocol,
++        long clientVersion, int clientMethodsHash) throws IOException {
++      return ProtocolSignature.getProtocolSignature(
++          this, protocol, clientVersion, clientMethodsHash);
++    }
++    
+     public Job(JobID jobid, String jobSubmitDir) throws IOException {
+       this.systemJobDir = new Path(jobSubmitDir);
+       this.systemJobFile = new Path(systemJobDir, "job.xml");
+diff --git a/src/mapred/org/apache/hadoop/mapred/SpillRecord.java b/src/mapred/org/apache/hadoop/mapred/SpillRecord.java
+index b67a7a4..3fc67c2 100644
+--- a/src/mapred/org/apache/hadoop/mapred/SpillRecord.java
++++ b/src/mapred/org/apache/hadoop/mapred/SpillRecord.java
+@@ -61,7 +61,7 @@ class SpillRecord {
+     final FileSystem rfs = FileSystem.getLocal(job).getRaw();
+     final DataInputStream in = 
+       new DataInputStream(SecureIOUtils.openForRead(
+-         new File(indexFileName.toUri().getPath()), expectedIndexOwner));
++         new File(indexFileName.toUri().getPath()), expectedIndexOwner, null));
+     try {
+       final long length = rfs.getFileStatus(indexFileName).getLen();
+       final int partitions = (int) length / MAP_OUTPUT_INDEX_RECORD_LENGTH;
+diff --git a/src/mapred/org/apache/hadoop/mapred/TaskLog.java b/src/mapred/org/apache/hadoop/mapred/TaskLog.java
+index 109e3a0..21f4c66 100644
+--- a/src/mapred/org/apache/hadoop/mapred/TaskLog.java
++++ b/src/mapred/org/apache/hadoop/mapred/TaskLog.java
+@@ -433,7 +433,7 @@ public class TaskLog {
+       bytesRemaining = end - start;
+       String owner = obtainLogDirOwner(taskid);
+       file = SecureIOUtils.openForRead(new File(fileDetail.location, kind.toString()), 
+-          owner);
++          owner, null);
+       // skip upto start
+       long pos = 0;
+       while (pos < start) {
+diff --git a/src/mapred/org/apache/hadoop/mapred/TaskTracker.java b/src/mapred/org/apache/hadoop/mapred/TaskTracker.java
+index a5ba0f5..904bafe 100644
+--- a/src/mapred/org/apache/hadoop/mapred/TaskTracker.java
++++ b/src/mapred/org/apache/hadoop/mapred/TaskTracker.java
+@@ -74,6 +74,7 @@ import org.apache.hadoop.http.HttpServer;
+ import org.apache.hadoop.io.IntWritable;
+ import org.apache.hadoop.io.nativeio.NativeIO;
+ import org.apache.hadoop.io.SecureIOUtils;
++import org.apache.hadoop.ipc.ProtocolSignature;
+ import org.apache.hadoop.ipc.RPC;
+ import org.apache.hadoop.ipc.RemoteException;
+ import org.apache.hadoop.ipc.Server;
+@@ -757,6 +758,13 @@ public class TaskTracker implements MRConstants, TaskUmbilicalProtocol,
+     }
+   }
+ 
++  @Override // VersionedProtocol
++  public ProtocolSignature getProtocolSignature(String protocol,
++    long clientVersion, int clientMethodsHash) throws IOException {
++    return ProtocolSignature.getProtocolSignature(
++        this, protocol, clientVersion, clientMethodsHash);
++  }
++
+   /**
+    * Delete all of the user directories.
+    * @param conf the TT configuration
+@@ -895,7 +903,7 @@ public class TaskTracker implements MRConstants, TaskUmbilicalProtocol,
+     
+     // bind address
+     String address = 
+-      NetUtils.getServerAddress(fConf,
++      NetUtils2.getServerAddress(fConf,
+                                 "mapred.task.tracker.report.bindAddress", 
+                                 "mapred.task.tracker.report.port", 
+                                 "mapred.task.tracker.report.address");
+@@ -910,7 +918,8 @@ public class TaskTracker implements MRConstants, TaskUmbilicalProtocol,
+                        maxMapSlots : maxReduceSlots;
+     //set the num handlers to max*2 since canCommit may wait for the duration
+     //of a heartbeat RPC
+-    this.taskReportServer = RPC.getServer(this, bindAddress,
++    this.taskReportServer = RPC.getServer(TaskUmbilicalProtocol.class,
++        this, bindAddress,
+         tmpPort, 2 * max, false, this.fConf, this.jobTokenSecretManager);
+ 
+     // Set service-level authorization security policy
+@@ -1575,7 +1584,7 @@ public class TaskTracker implements MRConstants, TaskUmbilicalProtocol,
+     aclsManager = new ACLsManager(conf, new JobACLsManager(conf), null);
+     this.jobTrackAddr = JobTracker.getAddress(conf);
+     String infoAddr = 
+-      NetUtils.getServerAddress(conf,
++      NetUtils2.getServerAddress(conf,
+                                 "tasktracker.http.bindAddress", 
+                                 "tasktracker.http.port",
+                                 "mapred.task.tracker.http.address");
+@@ -4019,7 +4028,7 @@ public class TaskTracker implements MRConstants, TaskUmbilicalProtocol,
+          */
+         //open the map-output file
+         mapOutputIn = SecureIOUtils.openForRead(
+-            new File(mapOutputFileName.toUri().getPath()), runAsUserName);
++            new File(mapOutputFileName.toUri().getPath()), runAsUserName, null);
+ 
+         // readahead if possible
+         if (tracker.manageOsCacheInShuffle && info.partLength > 0) {
+diff --git a/src/mapred/org/apache/hadoop/mapreduce/security/TokenCache.java b/src/mapred/org/apache/hadoop/mapreduce/security/TokenCache.java
+index 25ac34a..eb297f2 100644
+--- a/src/mapred/org/apache/hadoop/mapreduce/security/TokenCache.java
++++ b/src/mapred/org/apache/hadoop/mapreduce/security/TokenCache.java
+@@ -35,7 +35,7 @@ import org.apache.hadoop.mapred.JobConf;
+ import org.apache.hadoop.mapred.JobTracker;
+ import org.apache.hadoop.mapreduce.security.token.JobTokenIdentifier;
+ import org.apache.hadoop.security.Credentials;
+-import org.apache.hadoop.security.KerberosName;
++import org.apache.hadoop.security.HadoopKerberosName;
+ import org.apache.hadoop.security.SecurityUtil;
+ import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.security.token.Token;
+@@ -84,7 +84,7 @@ public class TokenCache {
+                                                Configuration conf
+                                                ) throws IOException {
+     // get jobtracker principal id (for the renewer)
+-    KerberosName jtKrbName = new KerberosName(conf.get(JobTracker.JT_USER_NAME, ""));
++    HadoopKerberosName jtKrbName = new HadoopKerberosName(conf.get(JobTracker.JT_USER_NAME, ""));
+     String delegTokenRenewer = jtKrbName.getShortName();
+     boolean readFile = true;
+     for(Path p: ps) {
+diff --git a/src/test/org/apache/hadoop/fs/TestCopyFiles.java b/src/test/org/apache/hadoop/fs/TestCopyFiles.java
+index 805d8f1..6654c24 100644
+--- a/src/test/org/apache/hadoop/fs/TestCopyFiles.java
++++ b/src/test/org/apache/hadoop/fs/TestCopyFiles.java
+@@ -53,7 +53,8 @@ public class TestCopyFiles extends TestCase {
+     ((Log4JLogger)LogFactory.getLog("org.apache.hadoop.hdfs.StateChange")
+         ).getLogger().setLevel(Level.OFF);
+     ((Log4JLogger)DataNode.LOG).getLogger().setLevel(Level.OFF);
+-    ((Log4JLogger)FSNamesystem.LOG).getLogger().setLevel(Level.OFF);
++    ((Log4JLogger)LogFactory.getLog(FSNamesystem.class)
++        ).getLogger().setLevel(Level.OFF);
+     ((Log4JLogger)DistCp.LOG).getLogger().setLevel(Level.ALL);
+   }
+   
+diff --git a/src/test/org/apache/hadoop/fs/TestFileSystem.java b/src/test/org/apache/hadoop/fs/TestFileSystem.java
+index a7fcba7..006f959 100644
+--- a/src/test/org/apache/hadoop/fs/TestFileSystem.java
++++ b/src/test/org/apache/hadoop/fs/TestFileSystem.java
+@@ -606,7 +606,7 @@ public class TestFileSystem extends TestCase {
+     // Different URIs should result in different FS instances
+     assertNotSame(fsWithAuto, fsWithoutAuto);
+ 
+-    FileSystem.CACHE.closeAll(null, true);
++    FileSystem.CACHE.closeAll(true);
+     assertEquals(1, closed.size());
+     assertTrue(closed.contains(fsWithAuto));
+ 
+diff --git a/src/test/org/apache/hadoop/mapred/TestMRServerPorts.java b/src/test/org/apache/hadoop/mapred/TestMRServerPorts.java
+index 77211b2..3e5e3ba 100644
+--- a/src/test/org/apache/hadoop/mapred/TestMRServerPorts.java
++++ b/src/test/org/apache/hadoop/mapred/TestMRServerPorts.java
+@@ -36,6 +36,10 @@ import org.apache.hadoop.fs.FileSystem;
+  * a free port and start on it.
+  */
+ public class TestMRServerPorts extends TestCase {
++  
++  private static final String NAME_NODE_HOST = "localhost:";
++  private static final String NAME_NODE_HTTP_HOST = "0.0.0.0:";
++
+   TestHDFSServerPorts hdfs = new TestHDFSServerPorts();
+ 
+   // Runs the JT in a separate thread
+@@ -76,11 +80,11 @@ public class TestMRServerPorts extends TestCase {
+   
+   private void setDataNodePorts(Configuration conf) {
+     conf.set("dfs.datanode.address", 
+-        TestHDFSServerPorts.NAME_NODE_HOST + "0");
++        NAME_NODE_HOST + "0");
+     conf.set("dfs.datanode.http.address", 
+-        TestHDFSServerPorts.NAME_NODE_HTTP_HOST + "0");
++        NAME_NODE_HTTP_HOST + "0");
+     conf.set("dfs.datanode.ipc.address", 
+-        TestHDFSServerPorts.NAME_NODE_HOST + "0");
++        NAME_NODE_HOST + "0");
+   }
+ 
+   /**
+@@ -134,21 +138,21 @@ public class TestMRServerPorts extends TestCase {
+       conf2.set("mapred.job.tracker",
+                 FileSystem.getDefaultUri(hdfs.getConfig()).toString());
+       conf2.set("mapred.job.tracker.http.address",
+-        TestHDFSServerPorts.NAME_NODE_HTTP_HOST + 0);
++        NAME_NODE_HTTP_HOST + 0);
+       boolean started = canStartJobTracker(conf2);
+       assertFalse(started); // should fail
+ 
+       // bind http server to the same port as name-node
+-      conf2.set("mapred.job.tracker", TestHDFSServerPorts.NAME_NODE_HOST + 0);
++      conf2.set("mapred.job.tracker", NAME_NODE_HOST + 0);
+       conf2.set("mapred.job.tracker.http.address",
+         hdfs.getConfig().get("dfs.http.address"));
+       started = canStartJobTracker(conf2);
+       assertFalse(started); // should fail again
+ 
+       // both ports are different from the name-node ones
+-      conf2.set("mapred.job.tracker", TestHDFSServerPorts.NAME_NODE_HOST + 0);
++      conf2.set("mapred.job.tracker", NAME_NODE_HOST + 0);
+       conf2.set("mapred.job.tracker.http.address",
+-        TestHDFSServerPorts.NAME_NODE_HTTP_HOST + 0);
++        NAME_NODE_HTTP_HOST + 0);
+       started = canStartJobTracker(conf2);
+       assertTrue(started); // should start now
+ 
+@@ -179,13 +183,13 @@ public class TestMRServerPorts extends TestCase {
+       conf2.set("mapred.task.tracker.report.address",
+                 FileSystem.getDefaultUri(hdfs.getConfig()).toString());
+       conf2.set("mapred.task.tracker.http.address",
+-        TestHDFSServerPorts.NAME_NODE_HTTP_HOST + 0);
++        NAME_NODE_HTTP_HOST + 0);
+       boolean started = canStartTaskTracker(conf2);
+       assertFalse(started); // should fail
+ 
+       // bind http server to the same port as name-node
+       conf2.set("mapred.task.tracker.report.address",
+-        TestHDFSServerPorts.NAME_NODE_HOST + 0);
++        NAME_NODE_HOST + 0);
+       conf2.set("mapred.task.tracker.http.address",
+         hdfs.getConfig().get("dfs.http.address"));
+       started = canStartTaskTracker(conf2);
+@@ -193,9 +197,9 @@ public class TestMRServerPorts extends TestCase {
+ 
+       // both ports are different from the name-node ones
+       conf2.set("mapred.task.tracker.report.address",
+-        TestHDFSServerPorts.NAME_NODE_HOST + 0);
++        NAME_NODE_HOST + 0);
+       conf2.set("mapred.task.tracker.http.address",
+-        TestHDFSServerPorts.NAME_NODE_HTTP_HOST + 0);
++        NAME_NODE_HTTP_HOST + 0);
+       started = canStartTaskTracker(conf2);
+       assertTrue(started); // should start now
+     } finally {
+diff --git a/src/test/org/apache/hadoop/mapred/TestSubmitJob.java b/src/test/org/apache/hadoop/mapred/TestSubmitJob.java
+index 570ba44..a623839 100644
+--- a/src/test/org/apache/hadoop/mapred/TestSubmitJob.java
++++ b/src/test/org/apache/hadoop/mapred/TestSubmitJob.java
+@@ -265,7 +265,7 @@ public class TestSubmitJob extends TestCase {
+         String path = new URI(jt.getSystemDir()).getPath();
+         LOG.info("Try listing the mapred-system-dir as the user ("
+             + user2.getUserName() + ")");
+-        client.getListing(path, HdfsFileStatus.EMPTY_NAME);
++        client.getListing(path, HdfsFileStatus.EMPTY_NAME, false);
+         fail("JobTracker system dir is accessible to others");
+       } catch (IOException ioe) {
+         assertTrue(ioe.toString(),
+@@ -278,7 +278,8 @@ public class TestSubmitJob extends TestCase {
+       try {
+         LOG.info("Try accessing the job folder for job " + id + " as the user ("
+             + user2.getUserName() + ")");
+-        client.getListing(jobSubmitDirpath.toUri().getPath(), HdfsFileStatus.EMPTY_NAME);
++        client.getListing(jobSubmitDirpath.toUri().getPath(),
++            HdfsFileStatus.EMPTY_NAME, false);
+         fail("User's staging folder is accessible to others");
+       } catch (IOException ioe) {
+         assertTrue(ioe.toString(),
+diff --git a/src/test/org/apache/hadoop/mapred/TestTaskCommit.java b/src/test/org/apache/hadoop/mapred/TestTaskCommit.java
+index 94164a0..cd1112d 100644
+--- a/src/test/org/apache/hadoop/mapred/TestTaskCommit.java
++++ b/src/test/org/apache/hadoop/mapred/TestTaskCommit.java
+@@ -25,6 +25,7 @@ import org.apache.hadoop.fs.FileUtil;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.io.BytesWritable;
+ import org.apache.hadoop.io.Text;
++import org.apache.hadoop.ipc.ProtocolSignature;
+ import org.apache.hadoop.mapred.SortedRanges.Range;
+ import org.apache.hadoop.mapreduce.TaskType;
+ 
+@@ -172,6 +173,12 @@ public class TestTaskCommit extends HadoopTestCase {
+     }
+ 
+     @Override
++    public ProtocolSignature getProtocolSignature(String protocol,
++        long clientVersion, int clientMethodsHash) throws IOException {
++      return null;
++    }
++
++    @Override
+     public void updatePrivateDistributedCacheSizes(
+         org.apache.hadoop.mapreduce.JobID jobId, long[] sizes)
+         throws IOException {
+diff --git a/src/test/org/apache/hadoop/mapreduce/security/TestTokenCache.java b/src/test/org/apache/hadoop/mapreduce/security/TestTokenCache.java
+index 98a420d..a1211a5 100644
+--- a/src/test/org/apache/hadoop/mapreduce/security/TestTokenCache.java
++++ b/src/test/org/apache/hadoop/mapreduce/security/TestTokenCache.java
+@@ -42,6 +42,7 @@ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hdfs.MiniDFSCluster;
+ import org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenIdentifier;
+ import org.apache.hadoop.hdfs.server.namenode.NameNode;
++import org.apache.hadoop.hdfs.server.namenode.NameNodeAdapter;
+ import org.apache.hadoop.io.IntWritable;
+ import org.apache.hadoop.io.NullWritable;
+ import org.apache.hadoop.io.Text;
+@@ -149,8 +150,7 @@ public class TestTokenCache {
+     
+     createTokenFileJson();
+     verifySecretKeysInJSONFile();
+-    dfsCluster.getNameNode().getNamesystem()
+-				.getDelegationTokenSecretManager().startThreads();
++    NameNodeAdapter.getDtSecretManager(dfsCluster.getNamesystem()).startThreads();
+     FileSystem fs = dfsCluster.getFileSystem();
+     
+     p1 = new Path("file1");
+diff --git a/src/test/org/apache/hadoop/mapreduce/security/TestUmbilicalProtocolWithJobToken.java b/src/test/org/apache/hadoop/mapreduce/security/TestUmbilicalProtocolWithJobToken.java
+index f6a1bcd..89fca12 100644
+--- a/src/test/org/apache/hadoop/mapreduce/security/TestUmbilicalProtocolWithJobToken.java
++++ b/src/test/org/apache/hadoop/mapreduce/security/TestUmbilicalProtocolWithJobToken.java
+@@ -78,7 +78,7 @@ public class TestUmbilicalProtocolWithJobToken {
+         TaskUmbilicalProtocol.versionID);
+ 
+     JobTokenSecretManager sm = new JobTokenSecretManager();
+-    final Server server = RPC.getServer(mockTT,
++    final Server server = RPC.getServer(TaskUmbilicalProtocol.class, mockTT,
+         ADDRESS, 0, 5, true, conf, sm);
+ 
+     server.start();
+diff --git a/src/test/org/apache/hadoop/test/MiniHadoopClusterManager.java b/src/test/org/apache/hadoop/test/MiniHadoopClusterManager.java
+index e97acd6..081feeb 100644
+--- a/src/test/org/apache/hadoop/test/MiniHadoopClusterManager.java
++++ b/src/test/org/apache/hadoop/test/MiniHadoopClusterManager.java
+@@ -35,7 +35,7 @@ import org.apache.commons.cli.ParseException;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.hdfs.MiniDFSCluster;
+-import org.apache.hadoop.hdfs.server.common.HdfsConstants.StartupOption;
++import org.apache.hadoop.hdfs.server.common.HdfsServerConstants.StartupOption;
+ import org.apache.hadoop.mapred.JobConf;
+ import org.apache.hadoop.mapred.MiniMRCluster;
+ import org.mortbay.util.ajax.JSON;
+diff --git a/src/test/org/apache/hadoop/tools/TestDistCh.java b/src/test/org/apache/hadoop/tools/TestDistCh.java
+index ac7dba2..4ec3a9f 100644
+--- a/src/test/org/apache/hadoop/tools/TestDistCh.java
++++ b/src/test/org/apache/hadoop/tools/TestDistCh.java
+@@ -48,7 +48,8 @@ public class TestDistCh extends junit.framework.TestCase {
+     ((Log4JLogger)LogFactory.getLog("org.apache.hadoop.hdfs.StateChange")
+         ).getLogger().setLevel(Level.OFF);
+     ((Log4JLogger)DataNode.LOG).getLogger().setLevel(Level.OFF);
+-    ((Log4JLogger)FSNamesystem.LOG).getLogger().setLevel(Level.OFF);
++    ((Log4JLogger)LogFactory.getLog(FSNamesystem.class)
++        ).getLogger().setLevel(Level.OFF);
+     ((Log4JLogger)TaskTracker.LOG).getLogger().setLevel(Level.OFF);
+   }
+ 
+-- 
+1.7.0.4
+

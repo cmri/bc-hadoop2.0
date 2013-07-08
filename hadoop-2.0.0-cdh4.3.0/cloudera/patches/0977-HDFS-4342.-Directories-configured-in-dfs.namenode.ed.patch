@@ -1,0 +1,302 @@
+From 04c70ad4c7b6d1f38c2f51ef1b26ce3e8221ed35 Mon Sep 17 00:00:00 2001
+From: Stephen Chu <schu@cloudera.com>
+Date: Sun, 24 Mar 2013 21:56:22 -0700
+Subject: [PATCH 0977/1357] HDFS-4342. Directories configured in dfs.namenode.edits.dir.required but not in dfs.namenode.edits.dir are silently ignored.  Contributed by Arpit Agarwal
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1445006 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 160c4ad993acdb035e5d8b5e02d0b70ef4f6fb3a)
+---
+ .../java/org/apache/hadoop/hdfs/DFSConfigKeys.java |    1 +
+ .../hadoop/hdfs/server/namenode/FSNamesystem.java  |   88 +++++++++++++-------
+ .../hadoop/hdfs/server/namenode/NameNode.java      |   28 +++++-
+ .../hdfs/server/namenode/TestNameEditsConfigs.java |   82 ++++++++++++++++++
+ 4 files changed, 162 insertions(+), 37 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+index e260a53..db6f929 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+@@ -216,6 +216,7 @@ public class DFSConfigKeys extends CommonConfigurationKeys {
+   public static final String  DFS_NAMENODE_SHARED_EDITS_DIR_KEY = "dfs.namenode.shared.edits.dir";
+   public static final String  DFS_NAMENODE_EDITS_PLUGIN_PREFIX = "dfs.namenode.edits.journal-plugin";
+   public static final String  DFS_NAMENODE_EDITS_DIR_REQUIRED_KEY = "dfs.namenode.edits.dir.required";
++  public static final String  DFS_NAMENODE_EDITS_DIR_DEFAULT = "file:///tmp/hadoop/dfs/name";
+   public static final String  DFS_CLIENT_READ_PREFETCH_SIZE_KEY = "dfs.client.read.prefetch.size"; 
+   public static final String  DFS_CLIENT_RETRY_WINDOW_BASE= "dfs.client.retry.window.base";
+   public static final String  DFS_METRICS_SESSION_ID_KEY = "dfs.metrics.session-id";
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+index f5269e2..8ad4104 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+@@ -126,6 +126,7 @@ import org.apache.hadoop.fs.permission.FsAction;
+ import org.apache.hadoop.fs.permission.FsPermission;
+ import org.apache.hadoop.fs.permission.PermissionStatus;
+ import org.apache.hadoop.ha.ServiceFailedException;
++import org.apache.hadoop.hdfs.DFSConfigKeys;
+ import org.apache.hadoop.hdfs.DFSUtil;
+ import org.apache.hadoop.hdfs.HAUtil;
+ import org.apache.hadoop.hdfs.HdfsConfiguration;
+@@ -380,51 +381,73 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+   }
+   
+   /**
+-
+-  /**
+-   * Instantiates an FSNamesystem loaded from the image and edits
+-   * directories specified in the passed Configuration.
+-   * 
+-   * @param conf the Configuration which specifies the storage directories
+-   *             from which to load
+-   * @return an FSNamesystem which contains the loaded namespace
+-   * @throws IOException if loading fails
++   * Check the supplied configuration for correctness.
++   * @param conf Supplies the configuration to validate.
++   * @throws IOException if the configuration could not be queried.
++   * @throws IllegalArgumentException if the configuration is invalid.
+    */
+-  public static FSNamesystem loadFromDisk(Configuration conf)
++  private static void checkConfiguration(Configuration conf)
+       throws IOException {
+-    Collection<URI> namespaceDirs = FSNamesystem.getNamespaceDirs(conf);
+-    List<URI> namespaceEditsDirs = 
+-      FSNamesystem.getNamespaceEditsDirs(conf);
+-    return loadFromDisk(conf, namespaceDirs, namespaceEditsDirs);
+-  }
+ 
+-  /**
+-   * Instantiates an FSNamesystem loaded from the image and edits
+-   * directories passed.
+-   * 
+-   * @param conf the Configuration which specifies the storage directories
+-   *             from which to load
+-   * @param namespaceDirs directories to load the fsimages
+-   * @param namespaceEditsDirs directories to load the edits from
+-   * @return an FSNamesystem which contains the loaded namespace
+-   * @throws IOException if loading fails
+-   */
+-  public static FSNamesystem loadFromDisk(Configuration conf,
+-      Collection<URI> namespaceDirs, List<URI> namespaceEditsDirs)
+-      throws IOException {
++    final Collection<URI> namespaceDirs =
++        FSNamesystem.getNamespaceDirs(conf);
++    final Collection<URI> editsDirs =
++        FSNamesystem.getNamespaceEditsDirs(conf);
++    final Collection<URI> requiredEditsDirs =
++        FSNamesystem.getRequiredNamespaceEditsDirs(conf);
++    final Collection<URI> sharedEditsDirs =
++        FSNamesystem.getSharedEditsDirs(conf);
++
++    for (URI u : requiredEditsDirs) {
++      if (u.toString().compareTo(
++              DFSConfigKeys.DFS_NAMENODE_EDITS_DIR_DEFAULT) == 0) {
++        continue;
++      }
++
++      // Each required directory must also be in editsDirs or in
++      // sharedEditsDirs.
++      if (!editsDirs.contains(u) &&
++          !sharedEditsDirs.contains(u)) {
++        throw new IllegalArgumentException(
++            "Required edits directory " + u.toString() + " not present in " +
++            DFSConfigKeys.DFS_NAMENODE_EDITS_DIR_KEY + ". " +
++            DFSConfigKeys.DFS_NAMENODE_EDITS_DIR_KEY + "=" +
++            editsDirs.toString() + "; " +
++            DFSConfigKeys.DFS_NAMENODE_EDITS_DIR_REQUIRED_KEY + "=" +
++            requiredEditsDirs.toString() + ". " +
++            DFSConfigKeys.DFS_NAMENODE_SHARED_EDITS_DIR_KEY + "=" +
++            sharedEditsDirs.toString() + ".");
++      }
++    }
+ 
+     if (namespaceDirs.size() == 1) {
+       LOG.warn("Only one image storage directory ("
+           + DFS_NAMENODE_NAME_DIR_KEY + ") configured. Beware of dataloss"
+           + " due to lack of redundant storage directories!");
+     }
+-    if (namespaceEditsDirs.size() == 1) {
++    if (editsDirs.size() == 1) {
+       LOG.warn("Only one namespace edits storage directory ("
+           + DFS_NAMENODE_EDITS_DIR_KEY + ") configured. Beware of dataloss"
+           + " due to lack of redundant storage directories!");
+     }
++  }
++
++  /**
++   * Instantiates an FSNamesystem loaded from the image and edits
++   * directories specified in the passed Configuration.
++   *
++   * @param conf the Configuration which specifies the storage directories
++   *             from which to load
++   * @return an FSNamesystem which contains the loaded namespace
++   * @throws IOException if loading fails
++   */
++  public static FSNamesystem loadFromDisk(Configuration conf)
++      throws IOException {
+ 
+-    FSImage fsImage = new FSImage(conf, namespaceDirs, namespaceEditsDirs);
++    checkConfiguration(conf);
++    FSImage fsImage = new FSImage(conf,
++        FSNamesystem.getNamespaceDirs(conf),
++        FSNamesystem.getNamespaceEditsDirs(conf));
+     FSNamesystem namesystem = new FSNamesystem(conf, fsImage);
+     StartupOption startOpt = NameNode.getStartupOption(conf);
+     if (startOpt == StartupOption.RECOVER) {
+@@ -870,7 +893,8 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+           "\n\t\t- use Backup Node as a persistent and up-to-date storage " +
+           "of the file system meta-data.");
+     } else if (dirNames.isEmpty()) {
+-      dirNames = Collections.singletonList("file:///tmp/hadoop/dfs/name");
++      dirNames = Collections.singletonList(
++          DFSConfigKeys.DFS_NAMENODE_EDITS_DIR_DEFAULT);
+     }
+     return Util.stringCollectionAsURIs(dirNames);
+   }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNode.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNode.java
+index 9144e11..c706fa6 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNode.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNode.java
+@@ -78,6 +78,7 @@ import org.apache.hadoop.util.ServicePlugin;
+ import org.apache.hadoop.util.StringUtils;
+ 
+ import com.google.common.annotations.VisibleForTesting;
++import com.google.common.base.Joiner;
+ import com.google.common.base.Preconditions;
+ import com.google.common.collect.Lists;
+ 
+@@ -776,6 +777,26 @@ public class NameNode {
+   }
+ 
+   /**
++   * Clone the supplied configuration but remove the shared edits dirs.
++   *
++   * @param conf Supplies the original configuration.
++   * @return Cloned configuration without the shared edit dirs.
++   * @throws IOException on failure to generate the configuration.
++   */
++  private static Configuration getConfigurationWithoutSharedEdits(
++      Configuration conf)
++      throws IOException {
++    List<URI> editsDirs = FSNamesystem.getNamespaceEditsDirs(conf, false);
++    String editsDirsString = Joiner.on(",").join(editsDirs);
++
++    Configuration confWithoutShared = new Configuration(conf);
++    confWithoutShared.unset(DFSConfigKeys.DFS_NAMENODE_SHARED_EDITS_DIR_KEY);
++    confWithoutShared.setStrings(DFSConfigKeys.DFS_NAMENODE_EDITS_DIR_KEY,
++        editsDirsString);
++    return confWithoutShared;
++  }
++
++  /**
+    * Format a new shared edits dir and copy in enough edit log segments so that
+    * the standby NN can start up.
+    * 
+@@ -804,11 +825,8 @@ public class NameNode {
+ 
+     NNStorage existingStorage = null;
+     try {
+-      Configuration confWithoutShared = new Configuration(conf);
+-      confWithoutShared.unset(DFSConfigKeys.DFS_NAMENODE_SHARED_EDITS_DIR_KEY);
+-      FSNamesystem fsns = FSNamesystem.loadFromDisk(confWithoutShared,
+-          FSNamesystem.getNamespaceDirs(conf),
+-          FSNamesystem.getNamespaceEditsDirs(conf, false));
++      FSNamesystem fsns =
++          FSNamesystem.loadFromDisk(getConfigurationWithoutSharedEdits(conf));
+       
+       existingStorage = fsns.getFSImage().getStorage();
+       NamespaceInfo nsInfo = existingStorage.getNamespaceInfo();
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestNameEditsConfigs.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestNameEditsConfigs.java
+index 70f5b57..1ad7504 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestNameEditsConfigs.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestNameEditsConfigs.java
+@@ -320,6 +320,88 @@ public class TestNameEditsConfigs {
+   }
+ 
+   /**
++   * Test edits.dir.required configuration options.
++   * 1. Directory present in dfs.namenode.edits.dir.required but not in
++   *    dfs.namenode.edits.dir. Expected to fail.
++   * 2. Directory present in both dfs.namenode.edits.dir.required and
++   *    dfs.namenode.edits.dir. Expected to succeed.
++   * 3. Directory present only in dfs.namenode.edits.dir. Expected to
++   *    succeed.
++   */
++  @Test
++  public void testNameEditsRequiredConfigs() throws IOException {
++    MiniDFSCluster cluster = null;
++    File nameAndEditsDir = new File(base_dir, "name_and_edits");
++    File nameAndEditsDir2 = new File(base_dir, "name_and_edits2");
++
++    // 1
++    // Bad configuration. Add a directory to dfs.namenode.edits.dir.required
++    // without adding it to dfs.namenode.edits.dir.
++    try {
++      Configuration conf = new HdfsConfiguration();
++      conf.set(
++          DFSConfigKeys.DFS_NAMENODE_EDITS_DIR_REQUIRED_KEY,
++          nameAndEditsDir2.toURI().toString());
++      conf.set(
++          DFSConfigKeys.DFS_NAMENODE_EDITS_DIR_KEY,
++          nameAndEditsDir.toURI().toString());
++      cluster = new MiniDFSCluster.Builder(conf)
++          .numDataNodes(NUM_DATA_NODES)
++          .manageNameDfsDirs(false)
++          .build();
++      fail("Successfully started cluster but should not have been able to.");
++    } catch (IllegalArgumentException iae) { // expect to fail
++      LOG.info("EXPECTED: cluster start failed due to bad configuration" + iae);
++    } finally {
++      if (cluster != null) {
++        cluster.shutdown();
++      }
++      cluster = null;
++    }
++
++    // 2
++    // Good configuration. Add a directory to both dfs.namenode.edits.dir.required
++    // and dfs.namenode.edits.dir.
++    try {
++      Configuration conf = new HdfsConfiguration();
++      conf.setStrings(
++          DFSConfigKeys.DFS_NAMENODE_EDITS_DIR_KEY,
++          nameAndEditsDir.toURI().toString(),
++          nameAndEditsDir2.toURI().toString());
++      conf.set(
++          DFSConfigKeys.DFS_NAMENODE_EDITS_DIR_REQUIRED_KEY,
++          nameAndEditsDir2.toURI().toString());
++      cluster = new MiniDFSCluster.Builder(conf)
++          .numDataNodes(NUM_DATA_NODES)
++          .manageNameDfsDirs(false)
++          .build();
++    } finally {
++      if (cluster != null) {
++        cluster.shutdown();
++      }
++    }
++
++    // 3
++    // Good configuration. Adds a directory to dfs.namenode.edits.dir but not to
++    // dfs.namenode.edits.dir.required.
++    try {
++      Configuration conf = new HdfsConfiguration();
++      conf.setStrings(
++          DFSConfigKeys.DFS_NAMENODE_EDITS_DIR_KEY,
++          nameAndEditsDir.toURI().toString(),
++          nameAndEditsDir2.toURI().toString());
++      cluster = new MiniDFSCluster.Builder(conf)
++          .numDataNodes(NUM_DATA_NODES)
++          .manageNameDfsDirs(false)
++          .build();
++    } finally {
++      if (cluster != null) {
++        cluster.shutdown();
++      }
++    }
++  }
++
++  /**
+    * Test various configuration options of dfs.namenode.name.dir and dfs.namenode.edits.dir
+    * This test tries to simulate failure scenarios.
+    * 1. Start cluster with shared name and edits dir
+-- 
+1.7.0.4
+

@@ -1,0 +1,111 @@
+From 35520bd5efb02e2f7c87d210b70a403c4d3bed3b Mon Sep 17 00:00:00 2001
+From: Suresh Srinivas <suresh@apache.org>
+Date: Wed, 17 Oct 2012 18:36:32 +0000
+Subject: [PATCH 0569/1357] HADOOP-8900. BuiltInGzipDecompressor throws IOException - stored gzip size doesn't match decompressed size. Contributed by Slavik Krassovsky.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1399377 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 3d6b546e1ca8e845b7ea8adcd8def88f70b50546)
+---
+ .../io/compress/zlib/BuiltInGzipDecompressor.java  |    4 +-
+ .../org/apache/hadoop/io/compress/TestCodec.java   |   49 ++++++++++++++++++++
+ .../org/apache/hadoop/io/file/tfile/TestVLong.java |    2 +-
+ 3 files changed, 52 insertions(+), 3 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/compress/zlib/BuiltInGzipDecompressor.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/compress/zlib/BuiltInGzipDecompressor.java
+index 1e5525e..efe4828 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/compress/zlib/BuiltInGzipDecompressor.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/compress/zlib/BuiltInGzipDecompressor.java
+@@ -385,7 +385,7 @@ public class BuiltInGzipDecompressor implements Decompressor {
+       copyBytesToLocal(n);       // modifies userBufLen, etc.
+       if (localBufOff >= 4) {    // should be strictly ==
+         long inputSize = readUIntLE(localBuf, 0);
+-        if (inputSize != (inflater.getBytesWritten() & 0xffffffff)) {
++        if (inputSize != (inflater.getBytesWritten() & 0xffffffffL)) {
+           throw new IOException(
+             "stored gzip size doesn't match decompressed size");
+         }
+@@ -566,7 +566,7 @@ public class BuiltInGzipDecompressor implements Decompressor {
+     return ((((long)(b[off+3] & 0xff) << 24) |
+              ((long)(b[off+2] & 0xff) << 16) |
+              ((long)(b[off+1] & 0xff) <<  8) |
+-             ((long)(b[off]   & 0xff)      )) & 0xffffffff);
++             ((long)(b[off]   & 0xff)      )) & 0xffffffffL);
+   }
+ 
+ }
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/compress/TestCodec.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/compress/TestCodec.java
+index 8254477..70f0cd2 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/compress/TestCodec.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/compress/TestCodec.java
+@@ -673,6 +673,55 @@ public class TestCodec {
+     }
+   }
+ 
++  @Test
++  public void testGzipLongOverflow() throws IOException {
++    LOG.info("testGzipLongOverflow");
++
++    // Don't use native libs for this test.
++    Configuration conf = new Configuration();
++    conf.setBoolean(CommonConfigurationKeys.IO_NATIVE_LIB_AVAILABLE_KEY, false);
++    assertFalse("ZlibFactory is using native libs against request",
++        ZlibFactory.isNativeZlibLoaded(conf));
++
++    // Ensure that the CodecPool has a BuiltInZlibInflater in it.
++    Decompressor zlibDecompressor = ZlibFactory.getZlibDecompressor(conf);
++    assertNotNull("zlibDecompressor is null!", zlibDecompressor);
++    assertTrue("ZlibFactory returned unexpected inflator",
++        zlibDecompressor instanceof BuiltInZlibInflater);
++    CodecPool.returnDecompressor(zlibDecompressor);
++
++    // Now create a GZip text file.
++    String tmpDir = System.getProperty("test.build.data", "/tmp/");
++    Path f = new Path(new Path(tmpDir), "testGzipLongOverflow.bin.gz");
++    BufferedWriter bw = new BufferedWriter(new OutputStreamWriter(
++      new GZIPOutputStream(new FileOutputStream(f.toString()))));
++
++    final int NBUF = 1024 * 4 + 1;
++    final char[] buf = new char[1024 * 1024];
++    for (int i = 0; i < buf.length; i++) buf[i] = '\0';
++    for (int i = 0; i < NBUF; i++) {
++      bw.write(buf);
++    }
++    bw.close();
++
++    // Now read it back, using the CodecPool to establish the
++    // decompressor to use.
++    CompressionCodecFactory ccf = new CompressionCodecFactory(conf);
++    CompressionCodec codec = ccf.getCodec(f);
++    Decompressor decompressor = CodecPool.getDecompressor(codec);
++    FileSystem fs = FileSystem.getLocal(conf);
++    InputStream is = fs.open(f);
++    is = codec.createInputStream(is, decompressor);
++    BufferedReader br = new BufferedReader(new InputStreamReader(is));
++    for (int j = 0; j < NBUF; j++) {
++      int n = br.read(buf);
++      assertEquals("got wrong read length!", n, buf.length);
++      for (int i = 0; i < buf.length; i++)
++        assertEquals("got wrong byte!", buf[i], '\0');
++    }
++    br.close();
++  }
++
+   public void testGzipCodecWrite(boolean useNative) throws IOException {
+     // Create a gzipped file using a compressor from the CodecPool,
+     // and try to read it back via the regular GZIPInputStream.
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/file/tfile/TestVLong.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/file/tfile/TestVLong.java
+index b71adac..34dcaa1 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/file/tfile/TestVLong.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/file/tfile/TestVLong.java
+@@ -141,7 +141,7 @@ public class TestVLong extends TestCase {
+       int shift = rng.nextInt(Long.SIZE) + 1;
+       long mask = (1L << shift) - 1;
+       long a = ((long) rng.nextInt()) << 32;
+-      long b = ((long) rng.nextInt()) & 0xffffffff;
++      long b = ((long) rng.nextInt()) & 0xffffffffL;
+       data[i] = (a + b) & mask;
+     }
+     
+-- 
+1.7.0.4
+

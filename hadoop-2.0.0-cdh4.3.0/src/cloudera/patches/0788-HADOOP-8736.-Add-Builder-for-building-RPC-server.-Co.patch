@@ -1,0 +1,698 @@
+From 9341d05f7a15045c360cae83fb74e0aaa3abe0a5 Mon Sep 17 00:00:00 2001
+From: Suresh Srinivas <suresh@apache.org>
+Date: Fri, 31 Aug 2012 22:40:51 +0000
+Subject: [PATCH 0788/1357] HADOOP-8736. Add Builder for building RPC server. Contributed by Brandon Li
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1379652 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 3175eb67a2d3f9892870bee8d8ee7f8b6f757f71)
+
+Conflicts:
+	hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestRPC.java
+---
+ .../java/org/apache/hadoop/ha/ZKFCRpcServer.java   |    9 +-
+ .../src/main/java/org/apache/hadoop/ipc/RPC.java   |  104 ++++++++++++++++++++
+ .../org/apache/hadoop/ipc/MiniRPCBenchmark.java    |    6 +-
+ .../org/apache/hadoop/ipc/RPCCallBenchmark.java    |   11 ++-
+ .../hadoop/ipc/TestMultipleProtocolServer.java     |   10 +-
+ .../org/apache/hadoop/ipc/TestProtoBufRpc.java     |    3 +-
+ .../test/java/org/apache/hadoop/ipc/TestRPC.java   |   88 +++++++++++++----
+ .../apache/hadoop/ipc/TestRPCCompatibility.java    |   35 ++++---
+ .../java/org/apache/hadoop/ipc/TestSaslRPC.java    |   43 +++++---
+ .../hadoop/security/TestDoAsEffectiveUser.java     |   42 +++++---
+ 10 files changed, 268 insertions(+), 83 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ha/ZKFCRpcServer.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ha/ZKFCRpcServer.java
+index 2077a86..7ea5188 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ha/ZKFCRpcServer.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ha/ZKFCRpcServer.java
+@@ -55,11 +55,10 @@ public class ZKFCRpcServer implements ZKFCProtocol {
+         new ZKFCProtocolServerSideTranslatorPB(this);
+     BlockingService service = ZKFCProtocolService
+         .newReflectiveBlockingService(translator);
+-    this.server = RPC.getServer(
+-        ZKFCProtocolPB.class,
+-        service, bindAddr.getHostName(),
+-            bindAddr.getPort(), HANDLER_COUNT, false, conf,
+-            null /*secretManager*/);
++    this.server = new RPC.Builder(conf).setProtocol(ZKFCProtocolPB.class)
++        .setInstance(service).setBindAddress(bindAddr.getHostName())
++        .setPort(bindAddr.getPort()).setNumHandlers(HANDLER_COUNT)
++        .setVerbose(false).build();
+     
+     // set service-level authorization security policy
+     if (conf.getBoolean(
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/RPC.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/RPC.java
+index f4c878e..550b047 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/RPC.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/RPC.java
+@@ -713,6 +713,110 @@ public class RPC {
+                  null);
+   }
+ 
++  /**
++   * Class to construct instances of RPC server with specific options.
++   */
++  public static class Builder {
++    private Class<?> protocol = null;
++    private Object instance = null;
++    private String bindAddress = "0.0.0.0";
++    private int port = 0;
++    private int numHandlers = 1;
++    private int numReaders = -1;
++    private int queueSizePerHandler = -1;
++    private boolean verbose = false;
++    private final Configuration conf;    
++    private SecretManager<? extends TokenIdentifier> secretManager = null;
++    private String portRangeConfig = null;
++    
++    public Builder(Configuration conf) {
++      this.conf = conf;
++    }
++
++    /** Mandatory field */
++    public Builder setProtocol(Class<?> protocol) {
++      this.protocol = protocol;
++      return this;
++    }
++    
++    /** Mandatory field */
++    public Builder setInstance(Object instance) {
++      this.instance = instance;
++      return this;
++    }
++    
++    /** Default: 0.0.0.0 */
++    public Builder setBindAddress(String bindAddress) {
++      this.bindAddress = bindAddress;
++      return this;
++    }
++    
++    /** Default: 0 */
++    public Builder setPort(int port) {
++      this.port = port;
++      return this;
++    }
++    
++    /** Default: 1 */
++    public Builder setNumHandlers(int numHandlers) {
++      this.numHandlers = numHandlers;
++      return this;
++    }
++    
++    /** Default: -1 */
++    public Builder setnumReaders(int numReaders) {
++      this.numReaders = numReaders;
++      return this;
++    }
++    
++    /** Default: -1 */
++    public Builder setQueueSizePerHandler(int queueSizePerHandler) {
++      this.queueSizePerHandler = queueSizePerHandler;
++      return this;
++    }
++    
++    /** Default: false */
++    public Builder setVerbose(boolean verbose) {
++      this.verbose = verbose;
++      return this;
++    }
++    
++    /** Default: null */
++    public Builder setSecretManager(
++        SecretManager<? extends TokenIdentifier> secretManager) {
++      this.secretManager = secretManager;
++      return this;
++    }
++    
++    /** Default: null */
++    public Builder setPortRangeConfig(String portRangeConfig) {
++      this.portRangeConfig = portRangeConfig;
++      return this;
++    }
++    
++    /**
++     * Build the RPC Server. 
++     * @throws IOException on error
++     * @throws HadoopIllegalArgumentException when mandatory fields are not set
++     */
++    public Server build() throws IOException, HadoopIllegalArgumentException {
++      if (this.conf == null) {
++        throw new HadoopIllegalArgumentException("conf is not set");
++      }
++      if (this.protocol == null) {
++        throw new HadoopIllegalArgumentException("protocol is not set");
++      }
++      if (this.instance == null) {
++        throw new HadoopIllegalArgumentException("instance is not set");
++      }
++      
++      return getProtocolEngine(this.protocol, this.conf).getServer(
++          this.protocol, this.instance, this.bindAddress, this.port,
++          this.numHandlers, this.numReaders, this.queueSizePerHandler,
++          this.verbose, this.conf, this.secretManager, this.portRangeConfig);
++    }
++  }
++  
+   /** An RPC Server. */
+   public abstract static class Server extends org.apache.hadoop.ipc.Server {
+    boolean verbose;
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/MiniRPCBenchmark.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/MiniRPCBenchmark.java
+index ace6173..e908953 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/MiniRPCBenchmark.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/MiniRPCBenchmark.java
+@@ -165,8 +165,10 @@ public class MiniRPCBenchmark {
+         new TestDelegationTokenSecretManager(24*60*60*1000,
+             7*24*60*60*1000,24*60*60*1000,3600000);
+       secretManager.startThreads();
+-      rpcServer = RPC.getServer(MiniProtocol.class,
+-          this, DEFAULT_SERVER_ADDRESS, 0, 1, false, conf, secretManager);
++      rpcServer = new RPC.Builder(conf).setProtocol(MiniProtocol.class)
++          .setInstance(this).setBindAddress(DEFAULT_SERVER_ADDRESS).setPort(0)
++          .setNumHandlers(1).setVerbose(false).setSecretManager(secretManager)
++          .build();
+       rpcServer.start();
+     }
+ 
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/RPCCallBenchmark.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/RPCCallBenchmark.java
+index 5fe2302..21aa44a 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/RPCCallBenchmark.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/RPCCallBenchmark.java
+@@ -227,11 +227,14 @@ public class RPCCallBenchmark implements Tool, Configurable {
+       BlockingService service = TestProtobufRpcProto
+           .newReflectiveBlockingService(serverImpl);
+ 
+-      server = RPC.getServer(TestRpcService.class, service,
+-          opts.host, opts.port, opts.serverThreads, false, conf, null);
++      server = new RPC.Builder(conf).setProtocol(TestRpcService.class)
++          .setInstance(service).setBindAddress(opts.host).setPort(opts.port)
++          .setNumHandlers(opts.serverThreads).setVerbose(false).build();
+     } else if (opts.rpcEngine == WritableRpcEngine.class) {
+-      server = RPC.getServer(TestProtocol.class, new TestRPC.TestImpl(),
+-          opts.host, opts.port, opts.serverThreads, false, conf, null);
++      server = new RPC.Builder(conf).setProtocol(TestProtocol.class)
++          .setInstance(new TestRPC.TestImpl()).setBindAddress(opts.host)
++          .setPort(opts.port).setNumHandlers(opts.serverThreads)
++          .setVerbose(false).build();
+     } else {
+       throw new RuntimeException("Bad engine: " + opts.rpcEngine);
+     }
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestMultipleProtocolServer.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestMultipleProtocolServer.java
+index 0446b42..dd73b52 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestMultipleProtocolServer.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestMultipleProtocolServer.java
+@@ -175,8 +175,9 @@ public class TestMultipleProtocolServer {
+   @Before
+   public void setUp() throws Exception {
+     // create a server with two handlers
+-    server = RPC.getServer(Foo0.class,
+-                              new Foo0Impl(), ADDRESS, 0, 2, false, conf, null);
++    server = new RPC.Builder(conf).setProtocol(Foo0.class)
++        .setInstance(new Foo0Impl()).setBindAddress(ADDRESS).setPort(0)
++        .setNumHandlers(2).setVerbose(false).build();
+     server.addProtocol(RPC.RpcKind.RPC_WRITABLE, Foo1.class, new Foo1Impl());
+     server.addProtocol(RPC.RpcKind.RPC_WRITABLE, Bar.class, new BarImpl());
+     server.addProtocol(RPC.RpcKind.RPC_WRITABLE, Mixin.class, new BarImpl());
+@@ -263,8 +264,9 @@ public class TestMultipleProtocolServer {
+   
+   @Test(expected=IOException.class)
+   public void testIncorrectServerCreation() throws IOException {
+-    RPC.getServer(Foo1.class,
+-        new Foo0Impl(), ADDRESS, 0, 2, false, conf, null);
++    new RPC.Builder(conf).setProtocol(Foo1.class).setInstance(new Foo0Impl())
++        .setBindAddress(ADDRESS).setPort(0).setNumHandlers(2).setVerbose(false)
++        .build();
+   } 
+   
+   // Now test a PB service - a server  hosts both PB and Writable Rpcs.
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestProtoBufRpc.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestProtoBufRpc.java
+index 9e7b269..54e227a 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestProtoBufRpc.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestProtoBufRpc.java
+@@ -113,7 +113,8 @@ public class TestProtoBufRpc {
+         .newReflectiveBlockingService(serverImpl);
+ 
+     // Get RPC server for server side implementation
+-    server = RPC.getServer(TestRpcService.class, service, ADDRESS, PORT, conf);
++    server = new RPC.Builder(conf).setProtocol(TestRpcService.class)
++        .setInstance(service).setBindAddress(ADDRESS).setPort(PORT).build();
+     addr = NetUtils.getConnectAddress(server);
+     
+     // now the second protocol
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestRPC.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestRPC.java
+index 8662f32..b935d58 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestRPC.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestRPC.java
+@@ -304,8 +304,9 @@ public class TestRPC {
+   
+   @Test
+   public void testConfRpc() throws Exception {
+-    Server server = RPC.getServer(TestProtocol.class,
+-                                  new TestImpl(), ADDRESS, 0, 1, false, conf, null);
++    Server server = new RPC.Builder(conf).setProtocol(TestProtocol.class)
++        .setInstance(new TestImpl()).setBindAddress(ADDRESS).setPort(0)
++        .setNumHandlers(1).setVerbose(false).build();
+     // Just one handler
+     int confQ = conf.getInt(
+               CommonConfigurationKeys.IPC_SERVER_HANDLER_QUEUE_SIZE_KEY,
+@@ -318,8 +319,11 @@ public class TestRPC {
+     assertEquals(confReaders, server.getNumReaders());
+     server.stop();
+     
+-    server = RPC.getServer(TestProtocol.class,
+-                                  new TestImpl(), ADDRESS, 0, 1, 3, 200, false, conf, null);
++    server = new RPC.Builder(conf).setProtocol(TestProtocol.class)
++        .setInstance(new TestImpl()).setBindAddress(ADDRESS).setPort(0)
++        .setNumHandlers(1).setnumReaders(3).setQueueSizePerHandler(200)
++        .setVerbose(false).build();        
++        
+     assertEquals(3, server.getNumReaders());
+     assertEquals(200, server.getMaxQueueSize());
+     server.stop();    
+@@ -327,8 +331,8 @@ public class TestRPC {
+ 
+   @Test
+   public void testProxyAddress() throws Exception {
+-    Server server = RPC.getServer(TestProtocol.class,
+-                                  new TestImpl(), ADDRESS, 0, conf);
++    Server server = new RPC.Builder(conf).setProtocol(TestProtocol.class)
++        .setInstance(new TestImpl()).setBindAddress(ADDRESS).setPort(0).build();
+     TestProtocol proxy = null;
+     
+     try {
+@@ -352,8 +356,10 @@ public class TestRPC {
+   public void testSlowRpc() throws Exception {
+     System.out.println("Testing Slow RPC");
+     // create a server with two handlers
+-    Server server = RPC.getServer(TestProtocol.class,
+-                                  new TestImpl(), ADDRESS, 0, 2, false, conf, null);
++    Server server = new RPC.Builder(conf).setProtocol(TestProtocol.class)
++        .setInstance(new TestImpl()).setBindAddress(ADDRESS).setPort(0)
++        .setNumHandlers(2).setVerbose(false).build();
++    
+     TestProtocol proxy = null;
+     
+     try {
+@@ -399,8 +405,8 @@ public class TestRPC {
+   }
+   
+   private void testCallsInternal(Configuration conf) throws Exception {
+-    Server server = RPC.getServer(TestProtocol.class,
+-                                  new TestImpl(), ADDRESS, 0, conf);
++    Server server = new RPC.Builder(conf).setProtocol(TestProtocol.class)
++        .setInstance(new TestImpl()).setBindAddress(ADDRESS).setPort(0).build();
+     TestProtocol proxy = null;
+     try {
+     server.start();
+@@ -518,8 +524,9 @@ public class TestRPC {
+   }
+   
+   private void doRPCs(Configuration conf, boolean expectFailure) throws Exception {
+-    Server server = RPC.getServer(TestProtocol.class,
+-                                  new TestImpl(), ADDRESS, 0, 5, true, conf, null);
++    Server server = new RPC.Builder(conf).setProtocol(TestProtocol.class)
++        .setInstance(new TestImpl()).setBindAddress(ADDRESS).setPort(0)
++        .setNumHandlers(5).setVerbose(true).build();
+ 
+     server.refreshServiceAcl(conf, new TestPolicyProvider());
+ 
+@@ -563,8 +570,9 @@ public class TestRPC {
+   
+   @Test
+   public void testServerAddress() throws IOException {
+-    Server server = RPC.getServer(TestProtocol.class,
+-        new TestImpl(), ADDRESS, 0, 5, true, conf, null);
++    Server server = new RPC.Builder(conf).setProtocol(TestProtocol.class)
++        .setInstance(new TestImpl()).setBindAddress(ADDRESS).setPort(0)
++        .setNumHandlers(5).setVerbose(true).build();
+     InetSocketAddress bindAddr = null;
+     try {
+       bindAddr = NetUtils.getConnectAddress(server);
+@@ -658,8 +666,9 @@ public class TestRPC {
+   
+   @Test
+   public void testErrorMsgForInsecureClient() throws Exception {
+-    final Server server = RPC.getServer(TestProtocol.class,
+-        new TestImpl(), ADDRESS, 0, 5, true, conf, null);
++    final Server server = new RPC.Builder(conf).setProtocol(TestProtocol.class)
++        .setInstance(new TestImpl()).setBindAddress(ADDRESS).setPort(0)
++        .setNumHandlers(5).setVerbose(true).build();
+     server.enableSecurity();
+     server.start();
+     boolean succeeded = false;
+@@ -683,8 +692,10 @@ public class TestRPC {
+ 
+     conf.setInt(CommonConfigurationKeys.IPC_SERVER_RPC_READ_THREADS_KEY, 2);
+ 
+-    final Server multiServer = RPC.getServer(TestProtocol.class,
+-        new TestImpl(), ADDRESS, 0, 5, true, conf, null);
++    final Server multiServer = new RPC.Builder(conf)
++        .setProtocol(TestProtocol.class).setInstance(new TestImpl())
++        .setBindAddress(ADDRESS).setPort(0).setNumHandlers(5).setVerbose(true)
++        .build();
+     multiServer.enableSecurity();
+     multiServer.start();
+     succeeded = false;
+@@ -738,8 +749,9 @@ public class TestRPC {
+     assertEquals("Expect no Reader threads running before test",
+       0, threadsBefore);
+ 
+-    final Server server = RPC.getServer(TestProtocol.class,
+-        new TestImpl(), ADDRESS, 0, 5, true, conf, null);
++    final Server server = new RPC.Builder(conf).setProtocol(TestProtocol.class)
++        .setInstance(new TestImpl()).setBindAddress(ADDRESS).setPort(0)
++        .setNumHandlers(5).setVerbose(true).build();
+     server.start();
+     try {
+       int threadsRunning = countThreads("Server$Listener$Reader");
+@@ -752,6 +764,42 @@ public class TestRPC {
+       0, threadsAfter);
+   }
+   
++  @Test
++  public void testRPCBuilder() throws Exception {
++    // Test mandatory field conf
++    try {
++      new RPC.Builder(null).setProtocol(TestProtocol.class)
++          .setInstance(new TestImpl()).setBindAddress(ADDRESS).setPort(0)
++          .setNumHandlers(5).setVerbose(true).build();
++      fail("Didn't throw HadoopIllegalArgumentException");
++    } catch (Exception e) {
++      if (!(e instanceof HadoopIllegalArgumentException)) {
++        fail("Expecting HadoopIllegalArgumentException but caught " + e);
++      }
++    }
++    // Test mandatory field protocol
++    try {
++      new RPC.Builder(conf).setInstance(new TestImpl()).setBindAddress(ADDRESS)
++          .setPort(0).setNumHandlers(5).setVerbose(true).build();
++      fail("Didn't throw HadoopIllegalArgumentException");
++    } catch (Exception e) {
++      if (!(e instanceof HadoopIllegalArgumentException)) {
++        fail("Expecting HadoopIllegalArgumentException but caught " + e);
++      }
++    }
++    // Test mandatory field instance
++    try {
++      new RPC.Builder(conf).setProtocol(TestProtocol.class)
++          .setBindAddress(ADDRESS).setPort(0).setNumHandlers(5)
++          .setVerbose(true).build();
++      fail("Didn't throw HadoopIllegalArgumentException");
++    } catch (Exception e) {
++      if (!(e instanceof HadoopIllegalArgumentException)) {
++        fail("Expecting HadoopIllegalArgumentException but caught " + e);
++      }
++    }
++  }
++  
+   @Test(timeout=90000)
+   public void testRPCInterruptedSimple() throws Exception {
+     final Configuration conf = new Configuration();
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestRPCCompatibility.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestRPCCompatibility.java
+index 50ae210..16ca418 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestRPCCompatibility.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestRPCCompatibility.java
+@@ -131,8 +131,9 @@ public class TestRPCCompatibility {
+   public void testVersion0ClientVersion1Server() throws Exception {
+     // create a server with two handlers
+     TestImpl1 impl = new TestImpl1();
+-    server = RPC.getServer(TestProtocol1.class,
+-                            impl, ADDRESS, 0, 2, false, conf, null);
++    server = new RPC.Builder(conf).setProtocol(TestProtocol1.class)
++        .setInstance(impl).setBindAddress(ADDRESS).setPort(0).setNumHandlers(2)
++        .setVerbose(false).build();
+     server.addProtocol(RPC.RpcKind.RPC_WRITABLE, TestProtocol0.class, impl);
+     server.start();
+     addr = NetUtils.getConnectAddress(server);
+@@ -147,8 +148,9 @@ public class TestRPCCompatibility {
+   @Test  // old client vs new server
+   public void testVersion1ClientVersion0Server() throws Exception {
+     // create a server with two handlers
+-    server = RPC.getServer(TestProtocol0.class,
+-                              new TestImpl0(), ADDRESS, 0, 2, false, conf, null);
++    server = new RPC.Builder(conf).setProtocol(TestProtocol0.class)
++        .setInstance(new TestImpl0()).setBindAddress(ADDRESS).setPort(0)
++        .setNumHandlers(2).setVerbose(false).build();
+     server.start();
+     addr = NetUtils.getConnectAddress(server);
+ 
+@@ -198,8 +200,9 @@ System.out.println("echo int is NOT supported");
+   public void testVersion2ClientVersion1Server() throws Exception {
+     // create a server with two handlers
+     TestImpl1 impl = new TestImpl1();
+-    server = RPC.getServer(TestProtocol1.class,
+-                              impl, ADDRESS, 0, 2, false, conf, null);
++    server = new RPC.Builder(conf).setProtocol(TestProtocol1.class)
++        .setInstance(impl).setBindAddress(ADDRESS).setPort(0).setNumHandlers(2)
++        .setVerbose(false).build();
+     server.addProtocol(RPC.RpcKind.RPC_WRITABLE, TestProtocol0.class, impl);
+     server.start();
+     addr = NetUtils.getConnectAddress(server);
+@@ -219,8 +222,9 @@ System.out.println("echo int is NOT supported");
+     ProtocolSignature.resetCache();
+     // create a server with two handlers
+     TestImpl2 impl = new TestImpl2();
+-    server = RPC.getServer(TestProtocol2.class,
+-                             impl, ADDRESS, 0, 2, false, conf, null);
++    server = new RPC.Builder(conf).setProtocol(TestProtocol2.class)
++        .setInstance(impl).setBindAddress(ADDRESS).setPort(0).setNumHandlers(2)
++        .setVerbose(false).build();
+     server.addProtocol(RPC.RpcKind.RPC_WRITABLE, TestProtocol0.class, impl);
+     server.start();
+     addr = NetUtils.getConnectAddress(server);
+@@ -289,8 +293,9 @@ System.out.println("echo int is NOT supported");
+   
+   @Test
+   public void testVersionMismatch() throws IOException {
+-    server = RPC.getServer(TestProtocol2.class, new TestImpl2(), ADDRESS, 0, 2,
+-        false, conf, null);
++    server = new RPC.Builder(conf).setProtocol(TestProtocol2.class)
++        .setInstance(new TestImpl2()).setBindAddress(ADDRESS).setPort(0)
++        .setNumHandlers(2).setVerbose(false).build();
+     server.start();
+     addr = NetUtils.getConnectAddress(server);
+ 
+@@ -307,8 +312,9 @@ System.out.println("echo int is NOT supported");
+   
+   @Test
+   public void testIsMethodSupported() throws IOException {
+-    server = RPC.getServer(TestProtocol2.class, new TestImpl2(), ADDRESS, 0, 2,
+-        false, conf, null);
++    server = new RPC.Builder(conf).setProtocol(TestProtocol2.class)
++        .setInstance(new TestImpl2()).setBindAddress(ADDRESS).setPort(0)
++        .setNumHandlers(2).setVerbose(false).build();
+     server.start();
+     addr = NetUtils.getConnectAddress(server);
+ 
+@@ -331,8 +337,9 @@ System.out.println("echo int is NOT supported");
+   @Test
+   public void testProtocolMetaInfoSSTranslatorPB() throws Exception {
+     TestImpl1 impl = new TestImpl1();
+-    server = RPC.getServer(TestProtocol1.class, impl, ADDRESS, 0, 2, false,
+-        conf, null);
++    server = new RPC.Builder(conf).setProtocol(TestProtocol1.class)
++        .setInstance(impl).setBindAddress(ADDRESS).setPort(0).setNumHandlers(2)
++        .setVerbose(false).build();
+     server.addProtocol(RPC.RpcKind.RPC_WRITABLE, TestProtocol0.class, impl);
+     server.start();
+ 
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestSaslRPC.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestSaslRPC.java
+index 9246fd5..47b7536 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestSaslRPC.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestSaslRPC.java
+@@ -230,9 +230,11 @@ public class TestSaslRPC {
+   @Test
+   public void testDigestRpc() throws Exception {
+     TestTokenSecretManager sm = new TestTokenSecretManager();
+-    final Server server = RPC.getServer(TestSaslProtocol.class,
+-        new TestSaslImpl(), ADDRESS, 0, 5, true, conf, sm);
+-
++    final Server server = new RPC.Builder(conf)
++        .setProtocol(TestSaslProtocol.class).setInstance(new TestSaslImpl())
++        .setBindAddress(ADDRESS).setPort(0).setNumHandlers(5).setVerbose(true)
++        .setSecretManager(sm).build();
++    
+     doDigestRpc(server, sm);
+   }
+ 
+@@ -241,9 +243,10 @@ public class TestSaslRPC {
+     TestTokenSecretManager sm = new TestTokenSecretManager();
+     try {
+       SecurityUtil.setSecurityInfoProviders(new CustomSecurityInfo());
+-      final Server server = RPC.getServer(TestSaslProtocol.class,
+-                                          new TestSaslImpl(), ADDRESS, 0, 5, 
+-                                          true, conf, sm);
++      final Server server = new RPC.Builder(conf)
++          .setProtocol(TestSaslProtocol.class).setInstance(new TestSaslImpl())
++          .setBindAddress(ADDRESS).setPort(0).setNumHandlers(5)
++          .setVerbose(true).setSecretManager(sm).build();
+       doDigestRpc(server, sm);
+     } finally {
+       SecurityUtil.setSecurityInfoProviders(new SecurityInfo[0]);
+@@ -252,8 +255,9 @@ public class TestSaslRPC {
+ 
+   @Test
+   public void testSecureToInsecureRpc() throws Exception {
+-    Server server = RPC.getServer(TestSaslProtocol.class,
+-        new TestSaslImpl(), ADDRESS, 0, 5, true, conf, null);
++    Server server = new RPC.Builder(conf).setProtocol(TestSaslProtocol.class)
++        .setInstance(new TestSaslImpl()).setBindAddress(ADDRESS).setPort(0)
++        .setNumHandlers(5).setVerbose(true).build();
+     server.disableSecurity();
+     TestTokenSecretManager sm = new TestTokenSecretManager();
+     doDigestRpc(server, sm);
+@@ -262,8 +266,10 @@ public class TestSaslRPC {
+   @Test
+   public void testErrorMessage() throws Exception {
+     BadTokenSecretManager sm = new BadTokenSecretManager();
+-    final Server server = RPC.getServer(TestSaslProtocol.class,
+-        new TestSaslImpl(), ADDRESS, 0, 5, true, conf, sm);
++    final Server server = new RPC.Builder(conf)
++        .setProtocol(TestSaslProtocol.class).setInstance(new TestSaslImpl())
++        .setBindAddress(ADDRESS).setPort(0).setNumHandlers(5).setVerbose(true)
++        .setSecretManager(sm).build();
+ 
+     boolean succeeded = false;
+     try {
+@@ -350,8 +356,10 @@ public class TestSaslRPC {
+   @Test
+   public void testPerConnectionConf() throws Exception {
+     TestTokenSecretManager sm = new TestTokenSecretManager();
+-    final Server server = RPC.getServer(TestSaslProtocol.class,
+-        new TestSaslImpl(), ADDRESS, 0, 5, true, conf, sm);
++    final Server server = new RPC.Builder(conf)
++        .setProtocol(TestSaslProtocol.class).setInstance(new TestSaslImpl())
++        .setBindAddress(ADDRESS).setPort(0).setNumHandlers(5).setVerbose(true)
++        .setSecretManager(sm).build();
+     server.start();
+     final UserGroupInformation current = UserGroupInformation.getCurrentUser();
+     final InetSocketAddress addr = NetUtils.getConnectAddress(server);
+@@ -413,8 +421,10 @@ public class TestSaslRPC {
+     UserGroupInformation current = UserGroupInformation.getCurrentUser();
+     System.out.println("UGI: " + current);
+ 
+-    Server server = RPC.getServer(TestSaslProtocol.class, new TestSaslImpl(),
+-        ADDRESS, 0, 5, true, newConf, null);
++    Server server = new RPC.Builder(newConf)
++        .setProtocol(TestSaslProtocol.class).setInstance(new TestSaslImpl())
++        .setBindAddress(ADDRESS).setPort(0).setNumHandlers(5).setVerbose(true)
++        .build();
+     TestSaslProtocol proxy = null;
+ 
+     server.start();
+@@ -436,8 +446,9 @@ public class TestSaslRPC {
+   @Test
+   public void testDigestAuthMethod() throws Exception {
+     TestTokenSecretManager sm = new TestTokenSecretManager();
+-    Server server = RPC.getServer(TestSaslProtocol.class,
+-        new TestSaslImpl(), ADDRESS, 0, 5, true, conf, sm);
++    Server server = new RPC.Builder(conf).setProtocol(TestSaslProtocol.class)
++        .setInstance(new TestSaslImpl()).setBindAddress(ADDRESS).setPort(0)
++        .setNumHandlers(5).setVerbose(true).setSecretManager(sm).build();      
+     server.start();
+ 
+     final UserGroupInformation current = UserGroupInformation.getCurrentUser();
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/security/TestDoAsEffectiveUser.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/security/TestDoAsEffectiveUser.java
+index ee7bc29..335056b 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/security/TestDoAsEffectiveUser.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/security/TestDoAsEffectiveUser.java
+@@ -153,8 +153,9 @@ public class TestDoAsEffectiveUser {
+     conf.setStrings(ProxyUsers
+         .getProxySuperuserGroupConfKey(REAL_USER_SHORT_NAME), "group1");
+     configureSuperUserIPAddresses(conf, REAL_USER_SHORT_NAME);
+-    Server server = RPC.getServer(TestProtocol.class, new TestImpl(), ADDRESS,
+-        0, 5, true, conf, null);
++    Server server = new RPC.Builder(conf).setProtocol(TestProtocol.class)
++        .setInstance(new TestImpl()).setBindAddress(ADDRESS).setPort(0)
++        .setNumHandlers(5).setVerbose(true).build();
+ 
+     refreshConf(conf);
+     try {
+@@ -194,8 +195,9 @@ public class TestDoAsEffectiveUser {
+     configureSuperUserIPAddresses(conf, REAL_USER_SHORT_NAME);
+     conf.setStrings(ProxyUsers.getProxySuperuserGroupConfKey(REAL_USER_SHORT_NAME),
+         "group1");
+-    Server server = RPC.getServer(TestProtocol.class, new TestImpl(), ADDRESS,
+-        0, 2, false, conf, null);
++    Server server = new RPC.Builder(conf).setProtocol(TestProtocol.class)
++        .setInstance(new TestImpl()).setBindAddress(ADDRESS).setPort(0)
++        .setNumHandlers(2).setVerbose(false).build();
+ 
+     refreshConf(conf);
+     try {
+@@ -240,8 +242,9 @@ public class TestDoAsEffectiveUser {
+         "20.20.20.20"); //Authorized IP address
+     conf.setStrings(ProxyUsers.getProxySuperuserGroupConfKey(REAL_USER_SHORT_NAME),
+         "group1");
+-    Server server = RPC.getServer(TestProtocol.class, new TestImpl(), ADDRESS,
+-        0, 2, false, conf, null);
++    Server server = new RPC.Builder(conf).setProtocol(TestProtocol.class)
++        .setInstance(new TestImpl()).setBindAddress(ADDRESS).setPort(0)
++        .setNumHandlers(2).setVerbose(false).build();
+ 
+     refreshConf(conf);
+     
+@@ -281,8 +284,9 @@ public class TestDoAsEffectiveUser {
+     final Configuration conf = new Configuration();
+     conf.setStrings(ProxyUsers
+         .getProxySuperuserGroupConfKey(REAL_USER_SHORT_NAME), "group1");
+-    Server server = RPC.getServer(TestProtocol.class, new TestImpl(), ADDRESS,
+-        0, 2, false, conf, null);
++    Server server = new RPC.Builder(conf).setProtocol(TestProtocol.class)
++        .setInstance(new TestImpl()).setBindAddress(ADDRESS).setPort(0)
++        .setNumHandlers(2).setVerbose(false).build();
+ 
+     try {
+       server.start();
+@@ -319,8 +323,9 @@ public class TestDoAsEffectiveUser {
+   public void testRealUserGroupNotSpecified() throws IOException {
+     final Configuration conf = new Configuration();
+     configureSuperUserIPAddresses(conf, REAL_USER_SHORT_NAME);
+-    Server server = RPC.getServer(TestProtocol.class, new TestImpl(), ADDRESS,
+-        0, 2, false, conf, null);
++    Server server = new RPC.Builder(conf).setProtocol(TestProtocol.class)
++        .setInstance(new TestImpl()).setBindAddress(ADDRESS).setPort(0)
++        .setNumHandlers(2).setVerbose(false).build();
+ 
+     try {
+       server.start();
+@@ -359,9 +364,9 @@ public class TestDoAsEffectiveUser {
+     configureSuperUserIPAddresses(conf, REAL_USER_SHORT_NAME);
+     conf.setStrings(ProxyUsers.getProxySuperuserGroupConfKey(REAL_USER_SHORT_NAME),
+         "group3");
+-    Server server = RPC.getServer(TestProtocol.class, new TestImpl(), ADDRESS,
+-        0, 2, false, conf, null);
+-
++    Server server = new RPC.Builder(conf).setProtocol(TestProtocol.class)
++        .setInstance(new TestImpl()).setBindAddress(ADDRESS).setPort(0)
++        .setNumHandlers(2).setVerbose(false).build();
+     
+     try {
+       server.start();
+@@ -406,8 +411,9 @@ public class TestDoAsEffectiveUser {
+     conf
+         .set(CommonConfigurationKeys.HADOOP_SECURITY_AUTHENTICATION, "kerberos");
+     UserGroupInformation.setConfiguration(conf);
+-    final Server server = RPC.getServer(TestProtocol.class, new TestImpl(),
+-        ADDRESS, 0, 5, true, conf, sm);
++    final Server server = new RPC.Builder(conf).setProtocol(TestProtocol.class)
++        .setInstance(new TestImpl()).setBindAddress(ADDRESS).setPort(0)
++        .setNumHandlers(5).setVerbose(true).setSecretManager(sm).build();
+ 
+     server.start();
+ 
+@@ -460,8 +466,10 @@ public class TestDoAsEffectiveUser {
+     newConf.set(CommonConfigurationKeys.HADOOP_SECURITY_AUTHENTICATION,
+         "kerberos");
+     UserGroupInformation.setConfiguration(newConf);
+-    final Server server = RPC.getServer(TestProtocol.class, new TestImpl(),
+-        ADDRESS, 0, 5, true, newConf, sm);
++    final Server server = new RPC.Builder(newConf)
++        .setProtocol(TestProtocol.class).setInstance(new TestImpl())
++        .setBindAddress(ADDRESS).setPort(0).setNumHandlers(5).setVerbose(true)
++        .setSecretManager(sm).build();
+ 
+     server.start();
+ 
+-- 
+1.7.0.4
+

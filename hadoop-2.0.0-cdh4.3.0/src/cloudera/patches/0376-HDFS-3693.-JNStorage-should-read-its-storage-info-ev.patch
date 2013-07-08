@@ -1,0 +1,234 @@
+From 6f5b79a69d3a298bc284736f415805b775ad2b81 Mon Sep 17 00:00:00 2001
+From: Todd Lipcon <todd@apache.org>
+Date: Wed, 25 Jul 2012 21:47:19 +0000
+Subject: [PATCH 0376/1357] HDFS-3693. JNStorage should read its storage info even before a writer becomes active. Contributed by Todd Lipcon.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-3077@1365794 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit c2065afd7cc41e5c4e0bee3e06deed57248c2837)
+(cherry picked from commit 7c5ebe172b9e8e5e8925405c8ba8d6f135d00570)
+---
+ .../hadoop-hdfs/CHANGES.HDFS-3077.txt              |    2 +
+ .../qjournal/server/GetJournalEditServlet.java     |   13 +++--
+ .../hadoop/hdfs/qjournal/server/JNStorage.java     |   50 +++++++++----------
+ .../hadoop/hdfs/qjournal/server/Journal.java       |    4 +-
+ .../hadoop/hdfs/qjournal/server/JournalNode.java   |    2 +-
+ .../qjournal/server/JournalNodeHttpServer.java     |    3 +-
+ .../hadoop/hdfs/qjournal/server/TestJournal.java   |   11 ++++-
+ 7 files changed, 47 insertions(+), 38 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/CHANGES.HDFS-3077.txt b/hadoop-hdfs-project/hadoop-hdfs/CHANGES.HDFS-3077.txt
+index 1bb65ea..e305dd1 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/CHANGES.HDFS-3077.txt
++++ b/hadoop-hdfs-project/hadoop-hdfs/CHANGES.HDFS-3077.txt
+@@ -6,3 +6,5 @@ HDFS-3077. Quorum-based protocol for reading and writing edit logs. Contributed
+ HDFS-3694. Fix getEditLogManifest to fetch httpPort if necessary (todd)
+ 
+ HDFS-3692. Support purgeEditLogs() call to remotely purge logs on JNs (todd)
++
++HDFS-3693. JNStorage should read its storage info even before a writer becomes active (todd)
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/server/GetJournalEditServlet.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/server/GetJournalEditServlet.java
+index e1f393d..1948078 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/server/GetJournalEditServlet.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/server/GetJournalEditServlet.java
+@@ -120,12 +120,13 @@ public class GetJournalEditServlet extends HttpServlet {
+     
+     if (theirStorageInfoString != null
+         && !myStorageInfoString.equals(theirStorageInfoString)) {
+-      response.sendError(HttpServletResponse.SC_FORBIDDEN,
+-              "This node has storage info " + myStorageInfoString
+-                  + " but the requesting node expected "
+-                  + theirStorageInfoString);
+-      LOG.warn("Received an invalid request file transfer request "
+-          + " with storage info " + theirStorageInfoString);
++      String msg = "This node has storage info '" + myStorageInfoString
++          + "' but the requesting node expected '"
++          + theirStorageInfoString + "'";
++      
++      response.sendError(HttpServletResponse.SC_FORBIDDEN, msg);
++      LOG.warn("Received an invalid request file transfer request from " +
++          request.getRemoteAddr() + ": " + msg);
+       return false;
+     }
+     return true;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/server/JNStorage.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/server/JNStorage.java
+index 8639f53..48bb09d 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/server/JNStorage.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/server/JNStorage.java
+@@ -28,6 +28,8 @@ import org.apache.hadoop.hdfs.server.namenode.FileJournalManager;
+ import org.apache.hadoop.hdfs.server.namenode.NNStorage;
+ import org.apache.hadoop.hdfs.server.protocol.NamespaceInfo;
+ 
++import com.google.common.base.Preconditions;
++
+ /**
+  * A {@link Storage} implementation for the {@link JournalNode}.
+  * 
+@@ -38,18 +40,21 @@ class JNStorage extends Storage {
+ 
+   private final FileJournalManager fjm;
+   private final StorageDirectory sd;
+-  private boolean lazyInitted = false;
++  private StorageState state;
+ 
+   /**
+    * @param logDir the path to the directory in which data will be stored
+    * @param errorReporter a callback to report errors
++   * @throws IOException 
+    */
+-  protected JNStorage(File logDir, StorageErrorReporter errorReporter) {
++  protected JNStorage(File logDir, StorageErrorReporter errorReporter) throws IOException {
+     super(NodeType.JOURNAL_NODE);
+     
+     sd = new StorageDirectory(logDir);
+     this.addStorageDir(sd);
+     this.fjm = new FileJournalManager(sd, errorReporter);
++    
++    analyzeStorage();
+   }
+   
+   FileJournalManager getJournalManager() {
+@@ -107,34 +112,27 @@ class JNStorage extends Storage {
+     }
+   }
+   
+-  void analyzeStorage(NamespaceInfo nsInfo) throws IOException {
+-    if (lazyInitted) {
++  public void formatIfNecessary(NamespaceInfo nsInfo) throws IOException {
++    if (state == StorageState.NOT_FORMATTED ||
++        state == StorageState.NON_EXISTENT) {
++      format(nsInfo);
++      analyzeStorage();
++      assert state == StorageState.NORMAL :
++        "Unexpected state after formatting: " + state;
++    } else {
++      Preconditions.checkState(state == StorageState.NORMAL,
++          "Unhandled storage state in %s: %s", this, state);
++      assert getNamespaceID() != 0;
++      
+       checkConsistentNamespace(nsInfo);
+-      return;
+     }
+-    
+-    StorageState state = sd.analyzeStorage(StartupOption.REGULAR, this);
+-    switch (state) {
+-    case NON_EXISTENT:
+-    case NOT_FORMATTED:
+-      format(nsInfo);
+-      // In the NORMAL case below, analyzeStorage() has already locked the
+-      // directory for us. But in the case that we format it, we have to
+-      // lock it here.
+-      // The directory is unlocked in close() when the node shuts down.
+-      sd.lock();
+-      break;
+-    case NORMAL:
+-      // Storage directory is already locked by analyzeStorage() - no
+-      // need to lock it here.
++  }
++
++  private void analyzeStorage() throws IOException {
++    this.state = sd.analyzeStorage(StartupOption.REGULAR, this);
++    if (state == StorageState.NORMAL) {
+       readProperties(sd);
+-      checkConsistentNamespace(nsInfo);
+-      break;
+-      
+-    default:
+-      LOG.warn("TODO: unhandled state for storage dir " + sd + ": " + state);
+     }
+-    lazyInitted  = true;
+   }
+ 
+   private void checkConsistentNamespace(NamespaceInfo nsInfo)
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/server/Journal.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/server/Journal.java
+index 31f7a0a..897f591 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/server/Journal.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/server/Journal.java
+@@ -79,7 +79,7 @@ class Journal implements Closeable {
+ 
+   private final FileJournalManager fjm;
+ 
+-  Journal(File logDir, StorageErrorReporter errorReporter) {
++  Journal(File logDir, StorageErrorReporter errorReporter) throws IOException {
+     storage = new JNStorage(logDir, errorReporter);
+ 
+     File currentDir = storage.getSingularStorageDir().getCurrentDir();
+@@ -152,7 +152,7 @@ class Journal implements Closeable {
+ 
+     // If the storage is unformatted, format it with this NS.
+     // Otherwise, check that the NN's nsinfo matches the storage.
+-    storage.analyzeStorage(nsInfo);
++    storage.formatIfNecessary(nsInfo);
+     
+     if (epoch <= getLastPromisedEpoch()) {
+       throw new IOException("Proposed epoch " + epoch + " <= last promise " +
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/server/JournalNode.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/server/JournalNode.java
+index 46540b7..67bebbc 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/server/JournalNode.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/server/JournalNode.java
+@@ -64,7 +64,7 @@ public class JournalNode implements Tool, Configurable {
+    */
+   private int resultCode = 0;
+ 
+-  synchronized Journal getOrCreateJournal(String jid) {
++  synchronized Journal getOrCreateJournal(String jid) throws IOException {
+     QuorumJournalManager.checkJournalId(jid);
+     
+     Journal journal = journalsById.get(jid);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/server/JournalNodeHttpServer.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/server/JournalNodeHttpServer.java
+index 6b15b0b..dce66a5 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/server/JournalNodeHttpServer.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/server/JournalNodeHttpServer.java
+@@ -115,7 +115,8 @@ public class JournalNodeHttpServer {
+         DFSConfigKeys.DFS_JOURNALNODE_HTTP_ADDRESS_KEY);
+   }
+ 
+-  public static Journal getJournalFromContext(ServletContext context, String jid) {
++  public static Journal getJournalFromContext(ServletContext context, String jid)
++      throws IOException {
+     JournalNode jn = (JournalNode)context.getAttribute(JN_ATTRIBUTE_KEY);
+     return jn.getOrCreateJournal(jid);
+   }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/qjournal/server/TestJournal.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/qjournal/server/TestJournal.java
+index e38630c..e193966 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/qjournal/server/TestJournal.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/qjournal/server/TestJournal.java
+@@ -112,10 +112,17 @@ public class TestJournal {
+         QJMTestUtil.createTxnData(1, 2));
+     // Don't finalize.
+     
++    String storageString = journal.getStorage().toColonSeparatedString();
++    System.err.println("storage string: " + storageString);
+     journal.close(); // close to unlock the storage dir
+     
+     // Now re-instantiate, make sure history is still there
+     journal = new Journal(TEST_LOG_DIR, mockErrorReporter);
++    
++    // The storage info should be read, even if no writer has taken over.
++    assertEquals(storageString,
++        journal.getStorage().toColonSeparatedString());
++
+     assertEquals(1, journal.getLastPromisedEpoch());
+     NewEpochResponseProtoOrBuilder newEpoch = journal.newEpoch(FAKE_NSINFO, 2);
+     assertEquals(1, newEpoch.getLastSegmentTxId());
+@@ -135,9 +142,8 @@ public class TestJournal {
+     // Journal should be locked
+     GenericTestUtils.assertExists(lockFile);
+     
+-    Journal journal2 = new Journal(TEST_LOG_DIR, mockErrorReporter);
+     try {
+-      journal2.newEpoch(FAKE_NSINFO, 2);
++      new Journal(TEST_LOG_DIR, mockErrorReporter);
+       fail("Did not fail to create another journal in same dir");
+     } catch (IOException ioe) {
+       GenericTestUtils.assertExceptionContains(
+@@ -147,6 +153,7 @@ public class TestJournal {
+     journal.close();
+     
+     // Journal should no longer be locked after the close() call.
++    Journal journal2 = new Journal(TEST_LOG_DIR, mockErrorReporter);
+     journal2.newEpoch(FAKE_NSINFO, 2);
+   }
+   
+-- 
+1.7.0.4
+

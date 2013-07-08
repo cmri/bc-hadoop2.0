@@ -1,0 +1,238 @@
+From 08c2c3c4fff6eb2d765bc9b81f03d385c501aee4 Mon Sep 17 00:00:00 2001
+From: Todd Lipcon <todd@apache.org>
+Date: Mon, 10 Sep 2012 18:51:15 +0000
+Subject: [PATCH 0504/1357] HDFS-3885. QJM: optimize log sync when JN is lagging behind. Contributed by Todd Lipcon.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-3077@1383039 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 73afd003d6654bdf169d9df4029bdd005c0004f8)
+---
+ .../hadoop-hdfs/CHANGES.HDFS-3077.txt              |    2 ++
+ .../bkjournal/BookKeeperEditLogOutputStream.java   |    4 ++--
+ .../hdfs/qjournal/client/QuorumOutputStream.java   |    2 +-
+ .../hadoop/hdfs/qjournal/server/Journal.java       |   12 +++++++++---
+ .../server/namenode/EditLogBackupOutputStream.java |    2 +-
+ .../server/namenode/EditLogFileOutputStream.java   |    4 ++--
+ .../hdfs/server/namenode/EditLogOutputStream.java  |   10 ++++++++--
+ .../hadoop/hdfs/server/namenode/JournalSet.java    |    4 ++--
+ .../offlineEditsViewer/BinaryEditsVisitor.java     |    2 +-
+ .../hadoop/hdfs/server/namenode/TestEditLog.java   |    2 +-
+ .../namenode/TestEditLogFileOutputStream.java      |    2 +-
+ .../hdfs/server/namenode/TestNameNodeRecovery.java |    2 +-
+ 12 files changed, 31 insertions(+), 17 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/CHANGES.HDFS-3077.txt b/hadoop-hdfs-project/hadoop-hdfs/CHANGES.HDFS-3077.txt
+index 065a21e..0a47ee2 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/CHANGES.HDFS-3077.txt
++++ b/hadoop-hdfs-project/hadoop-hdfs/CHANGES.HDFS-3077.txt
+@@ -54,3 +54,5 @@ HDFS-3893. QJM: Make QJM work with security enabled. (atm)
+ HDFS-3897. QJM: TestBlockToken fails after HDFS-3893. (atm)
+ 
+ HDFS-3898. QJM: enable TCP_NODELAY for IPC (todd)
++
++HDFS-3885. QJM: optimize log sync when JN is lagging behind (todd)
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/bkjournal/src/main/java/org/apache/hadoop/contrib/bkjournal/BookKeeperEditLogOutputStream.java b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/bkjournal/src/main/java/org/apache/hadoop/contrib/bkjournal/BookKeeperEditLogOutputStream.java
+index 6267871..4cc4b2d 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/bkjournal/src/main/java/org/apache/hadoop/contrib/bkjournal/BookKeeperEditLogOutputStream.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/bkjournal/src/main/java/org/apache/hadoop/contrib/bkjournal/BookKeeperEditLogOutputStream.java
+@@ -84,7 +84,7 @@ class BookKeeperEditLogOutputStream
+   @Override
+   public void close() throws IOException {
+     setReadyToFlush();
+-    flushAndSync();
++    flushAndSync(true);
+     try {
+       lh.close();
+     } catch (InterruptedException ie) {
+@@ -130,7 +130,7 @@ class BookKeeperEditLogOutputStream
+   }
+ 
+   @Override
+-  public void flushAndSync() throws IOException {
++  public void flushAndSync(boolean durable) throws IOException {
+     assert(syncLatch != null);
+     try {
+       syncLatch.await();
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/client/QuorumOutputStream.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/client/QuorumOutputStream.java
+index 4ea95ee..90633b4 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/client/QuorumOutputStream.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/client/QuorumOutputStream.java
+@@ -77,7 +77,7 @@ class QuorumOutputStream extends EditLogOutputStream {
+   }
+ 
+   @Override
+-  protected void flushAndSync() throws IOException {
++  protected void flushAndSync(boolean durable) throws IOException {
+     int numReadyBytes = buf.countReadyBytes();
+     if (numReadyBytes > 0) {
+       int numReadyTxns = buf.countReadyTxns();
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/server/Journal.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/server/Journal.java
+index 61bb22c..99ba41b 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/server/Journal.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/server/Journal.java
+@@ -301,17 +301,23 @@ class Journal implements Closeable {
+     if (LOG.isTraceEnabled()) {
+       LOG.trace("Writing txid " + firstTxnId + "-" + lastTxnId);
+     }
++
++    // If the edit has already been marked as committed, we know
++    // it has been fsynced on a quorum of other nodes, and we are
++    // "catching up" with the rest. Hence we do not need to fsync.
++    boolean isLagging = lastTxnId <= committedTxnId.get();
++    boolean shouldFsync = !isLagging;
+     
+     curSegment.writeRaw(records, 0, records.length);
+     curSegment.setReadyToFlush();
+     Stopwatch sw = new Stopwatch();
+     sw.start();
+-    curSegment.flush();
++    curSegment.flush(shouldFsync);
+     sw.stop();
+     
+     metrics.addSync(sw.elapsedTime(TimeUnit.MICROSECONDS));
+-    
+-    if (committedTxnId.get() > lastTxnId) {
++
++    if (isLagging) {
+       // This batch of edits has already been committed on a quorum of other
+       // nodes. So, we are in "catch up" mode. This gets its own metric.
+       metrics.batchesWrittenWhileLagging.incr(1);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogBackupOutputStream.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogBackupOutputStream.java
+index bdb4c5e..81cb783 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogBackupOutputStream.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogBackupOutputStream.java
+@@ -113,7 +113,7 @@ class EditLogBackupOutputStream extends EditLogOutputStream {
+   }
+ 
+   @Override // EditLogOutputStream
+-  protected void flushAndSync() throws IOException {
++  protected void flushAndSync(boolean durable) throws IOException {
+     assert out.getLength() == 0 : "Output buffer is not empty";
+     
+     int numReadyTxns = doubleBuf.countReadyTxns();
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogFileOutputStream.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogFileOutputStream.java
+index f7a8b33..fb11ae0 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogFileOutputStream.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogFileOutputStream.java
+@@ -176,7 +176,7 @@ public class EditLogFileOutputStream extends EditLogOutputStream {
+    * accumulates new log records while readyBuffer will be flushed and synced.
+    */
+   @Override
+-  public void flushAndSync() throws IOException {
++  public void flushAndSync(boolean durable) throws IOException {
+     if (fp == null) {
+       throw new IOException("Trying to use aborted output stream");
+     }
+@@ -186,7 +186,7 @@ public class EditLogFileOutputStream extends EditLogOutputStream {
+     }
+     preallocate(); // preallocate file if necessay
+     doubleBuf.flushTo(fp);
+-    if (!shouldSkipFsyncForTests) {
++    if (durable && !shouldSkipFsyncForTests) {
+       fc.force(false); // metadata updates not needed
+     }
+   }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogOutputStream.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogOutputStream.java
+index ec418f5..d5b7bff 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogOutputStream.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogOutputStream.java
+@@ -93,18 +93,24 @@ public abstract class EditLogOutputStream implements Closeable {
+   /**
+    * Flush and sync all data that is ready to be flush 
+    * {@link #setReadyToFlush()} into underlying persistent store.
++   * @param durable if true, the edits should be made truly durable before
++   * returning
+    * @throws IOException
+    */
+-  abstract protected void flushAndSync() throws IOException;
++  abstract protected void flushAndSync(boolean durable) throws IOException;
+ 
+   /**
+    * Flush data to persistent store.
+    * Collect sync metrics.
+    */
+   public void flush() throws IOException {
++    flush(true);
++  }
++  
++  public void flush(boolean durable) throws IOException {
+     numSync++;
+     long start = now();
+-    flushAndSync();
++    flushAndSync(durable);
+     long end = now();
+     totalTimeSync += (end - start);
+   }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/JournalSet.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/JournalSet.java
+index ac74cac..bc285b2 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/JournalSet.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/JournalSet.java
+@@ -470,12 +470,12 @@ public class JournalSet implements JournalManager {
+     }
+ 
+     @Override
+-    protected void flushAndSync() throws IOException {
++    protected void flushAndSync(final boolean durable) throws IOException {
+       mapJournalsAndReportErrors(new JournalClosure() {
+         @Override
+         public void apply(JournalAndStream jas) throws IOException {
+           if (jas.isActive()) {
+-            jas.getCurrentStream().flushAndSync();
++            jas.getCurrentStream().flushAndSync(durable);
+           }
+         }
+       }, "flushAndSync");
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/tools/offlineEditsViewer/BinaryEditsVisitor.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/tools/offlineEditsViewer/BinaryEditsVisitor.java
+index 1911ef7..8c4fcbb 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/tools/offlineEditsViewer/BinaryEditsVisitor.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/tools/offlineEditsViewer/BinaryEditsVisitor.java
+@@ -56,7 +56,7 @@ public class BinaryEditsVisitor implements OfflineEditsVisitor {
+   @Override
+   public void close(Throwable error) throws IOException {
+     elfos.setReadyToFlush();
+-    elfos.flushAndSync();
++    elfos.flushAndSync(true);
+     elfos.close();
+   }
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestEditLog.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestEditLog.java
+index cb18c1f..7fd046c 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestEditLog.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestEditLog.java
+@@ -1222,7 +1222,7 @@ public class TestEditLog {
+       elfos.create();
+       elfos.writeRaw(garbage, 0, garbage.length);
+       elfos.setReadyToFlush();
+-      elfos.flushAndSync();
++      elfos.flushAndSync(true);
+       elfos.close();
+       elfos = null;
+       file = new File(TEST_LOG_NAME);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestEditLogFileOutputStream.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestEditLogFileOutputStream.java
+index 3969bdb..7f237a8 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestEditLogFileOutputStream.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestEditLogFileOutputStream.java
+@@ -55,7 +55,7 @@ public class TestEditLogFileOutputStream {
+   static void flushAndCheckLength(EditLogFileOutputStream elos,
+       long expectedLength) throws IOException {
+     elos.setReadyToFlush();
+-    elos.flushAndSync();
++    elos.flushAndSync(true);
+     assertEquals(expectedLength, elos.getFile().length());
+   }
+   
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestNameNodeRecovery.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestNameNodeRecovery.java
+index d45bd0c..8379cb2 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestNameNodeRecovery.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestNameNodeRecovery.java
+@@ -74,7 +74,7 @@ public class TestNameNodeRecovery {
+ 
+       elts.addTransactionsToLog(elfos, cache);
+       elfos.setReadyToFlush();
+-      elfos.flushAndSync();
++      elfos.flushAndSync(true);
+       elfos.close();
+       elfos = null;
+       file = new File(TEST_LOG_NAME);
+-- 
+1.7.0.4
+

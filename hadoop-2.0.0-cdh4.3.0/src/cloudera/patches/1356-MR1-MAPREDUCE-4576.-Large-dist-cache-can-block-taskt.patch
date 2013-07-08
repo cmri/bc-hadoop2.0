@@ -1,0 +1,149 @@
+From 091cf95e2513d3b3ddb5725a480b1778ea91783a Mon Sep 17 00:00:00 2001
+From: Thomas Graves <tgraves@apache.org>
+Date: Tue, 11 Sep 2012 14:34:27 +0000
+Subject: [PATCH 1356/1357] MR1: MAPREDUCE-4576. Large dist cache can block tasktracker heartbeat (Robert Evans via tgraves).
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/branch-1@1383430 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 5cd92fe94be2ff5657903dd87f657aff6d2c8269)
+(cherry picked from commit fd454fe5b6f4b84f1a926fba8010aaf7de1ce5c1)
+(cherry picked from commit ae4c033d88b32822b788c1b1e296e9ecb2da6e69)
+(cherry picked from commit a02f2c04fcd1788094654317e8ff5ea3c7e43c60)
+(cherry picked from commit 5b44a623f0a4476be71288c040cb0f9b4c27393d)
+---
+ .../filecache/TrackerDistributedCacheManager.java  |   67 +++++++++++++-------
+ 1 files changed, 45 insertions(+), 22 deletions(-)
+
+diff --git a/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/filecache/TrackerDistributedCacheManager.java b/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/filecache/TrackerDistributedCacheManager.java
+index fbd500b..9f62108 100644
+--- a/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/filecache/TrackerDistributedCacheManager.java
++++ b/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/filecache/TrackerDistributedCacheManager.java
+@@ -35,6 +35,7 @@ import java.util.Random;
+ import java.util.Set;
+ import java.util.TreeMap;
+ import java.util.concurrent.atomic.AtomicInteger;
++import java.util.concurrent.locks.ReentrantLock;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+@@ -589,7 +590,8 @@ public class TrackerDistributedCacheManager {
+     //
+     long size;              //the size of this cache.
+     boolean inited = false; // is it initialized ?
+-    
++    private final ReentrantLock lock = new ReentrantLock();
++ 
+     //
+     // The following five fields are Immutable.
+     //
+@@ -621,14 +623,20 @@ public class TrackerDistributedCacheManager {
+       this.key = key;
+     }
+     
+-    public synchronized void incRefCount() {
+-      refcount.incrementAndGet() ;
+-      LOG.debug(localizedLoadPath + ": refcount=" + refcount.get());
++    public void incRefCount() {
++      lock.lock();
++      try {
++        refcount.incrementAndGet() ;
++        LOG.debug(localizedLoadPath + ": refcount=" + refcount.get());
++      } finally {
++        lock.unlock();
++      }
+     }
+ 
+     public void decRefCount() {
+       synchronized (cachedArchives) {
+-        synchronized (this) {
++        lock.lock();
++        try {
+           refcount.decrementAndGet() ;
+           LOG.debug(localizedLoadPath + ": refcount=" + refcount.get());
+           if(refcount.get() <= 0) {
+@@ -636,6 +644,8 @@ public class TrackerDistributedCacheManager {
+             cachedArchives.remove(key);
+             cachedArchives.put(key, this);
+           }
++        } finally {
++          lock.unlock();
+         }
+       }
+     }
+@@ -644,9 +654,14 @@ public class TrackerDistributedCacheManager {
+       return refcount.get();
+     }
+ 
+-    public synchronized boolean isUsed() {
+-      LOG.debug(localizedLoadPath + ": refcount=" + refcount.get());
+-      return refcount.get() > 0;
++    public boolean isUsed() {
++      lock.lock();
++      try { 
++        LOG.debug(localizedLoadPath + ": refcount=" + refcount.get());
++        return refcount.get() > 0;
++      } finally {
++        lock.unlock();
++      }
+     }
+ 
+     Path getBaseDir(){
+@@ -1097,19 +1112,24 @@ public class TrackerDistributedCacheManager {
+           CacheDir leftToClean = toBeCleanedBaseDir.get(cacheStatus.getBaseDir());
+ 
+           if (leftToClean != null && (leftToClean.size > 0 || leftToClean.subdirs > 0)) {
+-            synchronized (cacheStatus) {
+-              // if reference count is zero mark the cache for deletion
+-              boolean isUsed = cacheStatus.isUsed();
+-              long cacheSize = cacheStatus.size; 
+-              LOG.debug(cacheStatus.getLocalizedUniqueDir() + ": isUsed=" + isUsed + 
+-                  " size=" + cacheSize + " leftToClean.size=" + leftToClean.size);
+-              if (!isUsed) {
+-                leftToClean.size -= cacheSize;
+-                leftToClean.subdirs--;
+-                // delete this cache entry from the global list 
+-                // and mark the localized file for deletion
+-                toBeDeletedCache.add(cacheStatus);
+-                it.remove();
++            boolean gotLock = cacheStatus.lock.tryLock();
++            if (gotLock) {
++              try {
++                // if reference count is zero mark the cache for deletion
++                boolean isUsed = cacheStatus.isUsed();
++                long cacheSize = cacheStatus.size; 
++                LOG.debug(cacheStatus.getLocalizedUniqueDir() + ": isUsed=" + isUsed + 
++                    " size=" + cacheSize + " leftToClean.size=" + leftToClean.size);
++                if (!isUsed) {
++                  leftToClean.size -= cacheSize;
++                  leftToClean.subdirs--;
++                  // delete this cache entry from the global list 
++                  // and mark the localized file for deletion
++                  toBeDeletedCache.add(cacheStatus);
++                  it.remove();
++                }
++              } finally {
++                cacheStatus.lock.unlock();
+               }
+             }
+           }
+@@ -1118,7 +1138,8 @@ public class TrackerDistributedCacheManager {
+       
+       // do the deletion, after releasing the global lock
+       for (CacheStatus cacheStatus : toBeDeletedCache) {
+-        synchronized (cacheStatus) {
++        cacheStatus.lock.lock();
++        try {
+           Path localizedDir = cacheStatus.getLocalizedUniqueDir();
+           if (cacheStatus.user == null) {
+             TrackerDistributedCacheManager.LOG.info("Deleted path " + localizedDir);
+@@ -1137,6 +1158,8 @@ public class TrackerDistributedCacheManager {
+             taskController.deleteAsUser(cacheStatus.user, relative);
+           }
+           deleteCacheInfoUpdate(cacheStatus);
++        } finally {
++          cacheStatus.lock.unlock();
+         }
+       }
+     }
+-- 
+1.7.0.4
+

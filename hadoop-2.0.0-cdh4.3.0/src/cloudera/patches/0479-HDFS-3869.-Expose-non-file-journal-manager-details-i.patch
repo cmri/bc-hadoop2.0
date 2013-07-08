@@ -1,0 +1,375 @@
+From 65bcfa19b48588367c406ead8efed2c2a1467cde Mon Sep 17 00:00:00 2001
+From: Todd Lipcon <todd@cloudera.com>
+Date: Tue, 4 Sep 2012 22:53:22 -0700
+Subject: [PATCH 0479/1357] HDFS-3869. Expose non-file journal manager details in web UI. Contributed by Todd Lipcon.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-3077@1380978 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 0247d0e8f932319a584ff81947e09e56c541d733)
+---
+ .../hadoop-hdfs/CHANGES.HDFS-3077.txt              |    2 +
+ .../hadoop/hdfs/qjournal/client/AsyncLogger.java   |    6 ++
+ .../hdfs/qjournal/client/AsyncLoggerSet.java       |   19 ++++++++
+ .../hdfs/qjournal/client/IPCLoggerChannel.java     |   22 ++++++++-
+ .../hdfs/qjournal/client/QuorumOutputStream.java   |    9 ++++
+ .../hdfs/server/namenode/EditLogOutputStream.java  |    9 ++++
+ .../hadoop/hdfs/server/namenode/JournalSet.java    |   13 +++--
+ .../hdfs/server/namenode/NamenodeJspHelper.java    |   49 ++++++++++++++++++++
+ .../src/main/webapps/hdfs/dfshealth.jsp            |    4 +-
+ .../apache/hadoop/hdfs/qjournal/TestNNWithQJM.java |   42 ++++++++++++++++-
+ 10 files changed, 165 insertions(+), 10 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/CHANGES.HDFS-3077.txt b/hadoop-hdfs-project/hadoop-hdfs/CHANGES.HDFS-3077.txt
+index 918fd8b..de41bfe 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/CHANGES.HDFS-3077.txt
++++ b/hadoop-hdfs-project/hadoop-hdfs/CHANGES.HDFS-3077.txt
+@@ -38,3 +38,5 @@ HDFS-3845. Fixes for edge cases in QJM recovery protocol (todd)
+ HDFS-3877. QJM: Provide defaults for dfs.journalnode.*address (eli)
+ 
+ HDFS-3863. Track last "committed" txid in QJM (todd)
++
++HDFS-3869. Expose non-file journal manager details in web UI (todd)
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/client/AsyncLogger.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/client/AsyncLogger.java
+index 6b5e3f3..19206e6 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/client/AsyncLogger.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/client/AsyncLogger.java
+@@ -140,4 +140,10 @@ interface AsyncLogger {
+    * after this point, and any in-flight RPCs may throw an exception.
+    */
+   public void close();
++
++  /**
++   * Append an HTML-formatted report for this logger's status to the provided
++   * StringBuilder. This is displayed on the NN web UI.
++   */
++  public void appendHtmlReport(StringBuilder sb);
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/client/AsyncLoggerSet.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/client/AsyncLoggerSet.java
+index 96300db..d158c44 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/client/AsyncLoggerSet.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/client/AsyncLoggerSet.java
+@@ -33,6 +33,7 @@ import org.apache.hadoop.hdfs.qjournal.protocol.QJournalProtocolProtos.SegmentSt
+ import org.apache.hadoop.hdfs.server.protocol.NamespaceInfo;
+ import org.apache.hadoop.hdfs.server.protocol.RemoteEditLogManifest;
+ import org.apache.hadoop.ipc.RemoteException;
++import org.apache.jasper.compiler.JspUtil;
+ 
+ import com.google.common.annotations.VisibleForTesting;
+ import com.google.common.base.Preconditions;
+@@ -190,6 +191,24 @@ class AsyncLoggerSet {
+   int size() {
+     return loggers.size();
+   }
++  
++  /**
++   * Append an HTML-formatted status readout on the current
++   * state of the underlying loggers.
++   * @param sb the StringBuilder to append to
++   */
++  void appendHtmlReport(StringBuilder sb) {
++    sb.append("<table class=\"storage\">");
++    sb.append("<thead><tr><td>JN</td><td>Status</td></tr></thead>\n");
++    for (AsyncLogger l : loggers) {
++      sb.append("<tr>");
++      sb.append("<td>" + JspUtil.escapeXml(l.toString()) + "</td>");
++      sb.append("<td>");
++      l.appendHtmlReport(sb);
++      sb.append("</td></tr>\n");
++    }
++    sb.append("</table>");
++  }
+ 
+   /**
+    * @return the (mutable) list of loggers, for use in tests to
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/client/IPCLoggerChannel.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/client/IPCLoggerChannel.java
+index 80228f8..8681513 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/client/IPCLoggerChannel.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/client/IPCLoggerChannel.java
+@@ -84,7 +84,12 @@ public class IPCLoggerChannel implements AsyncLogger {
+    * The number of bytes of edits data still in the queue.
+    */
+   private int queuedEditsSizeBytes = 0;
+-
++  
++  /**
++   * The highest txid that has been successfully logged on the remote JN.
++   */
++  private long highestAckedTxId = 0;
++  
+   /**
+    * The maximum number of bytes that can be pending in the queue.
+    * This keeps the writer from hitting OOME if one of the loggers
+@@ -262,6 +267,9 @@ public class IPCLoggerChannel implements AsyncLogger {
+         public Void call() throws IOException {
+           getProxy().journal(createReqInfo(),
+               segmentTxId, firstTxnId, numTxns, data);
++          synchronized (IPCLoggerChannel.this) {
++            highestAckedTxId = firstTxnId + numTxns - 1;
++          }
+           return null;
+         }
+       });
+@@ -398,4 +406,14 @@ public class IPCLoggerChannel implements AsyncLogger {
+   public String toString() {
+     return "Channel to journal node " + addr; 
+   }
+-}
++
++  @Override
++  public synchronized void appendHtmlReport(StringBuilder sb) {
++    sb.append("Written txid ").append(highestAckedTxId);
++    long behind = committedTxId - highestAckedTxId;
++    assert behind >= 0;
++    if (behind > 0) {
++      sb.append(" (" + behind + " behind)");
++    }
++  }
++}
+\ No newline at end of file
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/client/QuorumOutputStream.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/client/QuorumOutputStream.java
+index e46676f..4ea95ee 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/client/QuorumOutputStream.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/client/QuorumOutputStream.java
+@@ -109,4 +109,13 @@ class QuorumOutputStream extends EditLogOutputStream {
+       loggers.setCommittedTxId(firstTxToFlush + numReadyTxns - 1);
+     }
+   }
++
++  @Override
++  public String generateHtmlReport() {
++    StringBuilder sb = new StringBuilder();
++    sb.append("Writing segment beginning at txid " + segmentTxId + "<br/>\n");
++    loggers.appendHtmlReport(sb);
++    return sb.toString();
++  }
++  
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogOutputStream.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogOutputStream.java
+index cc9b62c..ec418f5 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogOutputStream.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogOutputStream.java
+@@ -24,6 +24,7 @@ import static org.apache.hadoop.util.Time.now;
+ 
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.classification.InterfaceStability;
++import org.apache.jasper.compiler.JspUtil;
+ 
+ /**
+  * A generic abstract class to support journaling of edits logs into 
+@@ -132,4 +133,12 @@ public abstract class EditLogOutputStream implements Closeable {
+   protected long getNumSync() {
+     return numSync;
+   }
++
++  /**
++   * @return a short HTML snippet suitable for describing the current
++   * status of the stream
++   */
++  public String generateHtmlReport() {
++    return JspUtil.escapeXml(this.toString());
++  }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/JournalSet.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/JournalSet.java
+index 52026b5..f1178b8 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/JournalSet.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/JournalSet.java
+@@ -26,7 +26,7 @@ import java.util.LinkedList;
+ import java.util.List;
+ import java.util.PriorityQueue;
+ import java.util.SortedSet;
+-import java.util.TreeSet;
++import java.util.concurrent.CopyOnWriteArrayList;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+@@ -147,7 +147,7 @@ public class JournalSet implements JournalManager {
+       return journal;
+     }
+ 
+-    private boolean isDisabled() {
++    boolean isDisabled() {
+       return disabled;
+     }
+ 
+@@ -165,8 +165,12 @@ public class JournalSet implements JournalManager {
+       return required;
+     }
+   }
+-  
+-  private List<JournalAndStream> journals = Lists.newArrayList();
++ 
++  // COW implementation is necessary since some users (eg the web ui) call
++  // getAllJournalStreams() and then iterate. Since this is rarely
++  // mutated, there is no performance concern.
++  private List<JournalAndStream> journals =
++      new CopyOnWriteArrayList<JournalSet.JournalAndStream>();
+   final int minimumRedundantJournals;
+   
+   JournalSet(int minimumRedundantResources) {
+@@ -519,7 +523,6 @@ public class JournalSet implements JournalManager {
+     }
+   }
+   
+-  @VisibleForTesting
+   List<JournalAndStream> getAllJournalStreams() {
+     return journals;
+   }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeJspHelper.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeJspHelper.java
+index a21bf29..102207a 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeJspHelper.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeJspHelper.java
+@@ -50,6 +50,7 @@ import org.apache.hadoop.hdfs.server.common.JspHelper;
+ import org.apache.hadoop.hdfs.server.common.Storage;
+ import org.apache.hadoop.hdfs.server.common.Storage.StorageDirectory;
+ import org.apache.hadoop.hdfs.server.common.UpgradeStatusReport;
++import org.apache.hadoop.hdfs.server.namenode.JournalSet.JournalAndStream;
+ import org.apache.hadoop.hdfs.server.protocol.NamenodeProtocols;
+ import org.apache.hadoop.http.HttpConfig;
+ import org.apache.hadoop.io.Text;
+@@ -63,6 +64,8 @@ import org.apache.hadoop.util.Time;
+ import org.apache.hadoop.util.VersionInfo;
+ import org.znerd.xmlenc.XMLOutputter;
+ 
++import com.google.common.base.Preconditions;
++
+ class NamenodeJspHelper {
+   static String getSafeModeText(FSNamesystem fsn) {
+     if (!fsn.isInSafeMode())
+@@ -230,6 +233,52 @@ class NamenodeJspHelper {
+ 
+       out.print("</table></div>\n");
+     }
++    
++    /**
++     * Generate an HTML report containing the current status of the HDFS
++     * journals.
++     */
++    void generateJournalReport(JspWriter out, NameNode nn,
++        HttpServletRequest request) throws IOException {
++      FSEditLog log = nn.getFSImage().getEditLog();
++      Preconditions.checkArgument(log != null, "no edit log set in %s", nn);
++      
++      out.println("<h3> " + nn.getRole() + " Journal Status: </h3>");
++
++      out.println("<b>Current transaction ID:</b> " +
++          nn.getFSImage().getLastAppliedOrWrittenTxId() + "<br/>");
++      
++      
++      boolean openForWrite = log.isOpenForWrite();
++      
++      out.println("<div class=\"dfstable\">");
++      out.println("<table class=\"storage\" title=\"NameNode Journals\">\n"
++              + "<thead><tr><td><b>Journal Manager</b></td><td><b>State</b></td></tr></thead>");
++      for (JournalAndStream jas : log.getJournals()) {
++        out.print("<tr>");
++        out.print("<td>" + jas.getManager());
++        if (jas.isRequired()) {
++          out.print(" [required]");
++        }
++        out.print("</td><td>");
++        
++        if (jas.isDisabled()) {
++          out.print("<span class=\"failed\">Failed</span>");
++        } else if (openForWrite) {
++          EditLogOutputStream elos = jas.getCurrentStream();
++          if (elos != null) {
++            out.println(elos.generateHtmlReport());
++          } else {
++            out.println("not currently writing");
++          }
++        } else {
++          out.println("open for read");
++        }
++        out.println("</td></tr>");
++      }
++      
++      out.println("</table></div>");
++    }
+ 
+     void generateHealthReport(JspWriter out, NameNode nn,
+         HttpServletRequest request) throws IOException {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/webapps/hdfs/dfshealth.jsp b/hadoop-hdfs-project/hadoop-hdfs/src/main/webapps/hdfs/dfshealth.jsp
+index 275fd78..637d152 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/webapps/hdfs/dfshealth.jsp
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/webapps/hdfs/dfshealth.jsp
+@@ -60,8 +60,10 @@
+ <%= NamenodeJspHelper.getCorruptFilesWarning(fsn)%>
+ 
+ <% healthjsp.generateHealthReport(out, nn, request); %>
+-<hr>
++<% healthjsp.generateJournalReport(out, nn, request); %>
++<hr/>
+ <% healthjsp.generateConfReport(out, nn, request); %>
++<hr>
+ <%
+ out.println(ServletUtil.htmlFooter());
+ %>
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/qjournal/TestNNWithQJM.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/qjournal/TestNNWithQJM.java
+index 82f8dc1..523008a 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/qjournal/TestNNWithQJM.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/qjournal/TestNNWithQJM.java
+@@ -17,17 +17,18 @@
+  */
+ package org.apache.hadoop.hdfs.qjournal;
+ 
+-import static org.junit.Assert.assertTrue;
+-import static org.junit.Assert.fail;
++import static org.junit.Assert.*;
+ 
+ import java.io.File;
+ import java.io.IOException;
++import java.net.URL;
+ 
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.FileUtil;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hdfs.DFSConfigKeys;
++import org.apache.hadoop.hdfs.DFSTestUtil;
+ import org.apache.hadoop.hdfs.HdfsConfiguration;
+ import org.apache.hadoop.hdfs.MiniDFSCluster;
+ import org.apache.hadoop.hdfs.server.namenode.NameNode;
+@@ -185,4 +186,41 @@ public class TestNNWithQJM {
+           "Unable to start log segment 1: too few journals", ioe);
+     }
+   }
++  
++  @Test
++  public void testWebPageHasQjmInfo() throws Exception {
++    conf.set(DFSConfigKeys.DFS_NAMENODE_NAME_DIR_KEY,
++        MiniDFSCluster.getBaseDirectory() + "/TestNNWithQJM/image");
++    conf.set(DFSConfigKeys.DFS_NAMENODE_EDITS_DIR_KEY,
++        mjc.getQuorumJournalURI("myjournal").toString());
++    
++    MiniDFSCluster cluster = new MiniDFSCluster.Builder(conf)
++      .numDataNodes(0)
++      .manageNameDfsDirs(false)
++      .build();
++    try {
++      URL url = new URL("http://localhost:"
++          + NameNode.getHttpAddress(cluster.getConfiguration(0)).getPort()
++          + "/dfshealth.jsp");
++      
++      cluster.getFileSystem().mkdirs(TEST_PATH);
++      
++      String contents = DFSTestUtil.urlGet(url); 
++      assertTrue(contents.contains("Channel to journal node"));
++      assertTrue(contents.contains("Written txid 2"));
++
++      // Stop one JN, do another txn, and make sure it shows as behind
++      // stuck behind the others.
++      mjc.getJournalNode(0).stopAndJoin(0);
++      
++      cluster.getFileSystem().delete(TEST_PATH, true);
++      
++      contents = DFSTestUtil.urlGet(url); 
++      System.out.println(contents);
++      assertTrue(contents.contains("(1 behind)"));
++    } finally {
++      cluster.shutdown();
++    }
++
++  }
+ }
+-- 
+1.7.0.4
+

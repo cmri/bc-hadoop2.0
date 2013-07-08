@@ -1,0 +1,417 @@
+From 955bf335cec0c9cbb76f944ea35ee74ab1b2bdba Mon Sep 17 00:00:00 2001
+From: Eli Collins <eli@apache.org>
+Date: Tue, 21 Aug 2012 03:48:00 +0000
+Subject: [PATCH 0397/1357] HDFS-2727. libhdfs should get the default block size from the server. Contributed by Colin Patrick McCabe
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1375383 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 2fe7c6dff8b9d04337a8ffcd2d3426765d9cf629)
+---
+ .../hadoop-hdfs/src/main/native/libhdfs/hdfs.c     |  130 ++++++++++++++++----
+ .../hadoop-hdfs/src/main/native/libhdfs/hdfs.h     |   38 +++++-
+ .../main/native/libhdfs/test_libhdfs_threaded.c    |   52 ++++++++-
+ 3 files changed, 192 insertions(+), 28 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/hdfs.c b/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/hdfs.c
+index 3165b47..a180dd2 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/hdfs.c
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/hdfs.c
+@@ -279,12 +279,19 @@ done:
+     return ret;
+ }
+ 
++struct hdfsBuilderConfOpt {
++    struct hdfsBuilderConfOpt *next;
++    const char *key;
++    const char *val;
++};
++
+ struct hdfsBuilder {
+     int forceNewInstance;
+     const char *nn;
+     tPort port;
+     const char *kerbTicketCachePath;
+     const char *userName;
++    struct hdfsBuilderConfOpt *opts;
+ };
+ 
+ struct hdfsBuilder *hdfsNewBuilder(void)
+@@ -297,8 +304,32 @@ struct hdfsBuilder *hdfsNewBuilder(void)
+     return bld;
+ }
+ 
++int hdfsBuilderConfSetStr(struct hdfsBuilder *bld, const char *key,
++                          const char *val)
++{
++    struct hdfsBuilderConfOpt *opt, *next;
++    
++    opt = calloc(1, sizeof(struct hdfsBuilderConfOpt));
++    if (!opt)
++        return -ENOMEM;
++    next = bld->opts;
++    bld->opts = opt;
++    opt->next = next;
++    opt->key = key;
++    opt->val = val;
++    return 0;
++}
++
+ void hdfsFreeBuilder(struct hdfsBuilder *bld)
+ {
++    struct hdfsBuilderConfOpt *cur, *next;
++
++    cur = bld->opts;
++    for (cur = bld->opts; cur; ) {
++        next = cur->next;
++        free(cur);
++        cur = next;
++    }
+     free(bld);
+ }
+ 
+@@ -451,6 +482,7 @@ hdfsFS hdfsBuilderConnect(struct hdfsBuilder *bld)
+     char *cURI = 0, buf[512];
+     int ret;
+     jobject jRet = NULL;
++    struct hdfsBuilderConfOpt *opt;
+ 
+     //Get the JNIEnv* corresponding to current thread
+     env = getJNIEnv();
+@@ -466,6 +498,16 @@ hdfsFS hdfsBuilderConnect(struct hdfsBuilder *bld)
+             "hdfsBuilderConnect(%s)", hdfsBuilderToStr(bld, buf, sizeof(buf)));
+         goto done;
+     }
++    // set configuration values
++    for (opt = bld->opts; opt; opt = opt->next) {
++        jthr = hadoopConfSetStr(env, jConfiguration, opt->key, opt->val);
++        if (jthr) {
++            ret = printExceptionAndFree(env, jthr, PRINT_EXC_ALL,
++                "hdfsBuilderConnect(%s): error setting conf '%s' to '%s'",
++                hdfsBuilderToStr(bld, buf, sizeof(buf)), opt->key, opt->val);
++            goto done;
++        }
++    }
+  
+     //Check what type of FileSystem the caller wants...
+     if (bld->nn == NULL) {
+@@ -596,7 +638,7 @@ done:
+     destroyLocalReference(env, jURIString);
+     destroyLocalReference(env, jUserString);
+     free(cURI);
+-    free(bld);
++    hdfsFreeBuilder(bld);
+ 
+     if (ret) {
+         errno = ret;
+@@ -644,7 +686,29 @@ int hdfsDisconnect(hdfsFS fs)
+     return 0;
+ }
+ 
++/**
++ * Get the default block size of a FileSystem object.
++ *
++ * @param env       The Java env
++ * @param jFS       The FileSystem object
++ * @param jPath     The path to find the default blocksize at
++ * @param out       (out param) the default block size
++ *
++ * @return          NULL on success; or the exception
++ */
++static jthrowable getDefaultBlockSize(JNIEnv *env, jobject jFS,
++                                      jobject jPath, jlong *out)
++{
++    jthrowable jthr;
++    jvalue jVal;
+ 
++    jthr = invokeMethod(env, &jVal, INSTANCE, jFS, HADOOP_FS,
++                 "getDefaultBlockSize", JMETHOD1(JPARAM(HADOOP_PATH), "J"), jPath);
++    if (jthr)
++        return jthr;
++    *out = jVal.j;
++    return NULL;
++}
+ 
+ hdfsFile hdfsOpenFile(hdfsFS fs, const char* path, int flags, 
+                       int bufferSize, short replication, tSize blockSize)
+@@ -665,7 +729,6 @@ hdfsFile hdfsOpenFile(hdfsFS fs, const char* path, int flags,
+     }
+ 
+     jstring jStrBufferSize = NULL, jStrReplication = NULL;
+-    jstring jStrBlockSize = NULL;
+     jobject jConfiguration = NULL, jPath = NULL, jFile = NULL;
+     jobject jFS = (jobject)fs;
+     jthrowable jthr;
+@@ -724,7 +787,6 @@ hdfsFile hdfsOpenFile(hdfsFS fs, const char* path, int flags,
+ 
+     jint jBufferSize = bufferSize;
+     jshort jReplication = replication;
+-    jlong jBlockSize = blockSize;
+     jStrBufferSize = (*env)->NewStringUTF(env, "io.file.buffer.size"); 
+     if (!jStrBufferSize) {
+         ret = printPendingExceptionAndFree(env, PRINT_EXC_ALL, "OOM");
+@@ -735,11 +797,6 @@ hdfsFile hdfsOpenFile(hdfsFS fs, const char* path, int flags,
+         ret = printPendingExceptionAndFree(env, PRINT_EXC_ALL, "OOM");
+         goto done;
+     }
+-    jStrBlockSize = (*env)->NewStringUTF(env, "dfs.block.size");
+-    if (!jStrBlockSize) {
+-        ret = printPendingExceptionAndFree(env, PRINT_EXC_ALL, "OOM");
+-        goto done;
+-    }
+ 
+     if (!bufferSize) {
+         jthr = invokeMethod(env, &jVal, INSTANCE, jConfiguration, 
+@@ -768,20 +825,6 @@ hdfsFile hdfsOpenFile(hdfsFS fs, const char* path, int flags,
+             }
+             jReplication = jVal.i;
+         }
+-        
+-        //blockSize
+-        if (!blockSize) {
+-            jthr = invokeMethod(env, &jVal, INSTANCE, jConfiguration, 
+-                             HADOOP_CONF, "getLong", "(Ljava/lang/String;J)J",
+-                             jStrBlockSize, (jlong)67108864);
+-            if (jthr) {
+-                ret  = printExceptionAndFree(env, jthr, PRINT_EXC_ALL,
+-                    "hdfsOpenFile(%s): Configuration#getLong(dfs.block.size)",
+-                    path);
+-                goto done;
+-            }
+-            jBlockSize = jVal.j;
+-        }
+     }
+  
+     /* Create and return either the FSDataInputStream or
+@@ -798,6 +841,15 @@ hdfsFile hdfsOpenFile(hdfsFS fs, const char* path, int flags,
+     } else {
+         // WRITE/CREATE
+         jboolean jOverWrite = 1;
++        jlong jBlockSize = blockSize;
++
++        if (jBlockSize == 0) {
++            jthr = getDefaultBlockSize(env, jFS, jPath, &jBlockSize);
++            if (jthr) {
++                ret = EIO;
++                goto done;
++            }
++        }
+         jthr = invokeMethod(env, &jVal, INSTANCE, jFS, HADOOP_FS,
+                          method, signature, jPath, jOverWrite,
+                          jBufferSize, jReplication, jBlockSize);
+@@ -842,7 +894,6 @@ hdfsFile hdfsOpenFile(hdfsFS fs, const char* path, int flags,
+ done:
+     destroyLocalReference(env, jStrBufferSize);
+     destroyLocalReference(env, jStrReplication);
+-    destroyLocalReference(env, jStrBlockSize);
+     destroyLocalReference(env, jConfiguration); 
+     destroyLocalReference(env, jPath); 
+     destroyLocalReference(env, jFile); 
+@@ -2142,6 +2193,39 @@ tOffset hdfsGetDefaultBlockSize(hdfsFS fs)
+ }
+ 
+ 
++tOffset hdfsGetDefaultBlockSizeAtPath(hdfsFS fs, const char *path)
++{
++    // JAVA EQUIVALENT:
++    //  fs.getDefaultBlockSize(path);
++
++    jthrowable jthr;
++    jobject jFS = (jobject)fs;
++    jobject jPath;
++    tOffset blockSize;
++    JNIEnv* env = getJNIEnv();
++
++    if (env == NULL) {
++        errno = EINTERNAL;
++        return -1;
++    }
++    jthr = constructNewObjectOfPath(env, path, &jPath);
++    if (jthr) {
++        errno = printExceptionAndFree(env, jthr, PRINT_EXC_ALL,
++            "hdfsGetDefaultBlockSize(path=%s): constructNewObjectOfPath",
++            path);
++        return -1;
++    }
++    jthr = getDefaultBlockSize(env, jFS, jPath, &blockSize);
++    (*env)->DeleteLocalRef(env, jPath);
++    if (jthr) {
++        errno = printExceptionAndFree(env, jthr, PRINT_EXC_ALL,
++            "hdfsGetDefaultBlockSize(path=%s): "
++            "FileSystem#getDefaultBlockSize", path);
++        return -1;
++    }
++    return blockSize;
++}
++
+ 
+ tOffset hdfsGetCapacity(hdfsFS fs)
+ {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/hdfs.h b/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/hdfs.h
+index e32c299..fa71c83 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/hdfs.h
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/hdfs.h
+@@ -217,6 +217,20 @@ extern  "C" {
+     void hdfsFreeBuilder(struct hdfsBuilder *bld);
+ 
+     /**
++     * Set a configuration string for an HdfsBuilder.
++     *
++     * @param key      The key to set.
++     * @param val      The value, or NULL to set no value.
++     *                 This will be shallow-copied.  You are responsible for
++     *                 ensuring that it remains valid until the builder is
++     *                 freed.
++     *
++     * @return         0 on success; nonzero error code otherwise.
++     */
++    int hdfsBuilderConfSetStr(struct hdfsBuilder *bld, const char *key,
++                              const char *val);
++
++    /**
+      * Get a configuration string.
+      *
+      * @param key      The key to find
+@@ -234,7 +248,7 @@ extern  "C" {
+      *
+      * @param key      The key to find
+      * @param val      (out param) The value.  This will NOT be changed if the
+-	 *                 key isn't found.
++     *                 key isn't found.
+      *
+      * @return         0 on success; nonzero error code otherwise.
+      *                 Failure to find the key is not an error.
+@@ -550,14 +564,30 @@ extern  "C" {
+ 
+ 
+     /** 
+-     * hdfsGetDefaultBlockSize - Get the optimum blocksize.
+-     * @param fs The configured filesystem handle.
+-     * @return Returns the blocksize; -1 on error. 
++     * hdfsGetDefaultBlockSize - Get the default blocksize.
++     *
++     * @param fs            The configured filesystem handle.
++     * @deprecated          Use hdfsGetDefaultBlockSizeAtPath instead.
++     *
++     * @return              Returns the default blocksize, or -1 on error.
+      */
+     tOffset hdfsGetDefaultBlockSize(hdfsFS fs);
+ 
+ 
+     /** 
++     * hdfsGetDefaultBlockSizeAtPath - Get the default blocksize at the
++     * filesystem indicated by a given path.
++     *
++     * @param fs            The configured filesystem handle.
++     * @param path          The given path will be used to locate the actual
++     *                      filesystem.  The full path does not have to exist.
++     *
++     * @return              Returns the default blocksize, or -1 on error.
++     */
++    tOffset hdfsGetDefaultBlockSizeAtPath(hdfsFS fs, const char *path);
++
++
++    /** 
+      * hdfsGetCapacity - Return the raw capacity of the filesystem.  
+      * @param fs The configured filesystem handle.
+      * @return Returns the raw-capacity; -1 on error. 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/test_libhdfs_threaded.c b/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/test_libhdfs_threaded.c
+index 06e0012..d9cb0d9 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/test_libhdfs_threaded.c
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/native/libhdfs/test_libhdfs_threaded.c
+@@ -21,14 +21,20 @@
+ #include "native_mini_dfs.h"
+ 
+ #include <errno.h>
++#include <inttypes.h>
+ #include <semaphore.h>
+ #include <pthread.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ 
++#define TO_STR_HELPER(X) #X
++#define TO_STR(X) TO_STR_HELPER(X)
++
+ #define TLH_MAX_THREADS 100
+ 
++#define TLH_DEFAULT_BLOCK_SIZE 134217728
++
+ static sem_t tlhSem;
+ 
+ static struct NativeMiniDfsCluster* tlhCluster;
+@@ -46,6 +52,7 @@ static int hdfsSingleNameNodeConnect(struct NativeMiniDfsCluster *cl, hdfsFS *fs
+ {
+     int ret, port;
+     hdfsFS hdfs;
++    struct hdfsBuilder *bld;
+     
+     port = nmdGetNameNodePort(cl);
+     if (port < 0) {
+@@ -53,7 +60,17 @@ static int hdfsSingleNameNodeConnect(struct NativeMiniDfsCluster *cl, hdfsFS *fs
+                 "returned error %d\n", port);
+         return port;
+     }
+-    hdfs = hdfsConnectNewInstance("localhost", port);
++    bld = hdfsNewBuilder();
++    if (!bld)
++        return -ENOMEM;
++    hdfsBuilderSetForceNewInstance(bld);
++    hdfsBuilderSetNameNode(bld, "localhost");
++    hdfsBuilderSetNameNodePort(bld, port);
++    hdfsBuilderConfSetStr(bld, "dfs.block.size",
++                          TO_STR(TLH_DEFAULT_BLOCK_SIZE));
++    hdfsBuilderConfSetStr(bld, "dfs.blocksize",
++                          TO_STR(TLH_DEFAULT_BLOCK_SIZE));
++    hdfs = hdfsBuilderConnect(bld);
+     if (!hdfs) {
+         ret = -errno;
+         return ret;
+@@ -62,6 +79,37 @@ static int hdfsSingleNameNodeConnect(struct NativeMiniDfsCluster *cl, hdfsFS *fs
+     return 0;
+ }
+ 
++static int doTestGetDefaultBlockSize(hdfsFS fs, const char *path)
++{
++    uint64_t blockSize;
++    int ret;
++
++    blockSize = hdfsGetDefaultBlockSize(fs);
++    if (blockSize < 0) {
++        ret = errno;
++        fprintf(stderr, "hdfsGetDefaultBlockSize failed with error %d\n", ret);
++        return ret;
++    } else if (blockSize != TLH_DEFAULT_BLOCK_SIZE) {
++        fprintf(stderr, "hdfsGetDefaultBlockSize got %"PRId64", but we "
++                "expected %d\n", blockSize, TLH_DEFAULT_BLOCK_SIZE);
++        return EIO;
++    }
++
++    blockSize = hdfsGetDefaultBlockSizeAtPath(fs, path);
++    if (blockSize < 0) {
++        ret = errno;
++        fprintf(stderr, "hdfsGetDefaultBlockSizeAtPath(%s) failed with "
++                "error %d\n", path, ret);
++        return ret;
++    } else if (blockSize != TLH_DEFAULT_BLOCK_SIZE) {
++        fprintf(stderr, "hdfsGetDefaultBlockSizeAtPath(%s) got "
++                "%"PRId64", but we expected %d\n", 
++                path, blockSize, TLH_DEFAULT_BLOCK_SIZE);
++        return EIO;
++    }
++    return 0;
++}
++
+ static int doTestHdfsOperations(struct tlhThreadInfo *ti, hdfsFS fs)
+ {
+     char prefix[256], tmp[256];
+@@ -77,6 +125,8 @@ static int doTestHdfsOperations(struct tlhThreadInfo *ti, hdfsFS fs)
+     EXPECT_ZERO(hdfsCreateDirectory(fs, prefix));
+     snprintf(tmp, sizeof(tmp), "%s/file", prefix);
+ 
++    EXPECT_ZERO(doTestGetDefaultBlockSize(fs, prefix));
++
+     /* There should not be any file to open for reading. */
+     EXPECT_NULL(hdfsOpenFile(fs, tmp, O_RDONLY, 0, 0, 0));
+ 
+-- 
+1.7.0.4
+

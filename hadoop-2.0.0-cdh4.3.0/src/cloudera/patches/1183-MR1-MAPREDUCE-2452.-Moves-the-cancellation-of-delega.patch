@@ -1,0 +1,132 @@
+From 8ce67fe4e75a9febd093af8e347b39bca92ddbe2 Mon Sep 17 00:00:00 2001
+From: Devaraj Das <ddas@apache.org>
+Date: Thu, 2 Jun 2011 05:03:36 +0000
+Subject: [PATCH 1183/1357] MR1: MAPREDUCE-2452. Moves the cancellation of delegation tokens to a separate thread. Contributed by Devaraj Das.
+
+MapReduce part of:
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/branch-0.20-security@1130409 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 4d01aab294ad571e6e1915dc710f31d1aeedd3a3)
+
+Reason: Bug
+Ref: CDH-6189
+Author: Devaraj Das
+---
+ .../security/token/DelegationTokenRenewal.java     |   77 +++++++++++++++++---
+ 1 files changed, 68 insertions(+), 9 deletions(-)
+
+diff --git a/src/mapred/org/apache/hadoop/mapreduce/security/token/DelegationTokenRenewal.java b/src/mapred/org/apache/hadoop/mapreduce/security/token/DelegationTokenRenewal.java
+index b849dee..db66b3e 100644
+--- a/src/mapred/org/apache/hadoop/mapreduce/security/token/DelegationTokenRenewal.java
++++ b/src/mapred/org/apache/hadoop/mapreduce/security/token/DelegationTokenRenewal.java
+@@ -35,6 +35,7 @@ import java.util.List;
+ import java.util.Set;
+ import java.util.Timer;
+ import java.util.TimerTask;
++import java.util.concurrent.LinkedBlockingQueue;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+@@ -48,6 +49,7 @@ import org.apache.hadoop.security.Credentials;
+ import org.apache.hadoop.security.token.Token;
+ import org.apache.hadoop.security.token.TokenIdentifier;
+ import org.apache.hadoop.security.token.SecretManager.InvalidToken;
++import org.apache.hadoop.util.StringUtils;
+ 
+ 
+ //@InterfaceAudience.Private
+@@ -100,10 +102,75 @@ public class DelegationTokenRenewal {
+   // global single timer (daemon)
+   private static Timer renewalTimer = new Timer(true);
+   
++  //delegation token canceler thread
++  private static DelegationTokenCancelThread dtCancelThread =
++    new DelegationTokenCancelThread();
++  static {
++    dtCancelThread.start();
++  }
++
++  
+   //managing the list of tokens using Map
+   // jobId=>List<tokens>
+   private static Set<DelegationTokenToRenew> delegationTokens = 
+     Collections.synchronizedSet(new HashSet<DelegationTokenToRenew>());
++  
++  private static class DelegationTokenCancelThread extends Thread {
++    private static class TokenWithConf {
++      Token<DelegationTokenIdentifier> token;
++      Configuration conf;
++      TokenWithConf(Token<DelegationTokenIdentifier> token,  
++          Configuration conf) {
++        this.token = token;
++        this.conf = conf;
++      }
++    }
++    private LinkedBlockingQueue<TokenWithConf> queue =  
++      new LinkedBlockingQueue<TokenWithConf>();
++     
++    public DelegationTokenCancelThread() {
++      super("Delegation Token Canceler");
++      setDaemon(true);
++    }
++    public void cancelToken(Token<DelegationTokenIdentifier> token,  
++        Configuration conf) {
++      TokenWithConf tokenWithConf = new TokenWithConf(token, conf);
++      while (!queue.offer(tokenWithConf)) {
++        LOG.warn("Unable to add token " + token + " for cancellation. " +
++        		 "Will retry..");
++        try {
++          Thread.sleep(100);
++        } catch (InterruptedException e) {
++          throw new RuntimeException(e);
++        }
++      }
++    }
++
++    public void run() {
++      while (true) {
++        TokenWithConf tokenWithConf = null;
++        try {
++          tokenWithConf = queue.take();
++          DistributedFileSystem dfs = getDFSForToken(tokenWithConf.token,  
++              tokenWithConf.conf);
++          if (LOG.isDebugEnabled()) {
++            LOG.debug("Canceling token " + tokenWithConf.token.getService() +  
++                " for dfs=" + dfs);
++          }
++          dfs.cancelDelegationToken(tokenWithConf.token);
++        } catch (IOException e) {
++          LOG.warn("Failed to cancel token " + tokenWithConf.token + " " +  
++              StringUtils.stringifyException(e));
++        } catch (InterruptedException ie) {
++          return;
++        } catch (Throwable t) {
++          LOG.warn("Got exception " + StringUtils.stringifyException(t) + 
++                   ". Exiting..");
++          System.exit(-1);
++        }
++      }
++    }
++  }
+   //adding token
+   private static void addTokenToList(DelegationTokenToRenew t) {
+     delegationTokens.add(t);
+@@ -273,15 +340,7 @@ public class DelegationTokenRenewal {
+     Configuration conf = t.conf;
+     
+     if(token.getKind().equals(kindHdfs)) {
+-      try {
+-        DistributedFileSystem dfs = getDFSForToken(token, conf);
+-        if (LOG.isDebugEnabled())
+-          LOG.debug("canceling token " + token.getService() + " for dfs=" +
+-              dfs);
+-        dfs.cancelDelegationToken(token);
+-      } catch (Exception e) {
+-        LOG.warn("Failed to cancel " + token, e);
+-      }
++      dtCancelThread.cancelToken(token, conf);
+     }
+   }
+   
+-- 
+1.7.0.4
+

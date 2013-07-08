@@ -1,0 +1,582 @@
+From 90c27a2ab5f510c6cb024d725bdc22a34af6d8d6 Mon Sep 17 00:00:00 2001
+From: Suresh Srinivas <suresh@apache.org>
+Date: Sat, 2 Feb 2013 22:18:50 +0000
+Subject: [PATCH 0984/1357] HDFS-4350. Make enabling of stale marking on read and write paths independent. Contributed by Andrew Wang.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1441819 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit f5904a3fcc4b85b91a20e92ec4712f2f2e1bd5df)
+---
+ .../java/org/apache/hadoop/hdfs/DFSConfigKeys.java |   12 +-
+ .../main/java/org/apache/hadoop/hdfs/DFSUtil.java  |    4 +-
+ .../server/blockmanagement/DatanodeManager.java    |   98 +++++++++-----------
+ .../server/blockmanagement/HeartbeatManager.java   |   70 ++++----------
+ .../hadoop/hdfs/server/namenode/FSNamesystem.java  |   12 +-
+ .../src/main/resources/hdfs-default.xml            |   23 ++---
+ .../java/org/apache/hadoop/hdfs/TestGetBlocks.java |    2 +-
+ .../blockmanagement/TestReplicationPolicy.java     |   44 +++++----
+ .../namenode/metrics/TestNameNodeMetrics.java      |    3 +-
+ 9 files changed, 114 insertions(+), 154 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+index 827b594..eabf016 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+@@ -181,10 +181,10 @@ public class DFSConfigKeys extends CommonConfigurationKeys {
+   public static final String  DFS_DATANODE_SOCKET_REUSE_KEEPALIVE_KEY = "dfs.datanode.socket.reuse.keepalive";
+   public static final int     DFS_DATANODE_SOCKET_REUSE_KEEPALIVE_DEFAULT = 1000;
+   
+-  // Whether to enable datanode's stale state detection and usage
+-  public static final String DFS_NAMENODE_CHECK_STALE_DATANODE_KEY = "dfs.namenode.check.stale.datanode";
+-  public static final boolean DFS_NAMENODE_CHECK_STALE_DATANODE_DEFAULT = false;
+-  // Whether to enable datanode's stale state detection and usage
++  // Whether to enable datanode's stale state detection and usage for reads
++  public static final String DFS_NAMENODE_AVOID_STALE_DATANODE_FOR_READ_KEY = "dfs.namenode.avoid.read.stale.datanode";
++  public static final boolean DFS_NAMENODE_AVOID_STALE_DATANODE_FOR_READ_DEFAULT = false;
++  // Whether to enable datanode's stale state detection and usage for writes
+   public static final String DFS_NAMENODE_AVOID_STALE_DATANODE_FOR_WRITE_KEY = "dfs.namenode.avoid.write.stale.datanode";
+   public static final boolean DFS_NAMENODE_AVOID_STALE_DATANODE_FOR_WRITE_DEFAULT = false;
+   // The default value of the time interval for marking datanodes as stale
+@@ -195,8 +195,8 @@ public class DFSConfigKeys extends CommonConfigurationKeys {
+   public static final String DFS_NAMENODE_STALE_DATANODE_MINIMUM_INTERVAL_KEY = "dfs.namenode.stale.datanode.minimum.interval";
+   public static final int DFS_NAMENODE_STALE_DATANODE_MINIMUM_INTERVAL_DEFAULT = 3; // i.e. min_interval is 3 * heartbeat_interval = 9s
+   
+-  // When the number stale datanodes marked as stale reached this certian ratio, 
+-  // stop avoiding writing to stale nodes so as to prevent causing hotspots.
++  // When the percentage of stale datanodes reaches this ratio,
++  // allow writing to stale nodes to prevent hotspots.
+   public static final String DFS_NAMENODE_USE_STALE_DATANODE_FOR_WRITE_RATIO_KEY = "dfs.namenode.write.stale.datanode.ratio";
+   public static final float DFS_NAMENODE_USE_STALE_DATANODE_FOR_WRITE_RATIO_DEFAULT = 0.5f;
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSUtil.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSUtil.java
+index b9ea4c5..a46e5c2 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSUtil.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSUtil.java
+@@ -138,7 +138,7 @@ public class DFSUtil {
+   /**
+    * Comparator for sorting DataNodeInfo[] based on decommissioned/stale states.
+    * Decommissioned/stale nodes are moved to the end of the array on sorting
+-   * with this compartor.
++   * with this comparator.
+    */ 
+   @InterfaceAudience.Private 
+   public static class DecomStaleComparator implements Comparator<DatanodeInfo> {
+@@ -148,7 +148,7 @@ public class DFSUtil {
+      * Constructor of DecomStaleComparator
+      * 
+      * @param interval
+-     *          The time invertal for marking datanodes as stale is passed from
++     *          The time interval for marking datanodes as stale is passed from
+      *          outside, since the interval may be changed dynamically
+      */
+     public DecomStaleComparator(long interval) {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeManager.java
+index fc81159..8fa9e28 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeManager.java
+@@ -129,15 +129,26 @@ public class DatanodeManager {
+   private final long heartbeatExpireInterval;
+   /** Ask Datanode only up to this many blocks to delete. */
+   final int blockInvalidateLimit;
+-  
+-  /** Whether or not to check stale DataNodes for read/write */
+-  private final boolean checkForStaleDataNodes;
+ 
+   /** The interval for judging stale DataNodes for read/write */
+   private final long staleInterval;
+   
+-  /** Whether or not to avoid using stale DataNodes for writing */
+-  private volatile boolean avoidStaleDataNodesForWrite;
++  /** Whether or not to avoid using stale DataNodes for reading */
++  private final boolean avoidStaleDataNodesForRead;
++
++  /**
++   * Whether or not to avoid using stale DataNodes for writing.
++   * Note that, even if this is configured, the policy may be
++   * temporarily disabled when a high percentage of the nodes
++   * are marked as stale.
++   */
++  private final boolean avoidStaleDataNodesForWrite;
++
++  /**
++   * When the ratio of stale datanodes reaches this number, stop avoiding 
++   * writing to stale datanodes, i.e., continue using stale nodes for writing.
++   */
++  private final float ratioUseStaleDataNodesForWrite;
+   
+   /** The number of stale DataNodes */
+   private volatile int numStaleNodes;
+@@ -190,14 +201,23 @@ public class DatanodeManager {
+         DFSConfigKeys.DFS_BLOCK_INVALIDATE_LIMIT_KEY, blockInvalidateLimit);
+     LOG.info(DFSConfigKeys.DFS_BLOCK_INVALIDATE_LIMIT_KEY
+         + "=" + this.blockInvalidateLimit);
+-    
+-    checkForStaleDataNodes = conf.getBoolean(
+-        DFSConfigKeys.DFS_NAMENODE_CHECK_STALE_DATANODE_KEY,
+-        DFSConfigKeys.DFS_NAMENODE_CHECK_STALE_DATANODE_DEFAULT);
+ 
+-    staleInterval = getStaleIntervalFromConf(conf, heartbeatExpireInterval);
+-    avoidStaleDataNodesForWrite = getAvoidStaleForWriteFromConf(conf,
+-        checkForStaleDataNodes);
++    this.avoidStaleDataNodesForRead = conf.getBoolean(
++        DFSConfigKeys.DFS_NAMENODE_AVOID_STALE_DATANODE_FOR_READ_KEY,
++        DFSConfigKeys.DFS_NAMENODE_AVOID_STALE_DATANODE_FOR_READ_DEFAULT);
++    this.avoidStaleDataNodesForWrite = conf.getBoolean(
++        DFSConfigKeys.DFS_NAMENODE_AVOID_STALE_DATANODE_FOR_WRITE_KEY,
++        DFSConfigKeys.DFS_NAMENODE_AVOID_STALE_DATANODE_FOR_WRITE_DEFAULT);
++    this.staleInterval = getStaleIntervalFromConf(conf, heartbeatExpireInterval);
++    this.ratioUseStaleDataNodesForWrite = conf.getFloat(
++        DFSConfigKeys.DFS_NAMENODE_USE_STALE_DATANODE_FOR_WRITE_RATIO_KEY,
++        DFSConfigKeys.DFS_NAMENODE_USE_STALE_DATANODE_FOR_WRITE_RATIO_DEFAULT);
++    Preconditions.checkArgument(
++        (ratioUseStaleDataNodesForWrite > 0 && 
++            ratioUseStaleDataNodesForWrite <= 1.0f),
++        DFSConfigKeys.DFS_NAMENODE_USE_STALE_DATANODE_FOR_WRITE_RATIO_KEY +
++        " = '" + ratioUseStaleDataNodesForWrite + "' is invalid. " +
++        "It should be a positive non-zero float value, not greater than 1.0f.");
+   }
+   
+   private static long getStaleIntervalFromConf(Configuration conf,
+@@ -237,22 +257,6 @@ public class DatanodeManager {
+     return staleInterval;
+   }
+   
+-  static boolean getAvoidStaleForWriteFromConf(Configuration conf,
+-      boolean checkForStale) {
+-    boolean avoid = conf.getBoolean(
+-        DFSConfigKeys.DFS_NAMENODE_AVOID_STALE_DATANODE_FOR_WRITE_KEY,
+-        DFSConfigKeys.DFS_NAMENODE_AVOID_STALE_DATANODE_FOR_WRITE_DEFAULT);
+-    boolean avoidStaleDataNodesForWrite = checkForStale && avoid;
+-    if (!checkForStale && avoid) {
+-      LOG.warn("Cannot set "
+-          + DFSConfigKeys.DFS_NAMENODE_CHECK_STALE_DATANODE_KEY
+-          + " as false while setting "
+-          + DFSConfigKeys.DFS_NAMENODE_AVOID_STALE_DATANODE_FOR_WRITE_KEY
+-          + " as true.");
+-    }
+-    return avoidStaleDataNodesForWrite;
+-  }
+-  
+   void activate(final Configuration conf) {
+     final DecommissionManager dm = new DecommissionManager(namesystem, blockManager);
+     this.decommissionthread = new Daemon(dm.new Monitor(
+@@ -305,9 +309,9 @@ public class DatanodeManager {
+       if (rName != null)
+         client = new NodeBase(rName + NodeBase.PATH_SEPARATOR_STR + targethost);
+     }
+-    Comparator<DatanodeInfo> comparator = checkForStaleNodes ? 
+-                    new DFSUtil.DecomStaleComparator(staleInterval) : 
+-                    DFSUtil.DECOM_COMPARATOR;
++    Comparator<DatanodeInfo> comparator = avoidStaleDataNodesForRead ?
++        new DFSUtil.DecomStaleComparator(staleInterval) : 
++        DFSUtil.DECOM_COMPARATOR;
+     for (LocatedBlock b : locatedblocks) {
+       networktopology.pseudoSortByDistance(client, b.getLocations());
+       
+@@ -859,32 +863,20 @@ public class DatanodeManager {
+   }
+   
+   /* Getter and Setter for stale DataNodes related attributes */
+-  
+-  /**
+-   * @return whether or not to avoid writing to stale datanodes
+-   */
+-  public boolean isAvoidingStaleDataNodesForWrite() {
+-    return avoidStaleDataNodesForWrite;
+-  }
+ 
+   /**
+-   * Set the value of {@link DatanodeManager#avoidStaleDataNodesForWrite}. 
+-   * The HeartbeatManager disable avoidStaleDataNodesForWrite when more than
+-   * half of the DataNodes are marked as stale.
++   * Whether stale datanodes should be avoided as targets on the write path.
++   * The result of this function may change if the number of stale datanodes
++   * eclipses a configurable threshold.
+    * 
+-   * @param avoidStaleDataNodesForWrite
+-   *          The value to set to
+-   *          {@link DatanodeManager#avoidStaleDataNodesForWrite}
+-   */
+-  void setAvoidStaleDataNodesForWrite(boolean avoidStaleDataNodesForWrite) {
+-    this.avoidStaleDataNodesForWrite = avoidStaleDataNodesForWrite;
+-  }
+-
+-  /**
+-   * @return Whether or not to check stale DataNodes for R/W
++   * @return whether stale datanodes should be avoided on the write path
+    */
+-  boolean isCheckingForStaleDataNodes() {
+-    return checkForStaleDataNodes;
++  public boolean shouldAvoidStaleDataNodesForWrite() {
++    // If # stale exceeds maximum staleness ratio, disable stale
++    // datanode avoidance on the write path
++    return avoidStaleDataNodesForWrite &&
++        (numStaleNodes <= heartbeatManager.getLiveDatanodeCount()
++            * ratioUseStaleDataNodesForWrite);
+   }
+   
+   /**
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/HeartbeatManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/HeartbeatManager.java
+index e2aa837..49f8a93 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/HeartbeatManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/HeartbeatManager.java
+@@ -31,8 +31,6 @@ import org.apache.hadoop.hdfs.server.namenode.Namesystem;
+ import org.apache.hadoop.util.Daemon;
+ import org.apache.hadoop.util.Time;
+ 
+-import com.google.common.base.Preconditions;
+-
+ /**
+  * Manage the heartbeats received from datanodes.
+  * The datanode list and statistics are synchronized
+@@ -57,16 +55,7 @@ class HeartbeatManager implements DatanodeStatistics {
+   private final long heartbeatRecheckInterval;
+   /** Heartbeat monitor thread */
+   private final Daemon heartbeatThread = new Daemon(new Monitor());
+-  /**
+-   * The initial setting of end user which indicates whether or not to avoid
+-   * writing to stale datanodes.
+-   */
+-  private final boolean initialAvoidWriteStaleNodes;
+-  /**
+-   * When the ratio of stale datanodes reaches this number, stop avoiding 
+-   * writing to stale datanodes, i.e., continue using stale nodes for writing.
+-   */
+-  private final float ratioUseStaleDataNodesForWrite;
++
+     
+   final Namesystem namesystem;
+   final BlockManager blockManager;
+@@ -75,30 +64,25 @@ class HeartbeatManager implements DatanodeStatistics {
+       final BlockManager blockManager, final Configuration conf) {
+     this.namesystem = namesystem;
+     this.blockManager = blockManager;
+-    boolean checkStaleNodes = conf.getBoolean(
+-        DFSConfigKeys.DFS_NAMENODE_CHECK_STALE_DATANODE_KEY,
+-        DFSConfigKeys.DFS_NAMENODE_CHECK_STALE_DATANODE_DEFAULT);
++    boolean avoidStaleDataNodesForWrite = conf.getBoolean(
++        DFSConfigKeys.DFS_NAMENODE_AVOID_STALE_DATANODE_FOR_WRITE_KEY,
++        DFSConfigKeys.DFS_NAMENODE_AVOID_STALE_DATANODE_FOR_WRITE_DEFAULT);
+     long recheckInterval = conf.getInt(
+-        DFSConfigKeys.DFS_NAMENODE_HEARTBEAT_RECHECK_INTERVAL_KEY, 
++        DFSConfigKeys.DFS_NAMENODE_HEARTBEAT_RECHECK_INTERVAL_KEY,
+         DFSConfigKeys.DFS_NAMENODE_HEARTBEAT_RECHECK_INTERVAL_DEFAULT); // 5 min
+     long staleInterval = conf.getLong(
+-        DFSConfigKeys.DFS_NAMENODE_STALE_DATANODE_INTERVAL_KEY, 
++        DFSConfigKeys.DFS_NAMENODE_STALE_DATANODE_INTERVAL_KEY,
+         DFSConfigKeys.DFS_NAMENODE_STALE_DATANODE_INTERVAL_DEFAULT);// 30s
+-    this.initialAvoidWriteStaleNodes = DatanodeManager
+-        .getAvoidStaleForWriteFromConf(conf, checkStaleNodes);
+-    this.ratioUseStaleDataNodesForWrite = conf.getFloat(
+-        DFSConfigKeys.DFS_NAMENODE_USE_STALE_DATANODE_FOR_WRITE_RATIO_KEY,
+-        DFSConfigKeys.DFS_NAMENODE_USE_STALE_DATANODE_FOR_WRITE_RATIO_DEFAULT);
+-    Preconditions.checkArgument(
+-        (ratioUseStaleDataNodesForWrite > 0 && 
+-            ratioUseStaleDataNodesForWrite <= 1.0f),
+-        DFSConfigKeys.DFS_NAMENODE_USE_STALE_DATANODE_FOR_WRITE_RATIO_KEY +
+-        " = '" + ratioUseStaleDataNodesForWrite + "' is invalid. " +
+-        "It should be a positive non-zero float value, not greater than 1.0f.");
+-    
+-    this.heartbeatRecheckInterval = (checkStaleNodes 
+-        && initialAvoidWriteStaleNodes 
+-        && staleInterval < recheckInterval) ? staleInterval : recheckInterval;
++
++    if (avoidStaleDataNodesForWrite && staleInterval < recheckInterval) {
++      this.heartbeatRecheckInterval = staleInterval;
++      LOG.info("Setting heartbeat recheck interval to " + staleInterval
++          + " since " + DFSConfigKeys.DFS_NAMENODE_STALE_DATANODE_INTERVAL_KEY
++          + " is less than "
++          + DFSConfigKeys.DFS_NAMENODE_HEARTBEAT_RECHECK_INTERVAL_KEY);
++    } else {
++      this.heartbeatRecheckInterval = recheckInterval;
++    }
+   }
+ 
+   void activate(Configuration conf) {
+@@ -243,7 +227,6 @@ class HeartbeatManager implements DatanodeStatistics {
+     if (namesystem.isInSafeMode()) {
+       return;
+     }
+-    boolean checkStaleNodes = dm.isCheckingForStaleDataNodes();
+     boolean allAlive = false;
+     while (!allAlive) {
+       // locate the first dead node.
+@@ -255,29 +238,14 @@ class HeartbeatManager implements DatanodeStatistics {
+           if (dead == null && dm.isDatanodeDead(d)) {
+             stats.incrExpiredHeartbeats();
+             dead = d;
+-            if (!checkStaleNodes) {
+-              break;
+-            }
+           }
+-          if (checkStaleNodes && 
+-              d.isStale(dm.getStaleInterval())) {
++          if (d.isStale(dm.getStaleInterval())) {
+             numOfStaleNodes++;
+           }
+         }
+         
+-        // Change whether to avoid using stale datanodes for writing
+-        // based on proportion of stale datanodes
+-        if (checkStaleNodes) {
+-          dm.setNumStaleNodes(numOfStaleNodes);
+-          if (numOfStaleNodes > 
+-                datanodes.size() * ratioUseStaleDataNodesForWrite) {
+-            dm.setAvoidStaleDataNodesForWrite(false);
+-          } else {
+-            if (this.initialAvoidWriteStaleNodes) {
+-              dm.setAvoidStaleDataNodesForWrite(true);
+-            }
+-          }
+-        }
++        // Set the number of stale nodes in the DatanodeManager
++        dm.setNumStaleNodes(numOfStaleNodes);
+       }
+ 
+       allAlive = dead == null;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+index 749c28f..f9a1b88 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+@@ -5725,6 +5725,12 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+     this.nnResourceChecker = nnResourceChecker;
+   }
+ 
++  @Override
++  public boolean isAvoidingStaleDataNodesForWrite() {
++    return this.blockManager.getDatanodeManager()
++        .shouldAvoidStaleDataNodesForWrite();
++  }
++
+   /**
+    * Default AuditLogger implementation; used when no access logger is
+    * defined in the config file. It can also be explicitly listed in the
+@@ -5763,10 +5769,4 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+     }
+ 
+   }
+-
+-  @Override
+-  public boolean isAvoidingStaleDataNodesForWrite() {
+-    return this.blockManager.getDatanodeManager()
+-        .isAvoidingStaleDataNodesForWrite();
+-  }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml b/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+index e0e3d58..3deb50c 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+@@ -1008,17 +1008,14 @@
+ </property>
+ 
+ <property>
+-  <name>dfs.namenode.check.stale.datanode</name>
++  <name>dfs.namenode.avoid.read.stale.datanode</name>
+   <value>false</value>
+   <description>
+-    Indicate whether or not to check "stale" datanodes whose 
++    Indicate whether or not to avoid reading from &quot;stale&quot; datanodes whose
+     heartbeat messages have not been received by the namenode 
+-    for more than a specified time interval. If this configuration 
+-    parameter is set as true, the system will keep track 
+-    of the number of stale datanodes. The stale datanodes will be 
++    for more than a specified time interval. Stale datanodes will be
+     moved to the end of the node list returned for reading. See
+-    dfs.namenode.avoid.write.stale.datanode for details on how this 
+-    affects writes. 
++    dfs.namenode.avoid.write.stale.datanode for a similar setting for writes.
+   </description>
+ </property>
+ 
+@@ -1026,13 +1023,13 @@
+   <name>dfs.namenode.avoid.write.stale.datanode</name>
+   <value>false</value>
+   <description>
+-    Indicate whether or not to avoid writing to "stale" datanodes whose 
++    Indicate whether or not to avoid writing to &quot;stale&quot; datanodes whose 
+     heartbeat messages have not been received by the namenode 
+-    for more than a specified time interval. If this configuration 
+-    parameter and dfs.namenode.check.stale.datanode are both set as true, 
+-    the writing will avoid using stale datanodes unless a high number 
+-    of datanodes are marked as stale. See 
+-    dfs.namenode.write.stale.datanode.ratio for details.
++    for more than a specified time interval. Writes will avoid using 
++    stale datanodes unless more than a configured ratio 
++    (dfs.namenode.write.stale.datanode.ratio) of datanodes are marked as 
++    stale. See dfs.namenode.avoid.read.stale.datanode for a similar setting
++    for reads.
+   </description>
+ </property>
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestGetBlocks.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestGetBlocks.java
+index c1f4a67..3b21e73 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestGetBlocks.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestGetBlocks.java
+@@ -88,7 +88,7 @@ public class TestGetBlocks {
+   @Test
+   public void testReadSelectNonStaleDatanode() throws Exception {
+     HdfsConfiguration conf = new HdfsConfiguration();
+-    conf.setBoolean(DFSConfigKeys.DFS_NAMENODE_CHECK_STALE_DATANODE_KEY, true);
++    conf.setBoolean(DFSConfigKeys.DFS_NAMENODE_AVOID_STALE_DATANODE_FOR_READ_KEY, true);
+     long staleInterval = 30 * 1000 * 60;
+     conf.setLong(DFSConfigKeys.DFS_NAMENODE_STALE_DATANODE_INTERVAL_KEY,
+         staleInterval);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestReplicationPolicy.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestReplicationPolicy.java
+index c89ef84..cd50706 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestReplicationPolicy.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestReplicationPolicy.java
+@@ -88,9 +88,11 @@ public class TestReplicationPolicy {
+         "test.build.data", "build/test/data"), "dfs/");
+     conf.set(DFSConfigKeys.DFS_NAMENODE_NAME_DIR_KEY,
+         new File(baseDir, "name").getPath());
+-    // Enable the checking for stale datanodes in the beginning
+-    conf.setBoolean(DFSConfigKeys.DFS_NAMENODE_CHECK_STALE_DATANODE_KEY, true);
+ 
++    conf.setBoolean(
++        DFSConfigKeys.DFS_NAMENODE_AVOID_STALE_DATANODE_FOR_READ_KEY, true);
++    conf.setBoolean(
++        DFSConfigKeys.DFS_NAMENODE_AVOID_STALE_DATANODE_FOR_WRITE_KEY, true);
+     DFSTestUtil.formatNameNode(conf);
+     namenode = new NameNode(conf);
+ 
+@@ -100,6 +102,8 @@ public class TestReplicationPolicy {
+     // construct network topology
+     for (int i=0; i < NUM_OF_DATANODES; i++) {
+       cluster.add(dataNodes[i]);
++      bm.getDatanodeManager().getHeartbeatManager().addDatanode(
++          dataNodes[i]);
+     }
+     for (int i=0; i < NUM_OF_DATANODES; i++) {
+       dataNodes[i].updateHeartbeat(
+@@ -393,11 +397,11 @@ public class TestReplicationPolicy {
+       throws Exception {
+     try {
+       namenode.getNamesystem().getBlockManager().getDatanodeManager()
+-        .setAvoidStaleDataNodesForWrite(true);
++        .setNumStaleNodes(NUM_OF_DATANODES);
+       testChooseTargetWithMoreThanAvailableNodes();
+     } finally {
+       namenode.getNamesystem().getBlockManager().getDatanodeManager()
+-      .setAvoidStaleDataNodesForWrite(false);
++        .setNumStaleNodes(0);
+     }
+   }
+   
+@@ -479,12 +483,12 @@ public class TestReplicationPolicy {
+   
+   @Test
+   public void testChooseTargetWithStaleNodes() throws Exception {
+-    // Enable avoidng writing to stale datanodes
+-    namenode.getNamesystem().getBlockManager().getDatanodeManager()
+-        .setAvoidStaleDataNodesForWrite(true);
+     // Set dataNodes[0] as stale
+     dataNodes[0].setLastUpdate(Time.now() - staleInterval - 1);
+-
++    namenode.getNamesystem().getBlockManager()
++      .getDatanodeManager().getHeartbeatManager().heartbeatCheck();
++    assertTrue(namenode.getNamesystem().getBlockManager()
++        .getDatanodeManager().shouldAvoidStaleDataNodesForWrite());
+     DatanodeDescriptor[] targets;
+     // We set the datanode[0] as stale, thus should choose datanode[1] since
+     // datanode[1] is on the same rack with datanode[0] (writer)
+@@ -503,9 +507,9 @@ public class TestReplicationPolicy {
+     assertFalse(cluster.isOnSameRack(targets[0], dataNodes[0]));
+     
+     // reset
+-    namenode.getNamesystem().getBlockManager().getDatanodeManager()
+-        .setAvoidStaleDataNodesForWrite(false);
+     dataNodes[0].setLastUpdate(Time.now());
++    namenode.getNamesystem().getBlockManager()
++      .getDatanodeManager().getHeartbeatManager().heartbeatCheck();
+   }
+ 
+   /**
+@@ -518,20 +522,20 @@ public class TestReplicationPolicy {
+    */
+   @Test
+   public void testChooseTargetWithHalfStaleNodes() throws Exception {
+-    // Enable stale datanodes checking
+-    namenode.getNamesystem().getBlockManager().getDatanodeManager()
+-        .setAvoidStaleDataNodesForWrite(true);
+     // Set dataNodes[0], dataNodes[1], and dataNodes[2] as stale
+     for (int i = 0; i < 3; i++) {
+       dataNodes[i].setLastUpdate(Time.now() - staleInterval - 1);
+     }
++    namenode.getNamesystem().getBlockManager()
++      .getDatanodeManager().getHeartbeatManager().heartbeatCheck();
+ 
+     DatanodeDescriptor[] targets;
+     targets = replicator.chooseTarget(filename, 0, dataNodes[0],
+         new ArrayList<DatanodeDescriptor>(), BLOCK_SIZE);
+     assertEquals(targets.length, 0);
+ 
+-    // We set the datanode[0] as stale, thus should choose datanode[1]
++    // Since we have 6 datanodes total, stale nodes should
++    // not be returned until we ask for more than 3 targets
+     targets = replicator.chooseTarget(filename, 1, dataNodes[0],
+         new ArrayList<DatanodeDescriptor>(), BLOCK_SIZE);
+     assertEquals(targets.length, 1);
+@@ -557,18 +561,16 @@ public class TestReplicationPolicy {
+     assertTrue(containsWithinRange(dataNodes[4], targets, 0, 3));
+     assertTrue(containsWithinRange(dataNodes[5], targets, 0, 3));
+ 
+-    // reset
+-    namenode.getNamesystem().getBlockManager().getDatanodeManager()
+-        .setAvoidStaleDataNodesForWrite(false);
+     for (int i = 0; i < dataNodes.length; i++) {
+       dataNodes[i].setLastUpdate(Time.now());
+     }
++    namenode.getNamesystem().getBlockManager()
++      .getDatanodeManager().getHeartbeatManager().heartbeatCheck();
+   }
+ 
+   @Test
+   public void testChooseTargetWithMoreThanHalfStaleNodes() throws Exception {
+     HdfsConfiguration conf = new HdfsConfiguration();
+-    conf.setBoolean(DFSConfigKeys.DFS_NAMENODE_CHECK_STALE_DATANODE_KEY, true);
+     conf.setBoolean(
+         DFSConfigKeys.DFS_NAMENODE_AVOID_STALE_DATANODE_FOR_WRITE_KEY, true);
+     String[] hosts = new String[]{"host1", "host2", "host3", 
+@@ -598,7 +600,7 @@ public class TestReplicationPolicy {
+           .getBlockManager().getDatanodeManager().getNumStaleNodes();
+       assertEquals(numStaleNodes, 2);
+       assertTrue(miniCluster.getNameNode().getNamesystem().getBlockManager()
+-          .getDatanodeManager().isAvoidingStaleDataNodesForWrite());
++          .getDatanodeManager().shouldAvoidStaleDataNodesForWrite());
+       // Call chooseTarget
+       DatanodeDescriptor staleNodeInfo = miniCluster.getNameNode()
+           .getNamesystem().getBlockManager().getDatanodeManager()
+@@ -627,7 +629,7 @@ public class TestReplicationPolicy {
+       // According to our strategy, stale datanodes will be included for writing
+       // to avoid hotspots
+       assertFalse(miniCluster.getNameNode().getNamesystem().getBlockManager()
+-          .getDatanodeManager().isAvoidingStaleDataNodesForWrite());     
++          .getDatanodeManager().shouldAvoidStaleDataNodesForWrite());
+       // Call chooseTarget
+       targets = replicator.chooseTarget(filename, 3,
+           staleNodeInfo, new ArrayList<DatanodeDescriptor>(), BLOCK_SIZE);
+@@ -650,7 +652,7 @@ public class TestReplicationPolicy {
+           .getBlockManager().getDatanodeManager().getNumStaleNodes();
+       assertEquals(numStaleNodes, 2);
+       assertTrue(miniCluster.getNameNode().getNamesystem().getBlockManager()
+-          .getDatanodeManager().isAvoidingStaleDataNodesForWrite());
++          .getDatanodeManager().shouldAvoidStaleDataNodesForWrite());
+       // Call chooseTarget
+       targets = replicator.chooseTarget(filename, 3,
+           staleNodeInfo, new ArrayList<DatanodeDescriptor>(), BLOCK_SIZE);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/metrics/TestNameNodeMetrics.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/metrics/TestNameNodeMetrics.java
+index edb3bf5..1a200a8 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/metrics/TestNameNodeMetrics.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/metrics/TestNameNodeMetrics.java
+@@ -80,7 +80,8 @@ public class TestNameNodeMetrics {
+         DFS_REPLICATION_INTERVAL);
+     CONF.set(DFSConfigKeys.DFS_METRICS_PERCENTILES_INTERVALS_KEY, 
+         "" + PERCENTILES_INTERVAL);
+-
++    // Enable stale DataNodes checking
++    CONF.setBoolean(DFSConfigKeys.DFS_NAMENODE_AVOID_STALE_DATANODE_FOR_READ_KEY, true);
+     ((Log4JLogger)LogFactory.getLog(MetricsAsserts.class))
+       .getLogger().setLevel(Level.DEBUG);
+   }
+-- 
+1.7.0.4
+

@@ -1,0 +1,154 @@
+From 0c34f4c63ff26486203ed8ac8d01d4f37ad64f2b Mon Sep 17 00:00:00 2001
+From: Aaron Twining Myers <atm@apache.org>
+Date: Wed, 22 Aug 2012 18:48:32 +0000
+Subject: [PATCH 0400/1357] HDFS-3835. Long-lived 2NN cannot perform a checkpoint if security is enabled and the NN restarts with outstanding delegation tokens. Contributed by Aaron T. Myers.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/branch-2@1376189 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 415e34cd43d0551d2a098d11a3594fca25e96fec)
+---
+ .../AbstractDelegationTokenSecretManager.java      |   12 +++++-
+ .../hadoop/hdfs/server/namenode/FSImage.java       |    1 +
+ .../hadoop/hdfs/server/namenode/FSNamesystem.java  |    2 +-
+ .../hdfs/server/namenode/SecondaryNameNode.java    |    1 +
+ .../hdfs/server/namenode/TestCheckpoint.java       |   44 ++++++++++++++++++++
+ 5 files changed, 58 insertions(+), 2 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/delegation/AbstractDelegationTokenSecretManager.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/delegation/AbstractDelegationTokenSecretManager.java
+index 1a2801a..97530d1 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/delegation/AbstractDelegationTokenSecretManager.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/delegation/AbstractDelegationTokenSecretManager.java
+@@ -113,6 +113,16 @@ extends AbstractDelegationTokenIdentifier>
+     }
+   }
+   
++  /**
++   * Reset all data structures and mutable state.
++   */
++  public synchronized void reset() {
++    currentId = 0;
++    allKeys.clear();
++    delegationTokenSequenceNumber = 0;
++    currentTokens.clear();
++  }
++  
+   /** 
+    * Add a previously used master key to cache (when NN restarts), 
+    * should be called before activate().
+@@ -190,7 +200,6 @@ extends AbstractDelegationTokenIdentifier>
+   
+   @Override
+   protected synchronized byte[] createPassword(TokenIdent identifier) {
+-    LOG.info("Creating password for identifier: "+identifier);
+     int sequenceNum;
+     long now = Time.now();
+     sequenceNum = ++delegationTokenSequenceNumber;
+@@ -198,6 +207,7 @@ extends AbstractDelegationTokenIdentifier>
+     identifier.setMaxDate(now + tokenMaxLifetime);
+     identifier.setMasterKeyId(currentId);
+     identifier.setSequenceNumber(sequenceNum);
++    LOG.info("Creating password for identifier: " + identifier);
+     byte[] password = createPassword(identifier.getBytes(), currentKey.getKey());
+     currentTokens.put(identifier, new DelegationTokenInformation(now
+         + tokenRenewInterval, password));
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java
+index 864c0f3..22af950 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java
+@@ -573,6 +573,7 @@ public class FSImage implements Closeable {
+    */
+   void reloadFromImageFile(File file, FSNamesystem target) throws IOException {
+     target.dir.reset();
++    target.dtSecretManager.reset();
+ 
+     LOG.debug("Reloading namespace from " + file);
+     loadFSImage(file, target, null);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+index 0020364..89e55e4 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+@@ -284,7 +284,7 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+   // Scan interval is not configurable.
+   private static final long DELEGATION_TOKEN_REMOVER_SCAN_INTERVAL =
+     TimeUnit.MILLISECONDS.convert(1, TimeUnit.HOURS);
+-  private final DelegationTokenSecretManager dtSecretManager;
++  final DelegationTokenSecretManager dtSecretManager;
+   private final boolean alwaysUseDelegationTokensForTests;
+   
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/SecondaryNameNode.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/SecondaryNameNode.java
+index 8057955..ca0299c 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/SecondaryNameNode.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/SecondaryNameNode.java
+@@ -376,6 +376,7 @@ public class SecondaryNameNode implements Runnable {
+               downloadImage = false;
+               LOG.info("Image has not changed. Will not download image.");
+             } else {
++              LOG.info("Image has changed. Downloading updated image from NN.");
+               MD5Hash downloadedHash = TransferFsImage.downloadImageToStorage(
+                   nnHostPort, sig.mostRecentCheckpointTxId, dstImage.getStorage(), true);
+               dstImage.saveDigestAndRenameCheckpointImage(
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestCheckpoint.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestCheckpoint.java
+index e505e73..be99ffe 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestCheckpoint.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestCheckpoint.java
+@@ -67,6 +67,7 @@ import org.apache.hadoop.hdfs.server.protocol.NamenodeProtocols;
+ import org.apache.hadoop.hdfs.server.protocol.RemoteEditLog;
+ import org.apache.hadoop.hdfs.server.protocol.RemoteEditLogManifest;
+ import org.apache.hadoop.hdfs.tools.DFSAdmin;
++import org.apache.hadoop.io.Text;
+ import org.apache.hadoop.net.NetUtils;
+ import org.apache.hadoop.test.GenericTestUtils;
+ import org.apache.hadoop.test.GenericTestUtils.DelayAnswer;
+@@ -1835,6 +1836,49 @@ public class TestCheckpoint {
+     }
+   }
+   
++  /**
++   * Regression test for HDFS-3835 - "Long-lived 2NN cannot perform a
++   * checkpoint if security is enabled and the NN restarts without outstanding
++   * delegation tokens"
++   */
++  @Test
++  public void testSecondaryNameNodeWithDelegationTokens() throws IOException {
++    MiniDFSCluster cluster = null;
++    SecondaryNameNode secondary = null;
++    
++    Configuration conf = new HdfsConfiguration();
++    conf.setBoolean(
++        DFSConfigKeys.DFS_NAMENODE_DELEGATION_TOKEN_ALWAYS_USE_KEY, true);
++    try {
++      cluster = new MiniDFSCluster.Builder(conf).numDataNodes(numDatanodes)
++          .format(true).build();
++      
++      assertNotNull(cluster.getNamesystem().getDelegationToken(new Text("atm")));
++  
++      secondary = startSecondaryNameNode(conf);
++
++      // Checkpoint once, so the 2NN loads the DT into its in-memory sate.
++      secondary.doCheckpoint();
++      
++      // Perform a saveNamespace, so that the NN has a new fsimage, and the 2NN
++      // therefore needs to download a new fsimage the next time it performs a
++      // checkpoint.
++      cluster.getNameNodeRpc().setSafeMode(SafeModeAction.SAFEMODE_ENTER);
++      cluster.getNameNodeRpc().saveNamespace();
++      cluster.getNameNodeRpc().setSafeMode(SafeModeAction.SAFEMODE_LEAVE);
++      
++      // Ensure that the 2NN can still perform a checkpoint.
++      secondary.doCheckpoint();
++    } finally {
++      if (secondary != null) {
++        secondary.shutdown();
++      }
++      if (cluster != null) {
++        cluster.shutdown();
++      }
++    }
++  }
++  
+   @Test
+   public void testCommandLineParsing() throws ParseException {
+     SecondaryNameNode.CommandLineOpts opts =
+-- 
+1.7.0.4
+

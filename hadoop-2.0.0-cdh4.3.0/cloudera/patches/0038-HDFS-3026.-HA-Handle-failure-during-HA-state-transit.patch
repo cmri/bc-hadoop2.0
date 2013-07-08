@@ -1,0 +1,240 @@
+From f9f7cae05125e6a75683c5faea31a9a34bb55fca Mon Sep 17 00:00:00 2001
+From: Aaron T. Myers <atm@cloudera.com>
+Date: Fri, 11 May 2012 02:09:09 -0400
+Subject: [PATCH 0038/1357] HDFS-3026. HA: Handle failure during HA state transition. Contributed by Aaron T. Myers.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/branch-2@1337031 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit a447ccb61cc78dafe6a6a23ca251fc9943ca10e0)
+---
+ .../hadoop/hdfs/server/namenode/NameNode.java      |   85 +++++++++++++++----
+ .../namenode/ha/TestStateTransitionFailure.java    |   80 ++++++++++++++++++
+ 2 files changed, 147 insertions(+), 18 deletions(-)
+ create mode 100644 hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestStateTransitionFailure.java
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNode.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNode.java
+index 07671e3..2aa9b48 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNode.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNode.java
+@@ -226,6 +226,7 @@ public class NameNode {
+   private final boolean haEnabled;
+   private final HAContext haContext;
+   protected boolean allowStaleStandbyReads;
++  private Runtime runtime = Runtime.getRuntime();
+ 
+   
+   /** httpServer */
+@@ -501,11 +502,16 @@ public class NameNode {
+   }
+   
+   private void startTrashEmptier(Configuration conf) throws IOException {
+-    long trashInterval 
+-      = conf.getLong(CommonConfigurationKeys.FS_TRASH_INTERVAL_KEY, 
+-                     CommonConfigurationKeys.FS_TRASH_INTERVAL_DEFAULT);
+-    if(trashInterval == 0)
++    long trashInterval = conf.getLong(
++        CommonConfigurationKeys.FS_TRASH_INTERVAL_KEY,
++        CommonConfigurationKeys.FS_TRASH_INTERVAL_DEFAULT);
++    if (trashInterval == 0) {
+       return;
++    } else if (trashInterval < 0) {
++      throw new IOException("Cannot start tresh emptier with negative interval."
++          + " Set " + CommonConfigurationKeys.FS_TRASH_INTERVAL_KEY + " to a"
++          + " positive value.");
++    }
+     this.emptier = new Thread(new Trash(conf).getEmptier(), "Trash Emptier");
+     this.emptier.setDaemon(true);
+     this.emptier.start();
+@@ -1258,14 +1264,37 @@ public class NameNode {
+     }
+     return state.getServiceState();
+   }
++  
++  @VisibleForTesting
++  public synchronized void setRuntimeForTesting(Runtime runtime) {
++    this.runtime = runtime;
++  }
+ 
+   /**
+-   * Class used as expose {@link NameNode} as context to {@link HAState}
++   * Shutdown the NN immediately in an ungraceful way. Used when it would be
++   * unsafe for the NN to continue operating, e.g. during a failed HA state
++   * transition.
+    * 
+-   * TODO(HA):
+-   * When entering and exiting state, on failing to start services,
+-   * appropriate action is needed todo either shutdown the node or recover
+-   * from failure.
++   * @param t exception which warrants the shutdown. Printed to the NN log
++   *          before exit.
++   * @throws ServiceFailedException thrown only for testing.
++   */
++  private synchronized void doImmediateShutdown(Throwable t)
++      throws ServiceFailedException {
++    String message = "Error encountered requiring NN shutdown. " +
++        "Shutting down immediately.";
++    try {
++      LOG.fatal(message, t);
++    } catch (Throwable ignored) {
++      // This is unlikely to happen, but there's nothing we can do if it does.
++    }
++    runtime.exit(1);
++    // This code is only reached during testing, when runtime is stubbed out.
++    throw new ServiceFailedException(message, t);
++  }
++  
++  /**
++   * Class used to expose {@link NameNode} as context to {@link HAState}
+    */
+   protected class NameNodeHAContext implements HAContext {
+     @Override
+@@ -1280,32 +1309,52 @@ public class NameNode {
+ 
+     @Override
+     public void startActiveServices() throws IOException {
+-      namesystem.startActiveServices();
+-      startTrashEmptier(conf);
++      try {
++        namesystem.startActiveServices();
++        startTrashEmptier(conf);
++      } catch (Throwable t) {
++        doImmediateShutdown(t);
++      }
+     }
+ 
+     @Override
+     public void stopActiveServices() throws IOException {
+-      if (namesystem != null) {
+-        namesystem.stopActiveServices();
++      try {
++        if (namesystem != null) {
++          namesystem.stopActiveServices();
++        }
++        stopTrashEmptier();
++      } catch (Throwable t) {
++        doImmediateShutdown(t);
+       }
+-      stopTrashEmptier();
+     }
+ 
+     @Override
+     public void startStandbyServices() throws IOException {
+-      namesystem.startStandbyServices(conf);
++      try {
++        namesystem.startStandbyServices(conf);
++      } catch (Throwable t) {
++        doImmediateShutdown(t);
++      }
+     }
+ 
+     @Override
+     public void prepareToStopStandbyServices() throws ServiceFailedException {
+-      namesystem.prepareToStopStandbyServices();
++      try {
++        namesystem.prepareToStopStandbyServices();
++      } catch (Throwable t) {
++        doImmediateShutdown(t);
++      }
+     }
+     
+     @Override
+     public void stopStandbyServices() throws IOException {
+-      if (namesystem != null) {
+-        namesystem.stopStandbyServices();
++      try {
++        if (namesystem != null) {
++          namesystem.stopStandbyServices();
++        }
++      } catch (Throwable t) {
++        doImmediateShutdown(t);
+       }
+     }
+     
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestStateTransitionFailure.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestStateTransitionFailure.java
+new file mode 100644
+index 0000000..bf1ca52
+--- /dev/null
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestStateTransitionFailure.java
+@@ -0,0 +1,80 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hdfs.server.namenode.ha;
++
++import static org.apache.hadoop.test.GenericTestUtils.assertExceptionContains;
++import static org.junit.Assert.fail;
++import static org.mockito.Matchers.anyInt;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
++
++import java.io.IOException;
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.CommonConfigurationKeys;
++import org.apache.hadoop.ha.ServiceFailedException;
++import org.apache.hadoop.hdfs.MiniDFSCluster;
++import org.apache.hadoop.hdfs.MiniDFSNNTopology;
++import org.junit.Test;
++
++/**
++ * Tests to verify the behavior of failing to fully start transition HA states.
++ */
++public class TestStateTransitionFailure {
++  
++  public static final Log LOG = LogFactory.getLog(TestStateTransitionFailure.class);
++
++  /**
++   * Ensure that a failure to fully transition to the active state causes a
++   * shutdown of the NameNode.
++   */
++  @Test
++  public void testFailureToTransitionCausesShutdown() throws IOException {
++    MiniDFSCluster cluster = null;
++    try {
++      Configuration conf = new Configuration();
++      // Set an illegal value for the trash emptier interval. This will cause
++      // the NN to fail to transition to the active state.
++      conf.setLong(CommonConfigurationKeys.FS_TRASH_INTERVAL_KEY, -1);
++      cluster = new MiniDFSCluster.Builder(conf)
++          .nnTopology(MiniDFSNNTopology.simpleHATopology())
++          .numDataNodes(0)
++          .build();
++      cluster.waitActive();
++      Runtime mockRuntime = mock(Runtime.class);
++      cluster.getNameNode(0).setRuntimeForTesting(mockRuntime);
++      verify(mockRuntime, times(0)).exit(anyInt());
++      try {
++        cluster.transitionToActive(0);
++        fail("Transitioned to active but should not have been able to.");
++      } catch (ServiceFailedException sfe) {
++        assertExceptionContains("Error encountered requiring NN shutdown. " +
++            "Shutting down immediately.", sfe);
++        LOG.info("got expected exception", sfe);
++      }
++      verify(mockRuntime, times(1)).exit(anyInt());
++    } finally {
++      if (cluster != null) {
++        cluster.shutdown();
++      }
++    }
++  }
++}
+-- 
+1.7.0.4
+

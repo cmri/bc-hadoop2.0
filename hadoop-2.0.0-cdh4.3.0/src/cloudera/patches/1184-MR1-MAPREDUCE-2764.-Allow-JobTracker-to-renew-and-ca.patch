@@ -1,0 +1,468 @@
+From f1f99f3207c9c93b75c632b65f48b3fa71d16dca Mon Sep 17 00:00:00 2001
+From: Owen O'Malley <omalley@apache.org>
+Date: Fri, 9 Sep 2011 22:07:35 +0000
+Subject: [PATCH 1184/1357] MR1: MAPREDUCE-2764. Allow JobTracker to renew and cancel arbitrary token types,
+ including delegation tokens obtained via hftp. (omalley)
+
+MapReduce part of:
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/branch-0.20-security@1167374 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit ef21eca97f1d10489003e30435acab24010a2209)
+
+Reason: Bug
+Ref: CDH-6189
+Author: Owen O'Malley
+---
+ build.xml                                          |    7 +
+ src/mapred/org/apache/hadoop/mapred/JobClient.java |   41 ++++-
+ .../security/token/DelegationTokenRenewal.java     |  186 ++++++--------------
+ .../security/token/JobTokenIdentifier.java         |   12 ++-
+ .../delegation/DelegationTokenIdentifier.java      |    5 +-
+ 5 files changed, 115 insertions(+), 136 deletions(-)
+
+diff --git a/build.xml b/build.xml
+index 4c2dd23..9683fa9 100644
+--- a/build.xml
++++ b/build.xml
+@@ -644,6 +644,13 @@
+           <attribute name="Implementation-Vendor" value="Apache"/>
+         </section>
+       </manifest>
++      <service type="org.apache.hadoop.security.token.TokenRenewer">
++        <provider classname="org.apache.hadoop.hdfs.DFSClient$Renewer"/>
++        <provider classname="org.apache.hadoop.mapred.JobClient$Renewer"/>
++        <provider classname="org.apache.hadoop.hdfs.security.token.block.BlockTokenIdentifier$Renewer"/>
++        <provider classname="org.apache.hadoop.mapreduce.security.token.JobTokenIdentifier$Renewer"/>
++        <provider classname="org.apache.hadoop.hdfs.HftpFileSystem$TokenManager"/>
++      </service>
+       <fileset dir="${conf.dir}" includes="${jar.properties.list}" />
+       <fileset file="${jar.extra.properties.list}" />
+       <zipfileset dir="${build.webapps}" prefix="webapps"/>
+diff --git a/src/mapred/org/apache/hadoop/mapred/JobClient.java b/src/mapred/org/apache/hadoop/mapred/JobClient.java
+index b42ecb4..4f47276 100644
+--- a/src/mapred/org/apache/hadoop/mapred/JobClient.java
++++ b/src/mapred/org/apache/hadoop/mapred/JobClient.java
+@@ -1,4 +1,4 @@
+-/**
++			/**
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+@@ -44,6 +44,7 @@ import java.security.PrivilegedExceptionAction;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.conf.Configured;
+ import org.apache.hadoop.filecache.DistributedCache;
+@@ -76,6 +77,7 @@ import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.security.authorize.AccessControlList;
+ import org.apache.hadoop.security.token.Token;
+ import org.apache.hadoop.security.token.SecretManager.InvalidToken;
++import org.apache.hadoop.security.token.TokenRenewer;
+ import org.apache.hadoop.util.ReflectionUtils;
+ import org.apache.hadoop.util.StringUtils;
+ import org.apache.hadoop.util.Tool;
+@@ -513,7 +515,7 @@ public class JobClient extends Configured implements MRConstants, Tool  {
+     }
+   }
+ 
+-  private JobSubmissionProtocol createRPCProxy(InetSocketAddress addr,
++  private static JobSubmissionProtocol createRPCProxy(InetSocketAddress addr,
+       Configuration conf) throws IOException {
+     return (JobSubmissionProtocol) RPC.getProxy(JobSubmissionProtocol.class,
+         JobSubmissionProtocol.versionID, addr, 
+@@ -521,6 +523,41 @@ public class JobClient extends Configured implements MRConstants, Tool  {
+         NetUtils.getSocketFactory(conf, JobSubmissionProtocol.class));
+   }
+ 
++  @InterfaceAudience.Private
++  public static class Renewer extends TokenRenewer {
++
++    @Override
++    public boolean handleKind(Text kind) {
++      return DelegationTokenIdentifier.MAPREDUCE_DELEGATION_KIND.equals(kind);
++    }
++
++    @SuppressWarnings("unchecked")
++    @Override
++    public long renew(Token<?> token, Configuration conf
++                      ) throws IOException, InterruptedException {
++      InetSocketAddress addr = 
++          NetUtils.createSocketAddr(token.getService().toString());
++      JobSubmissionProtocol jt = createRPCProxy(addr, conf);
++      return jt.renewDelegationToken((Token<DelegationTokenIdentifier>) token);
++    }
++
++    @SuppressWarnings("unchecked")
++    @Override
++    public void cancel(Token<?> token, Configuration conf
++                       ) throws IOException, InterruptedException {
++      InetSocketAddress addr = 
++          NetUtils.createSocketAddr(token.getService().toString());
++      JobSubmissionProtocol jt = createRPCProxy(addr, conf);
++      jt.cancelDelegationToken((Token<DelegationTokenIdentifier>) token);
++    }
++
++    @Override
++    public boolean isManaged(Token<?> token) throws IOException {
++      return true;
++    }
++    
++  }
++
+   /**
+    * Build a job client, connect to the indicated job tracker.
+    * 
+diff --git a/src/mapred/org/apache/hadoop/mapreduce/security/token/DelegationTokenRenewal.java b/src/mapred/org/apache/hadoop/mapreduce/security/token/DelegationTokenRenewal.java
+index db66b3e..3fb8907 100644
+--- a/src/mapred/org/apache/hadoop/mapreduce/security/token/DelegationTokenRenewal.java
++++ b/src/mapred/org/apache/hadoop/mapreduce/security/token/DelegationTokenRenewal.java
+@@ -19,10 +19,6 @@
+ package org.apache.hadoop.mapreduce.security.token;
+ 
+ import java.io.IOException;
+-import java.net.InetAddress;
+-import java.net.URI;
+-import org.apache.hadoop.security.AccessControlException;
+-import org.apache.hadoop.security.UserGroupInformation;
+ 
+ import java.security.PrivilegedExceptionAction;
+ import java.util.ArrayList;
+@@ -40,15 +36,10 @@ import java.util.concurrent.LinkedBlockingQueue;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+-import org.apache.hadoop.fs.FileSystem;
+-import org.apache.hadoop.hdfs.DistributedFileSystem;
+-import org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenIdentifier;
+-import org.apache.hadoop.io.Text;
+ import org.apache.hadoop.mapreduce.JobID;
+ import org.apache.hadoop.security.Credentials;
++import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.security.token.Token;
+-import org.apache.hadoop.security.token.TokenIdentifier;
+-import org.apache.hadoop.security.token.SecretManager.InvalidToken;
+ import org.apache.hadoop.util.StringUtils;
+ 
+ 
+@@ -62,14 +53,14 @@ public class DelegationTokenRenewal {
+    *
+    */
+   private static class DelegationTokenToRenew {
+-    public final Token<DelegationTokenIdentifier> token;
++    public final Token<?> token;
+     public final JobID jobId;
+     public final Configuration conf;
+     public long expirationDate;
+     public TimerTask timerTask;
+     
+     public DelegationTokenToRenew(
+-        JobID jId, Token<DelegationTokenIdentifier> t, 
++        JobID jId, Token<?> t, 
+         Configuration newConf, long newExpirationDate) {
+       token = t;
+       jobId = jId;
+@@ -117,10 +108,9 @@ public class DelegationTokenRenewal {
+   
+   private static class DelegationTokenCancelThread extends Thread {
+     private static class TokenWithConf {
+-      Token<DelegationTokenIdentifier> token;
++      Token<?> token;
+       Configuration conf;
+-      TokenWithConf(Token<DelegationTokenIdentifier> token,  
+-          Configuration conf) {
++      TokenWithConf(Token<?> token, Configuration conf) {
+         this.token = token;
+         this.conf = conf;
+       }
+@@ -132,7 +122,7 @@ public class DelegationTokenRenewal {
+       super("Delegation Token Canceler");
+       setDaemon(true);
+     }
+-    public void cancelToken(Token<DelegationTokenIdentifier> token,  
++    public void cancelToken(Token<?> token,  
+         Configuration conf) {
+       TokenWithConf tokenWithConf = new TokenWithConf(token, conf);
+       while (!queue.offer(tokenWithConf)) {
+@@ -147,17 +137,24 @@ public class DelegationTokenRenewal {
+     }
+ 
+     public void run() {
++      TokenWithConf tokenWithConf = null;
+       while (true) {
+-        TokenWithConf tokenWithConf = null;
+         try {
+           tokenWithConf = queue.take();
+-          DistributedFileSystem dfs = getDFSForToken(tokenWithConf.token,  
+-              tokenWithConf.conf);
++          final TokenWithConf current = tokenWithConf;
+           if (LOG.isDebugEnabled()) {
+-            LOG.debug("Canceling token " + tokenWithConf.token.getService() +  
+-                " for dfs=" + dfs);
++            LOG.debug("Canceling token " + tokenWithConf.token.getService());
+           }
+-          dfs.cancelDelegationToken(tokenWithConf.token);
++          // need to use doAs so that http can find the kerberos tgt
++          UserGroupInformation.getLoginUser()
++            .doAs(new PrivilegedExceptionAction<Void>(){
++
++              @Override
++              public Void run() throws Exception {
++                current.token.cancel(current.conf);
++                return null;
++              }
++            });
+         } catch (IOException e) {
+           LOG.warn("Failed to cancel token " + tokenWithConf.token + " " +  
+               StringUtils.stringifyException(e));
+@@ -176,68 +173,28 @@ public class DelegationTokenRenewal {
+     delegationTokens.add(t);
+   }
+   
+-  // kind of tokens we currently renew
+-  private static final Text kindHdfs = 
+-    DelegationTokenIdentifier.HDFS_DELEGATION_KIND;
+-  
+-  @SuppressWarnings("unchecked")
+   public static synchronized void registerDelegationTokensForRenewal(
+-      JobID jobId, Credentials ts, Configuration conf) {
++      JobID jobId, Credentials ts, Configuration conf) throws IOException {
+     if(ts==null)
+       return; //nothing to add
+     
+-    Collection <Token<? extends TokenIdentifier>> tokens = ts.getAllTokens();
++    Collection <Token<?>> tokens = ts.getAllTokens();
+     long now = System.currentTimeMillis();
+     
+-    for(Token<? extends TokenIdentifier> t : tokens) {
+-      // currently we only check for HDFS delegation tokens
+-      // later we can add more different types.
+-      if(! t.getKind().equals(kindHdfs)) {
+-        continue; 
+-      }
+-      Token<DelegationTokenIdentifier> dt = 
+-        (Token<DelegationTokenIdentifier>)t;
+-      
++    for(Token<?> t : tokens) {
+       // first renew happens immediately
+-      DelegationTokenToRenew dtr = 
+-        new DelegationTokenToRenew(jobId, dt, conf, now); 
++      if (t.isManaged()) {
++        DelegationTokenToRenew dtr = 
++          new DelegationTokenToRenew(jobId, t, conf, now); 
+ 
+-      addTokenToList(dtr);
++        addTokenToList(dtr);
+       
+-      setTimerForTokenRenewal(dtr, true);
+-      LOG.info("registering token for renewal for service =" + dt.getService()+
+-          " and jobID = " + jobId);
+-    }
+-  }
+-  
+-  private static long renewDelegationToken(DelegationTokenToRenew dttr) 
+-  throws Exception {
+-    long newExpirationDate=System.currentTimeMillis()+3600*1000;
+-    Token<DelegationTokenIdentifier> token = dttr.token;
+-    Configuration conf = dttr.conf;
+-    
+-    if(token.getKind().equals(kindHdfs)) {
+-      try {
+-        DistributedFileSystem dfs = getDFSForToken(token, conf);
+-        newExpirationDate = dfs.renewDelegationToken(token);
+-      } catch (InvalidToken ite) {
+-        LOG.warn("invalid token - not scheduling for renew");
+-        removeFailedDelegationToken(dttr);
+-        throw new IOException("failed to renew token", ite);
+-      } catch (AccessControlException ioe) {
+-        LOG.warn("failed to renew token:"+token, ioe);
+-        removeFailedDelegationToken(dttr);
+-        throw new IOException("failed to renew token", ioe);
+-      } catch (Exception e) {
+-        LOG.warn("failed to renew token:"+token, e);
+-        // returns default expiration date
++        setTimerForTokenRenewal(dtr, true);
++        LOG.info("registering token for renewal for service =" + t.getService()+
++                 " and jobID = " + jobId);
+       }
+-    } else {
+-      throw new Exception("unknown token type to renew+"+token.getKind());
+     }
+-    return newExpirationDate;
+   }
+-
+   
+   /**
+    * Task - to renew a token
+@@ -250,60 +207,36 @@ public class DelegationTokenRenewal {
+     
+     @Override
+     public void run() {
+-      Token<DelegationTokenIdentifier> token = dttr.token;
+-      long newExpirationDate=0;
++      Token<?> token = dttr.token;
+       try {
+-        newExpirationDate = renewDelegationToken(dttr);
++        // need to use doAs so that http can find the kerberos tgt
++        dttr.expirationDate = UserGroupInformation.getLoginUser()
++          .doAs(new PrivilegedExceptionAction<Long>(){
++
++          @Override
++          public Long run() throws Exception {
++            return dttr.token.renew(dttr.conf);
++          }
++        });
++
++        if (LOG.isDebugEnabled()) {
++          LOG.debug("renewing for:" + token.getService() + ";newED=" + 
++                    dttr.expirationDate);
++        }
++        setTimerForTokenRenewal(dttr, false);// set the next one
+       } catch (Exception e) {
+-        return; // message logged in renewDT method
++        LOG.error("Exception renewing token" + token + ". Not rescheduled", e);
++        removeFailedDelegationToken(dttr);
+       }
+-      if (LOG.isDebugEnabled())
+-        LOG.debug("renewing for:"+token.getService()+";newED=" + 
+-            newExpirationDate);
+-      
+-      // new expiration date
+-      dttr.expirationDate = newExpirationDate;
+-      setTimerForTokenRenewal(dttr, false);// set the next one
+     }
+   }
+   
+-  private static DistributedFileSystem getDFSForToken(
+-      Token<DelegationTokenIdentifier> token, final Configuration conf) 
+-  throws Exception {
+-    DistributedFileSystem dfs = null;
+-    try {
+-      //TODO: The service is usually an IPaddress:port. We convert
+-      //it to dns name and then obtain the filesystem just so that
+-      //we reuse the existing filesystem handle (that the jobtracker
+-      //might have for this namenode; the namenode is usually
+-      //specified as the dns name in the jobtracker).
+-      //THIS IS A WORKAROUND FOR NOW. NEED TO SOLVE THIS PROBLEM 
+-      //IN A BETTER WAY.
+-      String[] ipaddr = token.getService().toString().split(":");
+-      InetAddress iaddr = InetAddress.getByName(ipaddr[0]);
+-      String dnsName = iaddr.getCanonicalHostName();
+-      final URI uri = new URI (SCHEME + "://" + dnsName+":"+ipaddr[1]);
+-      dfs = (DistributedFileSystem)
+-      UserGroupInformation.getLoginUser().doAs(
+-          new PrivilegedExceptionAction<DistributedFileSystem>() {
+-        public DistributedFileSystem run() throws IOException {
+-          return (DistributedFileSystem) FileSystem.get(uri, conf);  
+-        }
+-      });
+-
+-      
+-    } catch (Exception e) {
+-      LOG.warn("Failed to create a dfs to renew for:" + token.getService(), e);
+-      throw e;
+-    } 
+-    return dfs;
+-  }
+-  
+   /**
+    * set task to renew the token
+    */
+-  private static void setTimerForTokenRenewal(
+-      DelegationTokenToRenew token, boolean firstTime) {
++  private static 
++  void setTimerForTokenRenewal(DelegationTokenToRenew token, 
++                               boolean firstTime) throws IOException {
+       
+     // calculate timer time
+     long now = System.currentTimeMillis();
+@@ -315,15 +248,11 @@ public class DelegationTokenRenewal {
+       renewIn = now + expiresIn - expiresIn/10; // little bit before the expiration
+     }
+     
+-    try {
+-      // need to create new task every time
+-      TimerTask tTask = new RenewalTimerTask(token);
+-      token.setTimerTask(tTask); // keep reference to the timer
++    // need to create new task every time
++    TimerTask tTask = new RenewalTimerTask(token);
++    token.setTimerTask(tTask); // keep reference to the timer
+ 
+-      renewalTimer.schedule(token.timerTask, new Date(renewIn));
+-    } catch (Exception e) {
+-      LOG.warn("failed to schedule a task, token will not renew more", e);
+-    }
++    renewalTimer.schedule(token.timerTask, new Date(renewIn));
+   }
+ 
+   /**
+@@ -336,12 +265,7 @@ public class DelegationTokenRenewal {
+   
+   // cancel a token
+   private static void cancelToken(DelegationTokenToRenew t) {
+-    Token<DelegationTokenIdentifier> token = t.token;
+-    Configuration conf = t.conf;
+-    
+-    if(token.getKind().equals(kindHdfs)) {
+-      dtCancelThread.cancelToken(token, conf);
+-    }
++    dtCancelThread.cancelToken(t.token, t.conf);
+   }
+   
+   /**
+diff --git a/src/mapred/org/apache/hadoop/mapreduce/security/token/JobTokenIdentifier.java b/src/mapred/org/apache/hadoop/mapreduce/security/token/JobTokenIdentifier.java
+index 92bf9e4..7022a8f 100644
+--- a/src/mapred/org/apache/hadoop/mapreduce/security/token/JobTokenIdentifier.java
++++ b/src/mapred/org/apache/hadoop/mapreduce/security/token/JobTokenIdentifier.java
+@@ -22,7 +22,9 @@ import java.io.DataInput;
+ import java.io.DataOutput;
+ import java.io.IOException;
+ 
++import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.io.Text;
++import org.apache.hadoop.security.token.Token;
+ import org.apache.hadoop.security.token.TokenIdentifier;
+ import org.apache.hadoop.security.UserGroupInformation;
+ 
+@@ -31,7 +33,7 @@ import org.apache.hadoop.security.UserGroupInformation;
+  */
+ public class JobTokenIdentifier extends TokenIdentifier {
+   private Text jobid;
+-  final static Text KIND_NAME = new Text("mapreduce.job");
++  public final static Text KIND_NAME = new Text("mapreduce.job");
+   
+   /**
+    * Default constructor
+@@ -82,4 +84,12 @@ public class JobTokenIdentifier extends TokenIdentifier {
+   public void write(DataOutput out) throws IOException {
+     jobid.write(out);
+   }
++
++  @InterfaceAudience.Private
++  public static class Renewer extends Token.TrivialRenewer {
++    @Override
++    protected Text getKind() {
++      return KIND_NAME;
++    }
++  }
+ }
+diff --git a/src/mapred/org/apache/hadoop/mapreduce/security/token/delegation/DelegationTokenIdentifier.java b/src/mapred/org/apache/hadoop/mapreduce/security/token/delegation/DelegationTokenIdentifier.java
+index fd64394..5cce7d7 100644
+--- a/src/mapred/org/apache/hadoop/mapreduce/security/token/delegation/DelegationTokenIdentifier.java
++++ b/src/mapred/org/apache/hadoop/mapreduce/security/token/delegation/DelegationTokenIdentifier.java
+@@ -28,8 +28,9 @@ import org.apache.hadoop.security.token.delegation.AbstractDelegationTokenIdenti
+ //@InterfaceAudience.Private
+ public class DelegationTokenIdentifier 
+   extends AbstractDelegationTokenIdentifier {
+-static final Text MAPREDUCE_DELEGATION_KIND = 
+-  new Text("MAPREDUCE_DELEGATION_TOKEN");
++  
++  public static final Text MAPREDUCE_DELEGATION_KIND = 
++    new Text("MAPREDUCE_DELEGATION_TOKEN");
+ 
+ /**
+  * Create an empty delegation token identifier for reading into.
+-- 
+1.7.0.4
+

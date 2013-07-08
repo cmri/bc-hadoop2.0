@@ -1,0 +1,331 @@
+From dff05676403ed444fa1a5add55cb76694a7c4f6e Mon Sep 17 00:00:00 2001
+From: Eli Collins <eli@apache.org>
+Date: Tue, 12 Jun 2012 22:10:12 +0000
+Subject: [PATCH 0111/1357] HADOOP-8507. Avoid OOM while deserializing DelegationTokenIdentifer. Contributed by Colin Patrick McCabe
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1349561 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 15f7bc3dd634d82ee845f57a29d1ecb91fe044b8)
+---
+ .../main/java/org/apache/hadoop/fs/FileStatus.java |   16 ++++----
+ .../hadoop/fs/permission/PermissionStatus.java     |    8 ++--
+ .../src/main/java/org/apache/hadoop/io/Text.java   |   32 +++++++++++++--
+ .../AbstractDelegationTokenIdentifier.java         |   24 +++++++++--
+ .../test/java/org/apache/hadoop/io/TestText.java   |   18 ++++----
+ .../token/delegation/TestDelegationToken.java      |   43 ++++++++++++++++++++
+ 6 files changed, 112 insertions(+), 29 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileStatus.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileStatus.java
+index 1946dc2..7947b46 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileStatus.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileStatus.java
+@@ -254,7 +254,7 @@ public class FileStatus implements Writable, Comparable {
+   // Writable
+   //////////////////////////////////////////////////
+   public void write(DataOutput out) throws IOException {
+-    Text.writeString(out, getPath().toString(), Text.ONE_MEGABYTE);
++    Text.writeString(out, getPath().toString(), Text.DEFAULT_MAX_LEN);
+     out.writeLong(getLen());
+     out.writeBoolean(isDirectory());
+     out.writeShort(getReplication());
+@@ -262,16 +262,16 @@ public class FileStatus implements Writable, Comparable {
+     out.writeLong(getModificationTime());
+     out.writeLong(getAccessTime());
+     getPermission().write(out);
+-    Text.writeString(out, getOwner(), Text.ONE_MEGABYTE);
+-    Text.writeString(out, getGroup(), Text.ONE_MEGABYTE);
++    Text.writeString(out, getOwner(), Text.DEFAULT_MAX_LEN);
++    Text.writeString(out, getGroup(), Text.DEFAULT_MAX_LEN);
+     out.writeBoolean(isSymlink());
+     if (isSymlink()) {
+-      Text.writeString(out, getSymlink().toString(), Text.ONE_MEGABYTE);
++      Text.writeString(out, getSymlink().toString(), Text.DEFAULT_MAX_LEN);
+     }
+   }
+ 
+   public void readFields(DataInput in) throws IOException {
+-    String strPath = Text.readString(in, Text.ONE_MEGABYTE);
++    String strPath = Text.readString(in, Text.DEFAULT_MAX_LEN);
+     this.path = new Path(strPath);
+     this.length = in.readLong();
+     this.isdir = in.readBoolean();
+@@ -280,10 +280,10 @@ public class FileStatus implements Writable, Comparable {
+     modification_time = in.readLong();
+     access_time = in.readLong();
+     permission.readFields(in);
+-    owner = Text.readString(in, Text.ONE_MEGABYTE);
+-    group = Text.readString(in, Text.ONE_MEGABYTE);
++    owner = Text.readString(in, Text.DEFAULT_MAX_LEN);
++    group = Text.readString(in, Text.DEFAULT_MAX_LEN);
+     if (in.readBoolean()) {
+-      this.symlink = new Path(Text.readString(in, Text.ONE_MEGABYTE));
++      this.symlink = new Path(Text.readString(in, Text.DEFAULT_MAX_LEN));
+     } else {
+       this.symlink = null;
+     }
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/permission/PermissionStatus.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/permission/PermissionStatus.java
+index 5642d0f..f47226f 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/permission/PermissionStatus.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/permission/PermissionStatus.java
+@@ -84,8 +84,8 @@ public class PermissionStatus implements Writable {
+ 
+   /** {@inheritDoc} */
+   public void readFields(DataInput in) throws IOException {
+-    username = Text.readString(in, Text.ONE_MEGABYTE);
+-    groupname = Text.readString(in, Text.ONE_MEGABYTE);
++    username = Text.readString(in, Text.DEFAULT_MAX_LEN);
++    groupname = Text.readString(in, Text.DEFAULT_MAX_LEN);
+     permission = FsPermission.read(in);
+   }
+ 
+@@ -110,8 +110,8 @@ public class PermissionStatus implements Writable {
+                            String username, 
+                            String groupname,
+                            FsPermission permission) throws IOException {
+-    Text.writeString(out, username, Text.ONE_MEGABYTE);
+-    Text.writeString(out, groupname, Text.ONE_MEGABYTE);
++    Text.writeString(out, username, Text.DEFAULT_MAX_LEN);
++    Text.writeString(out, groupname, Text.DEFAULT_MAX_LEN);
+     permission.write(out);
+   }
+ 
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/Text.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/Text.java
+index cae70d7..caa8919 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/Text.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/Text.java
+@@ -284,6 +284,20 @@ public class Text extends BinaryComparable
+     in.readFully(bytes, 0, newLength);
+     length = newLength;
+   }
++  
++  public void readFields(DataInput in, int maxLength) throws IOException {
++    int newLength = WritableUtils.readVInt(in);
++    if (newLength < 0) {
++      throw new IOException("tried to deserialize " + newLength +
++          " bytes of data!  newLength must be non-negative.");
++    } else if (newLength >= maxLength) {
++      throw new IOException("tried to deserialize " + newLength +
++          " bytes of data, but maxLength = " + maxLength);
++    }
++    setCapacity(newLength, false);
++    in.readFully(bytes, 0, newLength);
++    length = newLength;
++  }
+ 
+   /** Skips over one Text in the input. */
+   public static void skip(DataInput in) throws IOException {
+@@ -301,6 +315,16 @@ public class Text extends BinaryComparable
+     out.write(bytes, 0, length);
+   }
+ 
++  public void write(DataOutput out, int maxLength) throws IOException {
++    if (length > maxLength) {
++      throw new IOException("data was too long to write!  Expected " +
++          "less than or equal to " + maxLength + " bytes, but got " +
++          length + " bytes.");
++    }
++    WritableUtils.writeVInt(out, length);
++    out.write(bytes, 0, length);
++  }
++
+   /** Returns true iff <code>o</code> is a Text with the same contents.  */
+   public boolean equals(Object o) {
+     if (o instanceof Text)
+@@ -414,7 +438,7 @@ public class Text extends BinaryComparable
+     return bytes;
+   }
+ 
+-  static final public int ONE_MEGABYTE = 1024 * 1024;
++  static final public int DEFAULT_MAX_LEN = 1024 * 1024;
+ 
+   /** Read a UTF8 encoded string from in
+    */
+@@ -429,7 +453,7 @@ public class Text extends BinaryComparable
+    */
+   public static String readString(DataInput in, int maxLength)
+       throws IOException {
+-    int length = WritableUtils.readVIntInRange(in, 0, maxLength - 1);
++    int length = WritableUtils.readVIntInRange(in, 0, maxLength);
+     byte [] bytes = new byte[length];
+     in.readFully(bytes, 0, length);
+     return decode(bytes);
+@@ -451,9 +475,9 @@ public class Text extends BinaryComparable
+       throws IOException {
+     ByteBuffer bytes = encode(s);
+     int length = bytes.limit();
+-    if (length >= maxLength) {
++    if (length > maxLength) {
+       throw new IOException("string was too long to write!  Expected " +
+-          "less than " + maxLength + " bytes, but got " +
++          "less than or equal to " + maxLength + " bytes, but got " +
+           length + " bytes.");
+     }
+     WritableUtils.writeVInt(out, length);
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/delegation/AbstractDelegationTokenIdentifier.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/delegation/AbstractDelegationTokenIdentifier.java
+index c773808..8c3c1b2 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/delegation/AbstractDelegationTokenIdentifier.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/delegation/AbstractDelegationTokenIdentifier.java
+@@ -31,6 +31,8 @@ import org.apache.hadoop.security.HadoopKerberosName;
+ import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.security.token.TokenIdentifier;
+ 
++import com.google.common.annotations.VisibleForTesting;
++
+ @InterfaceAudience.LimitedPrivate({"HDFS", "MapReduce"})
+ @InterfaceStability.Evolving
+ public abstract class AbstractDelegationTokenIdentifier 
+@@ -173,16 +175,17 @@ extends TokenIdentifier {
+ 	throw new IOException("Unknown version of delegation token " + 
+                               version);
+     }
+-    owner.readFields(in);
+-    renewer.readFields(in);
+-    realUser.readFields(in);
++    owner.readFields(in, Text.DEFAULT_MAX_LEN);
++    renewer.readFields(in, Text.DEFAULT_MAX_LEN);
++    realUser.readFields(in, Text.DEFAULT_MAX_LEN);
+     issueDate = WritableUtils.readVLong(in);
+     maxDate = WritableUtils.readVLong(in);
+     sequenceNumber = WritableUtils.readVInt(in);
+     masterKeyId = WritableUtils.readVInt(in);
+   }
+ 
+-  public void write(DataOutput out) throws IOException {
++  @VisibleForTesting
++  void writeImpl(DataOutput out) throws IOException {
+     out.writeByte(VERSION);
+     owner.write(out);
+     renewer.write(out);
+@@ -193,6 +196,19 @@ extends TokenIdentifier {
+     WritableUtils.writeVInt(out, masterKeyId);
+   }
+   
++  public void write(DataOutput out) throws IOException {
++    if (owner.getLength() > Text.DEFAULT_MAX_LEN) {
++      throw new IOException("owner is too long to be serialized!");
++    }
++    if (renewer.getLength() > Text.DEFAULT_MAX_LEN) {
++      throw new IOException("renewer is too long to be serialized!");
++    }
++    if (realUser.getLength() > Text.DEFAULT_MAX_LEN) {
++      throw new IOException("realuser is too long to be serialized!");
++    }
++    writeImpl(out);
++  }
++  
+   public String toString() {
+     StringBuilder buffer = new StringBuilder();
+     buffer
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/TestText.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/TestText.java
+index a86c532..5aac31b 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/TestText.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/TestText.java
+@@ -137,38 +137,38 @@ public class TestText extends TestCase {
+     }
+   }
+   
+-  public void doTestLimitedIO(String str, int strLen) throws IOException {
++  public void doTestLimitedIO(String str, int len) throws IOException {
+     DataOutputBuffer out = new DataOutputBuffer();
+     DataInputBuffer in = new DataInputBuffer();
+ 
+     out.reset();
+     try {
+-      Text.writeString(out, str, strLen);
++      Text.writeString(out, str, len);
+       fail("expected writeString to fail when told to write a string " +
+           "that was too long!  The string was '" + str + "'");
+     } catch (IOException e) {
+     }
+-    Text.writeString(out, str, strLen + 1);
++    Text.writeString(out, str, len + 1);
+ 
+     // test that it reads correctly
+     in.reset(out.getData(), out.getLength());
+-    in.mark(strLen);
++    in.mark(len);
+     String after;
+     try {
+-      after = Text.readString(in, strLen);
++      after = Text.readString(in, len);
+       fail("expected readString to fail when told to read a string " +
+           "that was too long!  The string was '" + str + "'");
+     } catch (IOException e) {
+     }
+     in.reset();
+-    after = Text.readString(in, strLen + 1);
++    after = Text.readString(in, len + 1);
+     assertTrue(str.equals(after));
+   }
+   
+   public void testLimitedIO() throws Exception {
+-    doTestLimitedIO("abcd", 4);
+-    doTestLimitedIO("", 0);
+-    doTestLimitedIO("1", 1);
++    doTestLimitedIO("abcd", 3);
++    doTestLimitedIO("foo bar baz", 10);
++    doTestLimitedIO("1", 0);
+   }
+ 
+   public void testCompare() throws Exception {
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/security/token/delegation/TestDelegationToken.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/security/token/delegation/TestDelegationToken.java
+index e2388ad..9126810 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/security/token/delegation/TestDelegationToken.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/security/token/delegation/TestDelegationToken.java
+@@ -19,6 +19,7 @@
+ package org.apache.hadoop.security.token.delegation;
+ 
+ import java.io.ByteArrayInputStream;
++import java.io.ByteArrayOutputStream;
+ import java.io.DataInput;
+ import java.io.DataInputStream;
+ import java.io.DataOutput;
+@@ -387,4 +388,46 @@ public class TestDelegationToken {
+     }
+   }
+ 
++  private boolean testDelegationTokenIdentiferSerializationRoundTrip(Text owner,
++      Text renewer, Text realUser) throws IOException {
++    TestDelegationTokenIdentifier dtid = new TestDelegationTokenIdentifier(
++        owner, renewer, realUser);
++    DataOutputBuffer out = new DataOutputBuffer();
++    dtid.writeImpl(out);
++    DataInputBuffer in = new DataInputBuffer();
++    in.reset(out.getData(), out.getLength());
++    try {
++      TestDelegationTokenIdentifier dtid2 =
++          new TestDelegationTokenIdentifier();
++      dtid2.readFields(in);
++      assertTrue(dtid.equals(dtid2));
++      return true;
++    } catch(IOException e){
++      return false;
++    }
++  }
++      
++  @Test
++  public void testSimpleDtidSerialization() throws IOException {
++    assertTrue(testDelegationTokenIdentiferSerializationRoundTrip(
++        new Text("owner"), new Text("renewer"), new Text("realUser")));
++    assertTrue(testDelegationTokenIdentiferSerializationRoundTrip(
++        new Text(""), new Text(""), new Text("")));
++    assertTrue(testDelegationTokenIdentiferSerializationRoundTrip(
++        new Text(""), new Text("b"), new Text("")));
++  }
++  
++  @Test
++  public void testOverlongDtidSerialization() throws IOException {
++    byte[] bigBuf = new byte[Text.DEFAULT_MAX_LEN + 1];
++    for (int i = 0; i < bigBuf.length; i++) {
++      bigBuf[i] = 0;
++    }
++    assertFalse(testDelegationTokenIdentiferSerializationRoundTrip(
++        new Text(bigBuf), new Text("renewer"), new Text("realUser")));
++    assertFalse(testDelegationTokenIdentiferSerializationRoundTrip(
++        new Text("owner"), new Text(bigBuf), new Text("realUser")));
++    assertFalse(testDelegationTokenIdentiferSerializationRoundTrip(
++        new Text("owner"), new Text("renewer"), new Text(bigBuf)));
++  }
+ }
+-- 
+1.7.0.4
+

@@ -1,0 +1,749 @@
+From 9f2d978d12f9fb932d4197cf25b6fb79e803fe5f Mon Sep 17 00:00:00 2001
+From: Aaron Twining Myers <atm@apache.org>
+Date: Thu, 6 Dec 2012 22:30:07 +0000
+Subject: [PATCH 0632/1357] HDFS-3680. Allow customized audit logging in HDFS FSNamesystem. Contributed by Marcelo Vanzin.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/branch-2@1418115 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 7567291e21386f3ed979eaef0d9527aa6b5a69d7)
+---
+ .../java/org/apache/hadoop/hdfs/DFSConfigKeys.java |    2 +
+ .../hadoop/hdfs/server/namenode/AuditLogger.java   |   61 ++++++
+ .../hadoop/hdfs/server/namenode/FSNamesystem.java  |  195 ++++++++++++++------
+ .../src/main/resources/hdfs-default.xml            |   13 ++
+ .../hdfs/server/namenode/TestAuditLogger.java      |  123 ++++++++++++
+ 5 files changed, 339 insertions(+), 55 deletions(-)
+ create mode 100644 hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/AuditLogger.java
+ create mode 100644 hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestAuditLogger.java
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+index 471099a..5a2ae6d 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+@@ -225,6 +225,8 @@ public class DFSConfigKeys extends CommonConfigurationKeys {
+   public static final String  DFS_HOSTS = "dfs.hosts";
+   public static final String  DFS_HOSTS_EXCLUDE = "dfs.hosts.exclude";
+   public static final String  DFS_CLIENT_LOCAL_INTERFACES = "dfs.client.local.interfaces";
++  public static final String  DFS_NAMENODE_AUDIT_LOGGERS_KEY = "dfs.namenode.audit.loggers";
++  public static final String  DFS_NAMENODE_DEFAULT_AUDIT_LOGGER_NAME = "default";
+ 
+   // Much code in hdfs is not yet updated to use these keys.
+   public static final String  DFS_CLIENT_BLOCK_WRITE_LOCATEFOLLOWINGBLOCK_RETRIES_KEY = "dfs.client.block.write.locateFollowingBlock.retries";
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/AuditLogger.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/AuditLogger.java
+new file mode 100644
+index 0000000..614eb63
+--- /dev/null
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/AuditLogger.java
+@@ -0,0 +1,61 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hdfs.server.namenode;
++
++import java.net.InetAddress;
++import java.security.Principal;
++
++import org.apache.hadoop.classification.InterfaceAudience;
++import org.apache.hadoop.classification.InterfaceStability;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileStatus;
++
++/**
++ * Interface defining an audit logger.
++ */
++@InterfaceAudience.Public
++@InterfaceStability.Evolving
++public interface AuditLogger {
++
++  /**
++   * Called during initialization of the logger.
++   *
++   * @param conf The configuration object.
++   */
++  void initialize(Configuration conf);
++
++  /**
++   * Called to log an audit event.
++   * <p>
++   * This method must return as quickly as possible, since it's called
++   * in a critical section of the NameNode's operation.
++   *
++   * @param succeeded Whether authorization succeeded.
++   * @param userName Name of the user executing the request.
++   * @param addr Remote address of the request.
++   * @param cmd The requested command.
++   * @param src Path of affected source file.
++   * @param dst Path of affected destination file (if any).
++   * @param stat File information for operations that change the file's
++   *             metadata (permissions, owner, times, etc).
++   */
++  void logAuditEvent(boolean succeeded, String userName,
++      InetAddress addr, String cmd, String src, String dst,
++      FileStatus stat);
++
++}
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+index 6f22f15..98f390a 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+@@ -32,6 +32,8 @@ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_ENCRYPT_DATA_TRANSFER_DEF
+ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_HA_STANDBY_CHECKPOINTS_DEFAULT;
+ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_HA_STANDBY_CHECKPOINTS_KEY;
+ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_ACCESSTIME_PRECISION_KEY;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_AUDIT_LOGGERS_KEY;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_DEFAULT_AUDIT_LOGGER_NAME;
+ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_DELEGATION_KEY_UPDATE_INTERVAL_DEFAULT;
+ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_DELEGATION_KEY_UPDATE_INTERVAL_KEY;
+ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_DELEGATION_TOKEN_ALWAYS_USE_DEFAULT;
+@@ -110,6 +112,7 @@ import org.apache.hadoop.fs.CommonConfigurationKeysPublic;
+ import org.apache.hadoop.fs.ContentSummary;
+ import org.apache.hadoop.fs.CreateFlag;
+ import org.apache.hadoop.fs.FileAlreadyExistsException;
++import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.fs.FsServerDefaults;
+ import org.apache.hadoop.fs.InvalidPathException;
+ import org.apache.hadoop.fs.Options;
+@@ -230,32 +233,32 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+       }
+   };
+ 
+-  private static final void logAuditEvent(UserGroupInformation ugi,
++  private boolean isAuditEnabled() {
++    return !isDefaultAuditLogger || auditLog.isInfoEnabled();
++  }
++
++  private void logAuditEvent(UserGroupInformation ugi,
+       InetAddress addr, String cmd, String src, String dst,
+       HdfsFileStatus stat) {
+     logAuditEvent(true, ugi, addr, cmd, src, dst, stat);
+   }
+ 
+-  private static final void logAuditEvent(boolean succeeded,
++  private void logAuditEvent(boolean succeeded,
+       UserGroupInformation ugi, InetAddress addr, String cmd, String src,
+       String dst, HdfsFileStatus stat) {
+-    final StringBuilder sb = auditBuffer.get();
+-    sb.setLength(0);
+-    sb.append("allowed=").append(succeeded).append("\t");
+-    sb.append("ugi=").append(ugi).append("\t");
+-    sb.append("ip=").append(addr).append("\t");
+-    sb.append("cmd=").append(cmd).append("\t");
+-    sb.append("src=").append(src).append("\t");
+-    sb.append("dst=").append(dst).append("\t");
+-    if (null == stat) {
+-      sb.append("perm=null");
+-    } else {
+-      sb.append("perm=");
+-      sb.append(stat.getOwner()).append(":");
+-      sb.append(stat.getGroup()).append(":");
+-      sb.append(stat.getPermission());
++    FileStatus status = null;
++    if (stat != null) {
++      Path symlink = stat.isSymlink() ? new Path(stat.getSymlink()) : null;
++      Path path = dst != null ? new Path(dst) : new Path(src);
++      status = new FileStatus(stat.getLen(), stat.isDir(),
++          stat.getReplication(), stat.getBlockSize(), stat.getModificationTime(),
++          stat.getAccessTime(), stat.getPermission(), stat.getOwner(),
++          stat.getGroup(), symlink, path);
++    }
++    for (AuditLogger logger : auditLoggers) {
++      logger.logAuditEvent(succeeded, ugi.toString(), addr,
++          cmd, src, dst, status);
+     }
+-    auditLog.info(sb);
+   }
+ 
+   /**
+@@ -288,6 +291,11 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+   final DelegationTokenSecretManager dtSecretManager;
+   private final boolean alwaysUseDelegationTokensForTests;
+   
++  // Tracks whether the default audit logger is the only configured audit
++  // logger; this allows isAuditEnabled() to return false in case the
++  // underlying logger is disabled, and avoid some unnecessary work.
++  private final boolean isDefaultAuditLogger;
++  private final List<AuditLogger> auditLoggers;
+ 
+   /** The namespace tree. */
+   FSDirectory dir;
+@@ -509,12 +517,48 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+       this.dtSecretManager = createDelegationTokenSecretManager(conf);
+       this.dir = new FSDirectory(fsImage, this, conf);
+       this.safeMode = new SafeModeInfo(conf);
+-
++      this.auditLoggers = initAuditLoggers(conf);
++      this.isDefaultAuditLogger = auditLoggers.size() == 1 &&
++        auditLoggers.get(0) instanceof DefaultAuditLogger;
+     } catch(IOException e) {
+       LOG.error(getClass().getSimpleName() + " initialization failed.", e);
+       close();
+       throw e;
++    } catch (RuntimeException re) {
++      LOG.error(getClass().getSimpleName() + " initialization failed.", re);
++      close();
++      throw re;
++    }
++  }
++
++  private List<AuditLogger> initAuditLoggers(Configuration conf) {
++    // Initialize the custom access loggers if configured.
++    Collection<String> alClasses = conf.getStringCollection(DFS_NAMENODE_AUDIT_LOGGERS_KEY);
++    List<AuditLogger> auditLoggers = Lists.newArrayList();
++    if (alClasses != null && !alClasses.isEmpty()) {
++      for (String className : alClasses) {
++        try {
++          AuditLogger logger;
++          if (DFS_NAMENODE_DEFAULT_AUDIT_LOGGER_NAME.equals(className)) {
++            logger = new DefaultAuditLogger();
++          } else {
++            logger = (AuditLogger) Class.forName(className).newInstance();
++          }
++          logger.initialize(conf);
++          auditLoggers.add(logger);
++        } catch (RuntimeException re) {
++          throw re;
++        } catch (Exception e) {
++          throw new RuntimeException(e);
++        }
++      }
++    }
++
++    // Make sure there is at least one logger installed.
++    if (auditLoggers.isEmpty()) {
++      auditLoggers.add(new DefaultAuditLogger());
+     }
++    return auditLoggers;
+   }
+ 
+   void loadFSImage(StartupOption startOpt, FSImage fsImage, boolean haEnabled)
+@@ -1050,7 +1094,7 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+     try {
+       setPermissionInt(src, permission);
+     } catch (AccessControlException e) {
+-      if (auditLog.isInfoEnabled() && isExternalInvocation()) {
++      if (isAuditEnabled() && isExternalInvocation()) {
+         logAuditEvent(false, UserGroupInformation.getCurrentUser(),
+                       getRemoteIp(),
+                       "setPermission", src, null, null);
+@@ -1072,14 +1116,14 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+       }
+       checkOwner(src);
+       dir.setPermission(src, permission);
+-      if (auditLog.isInfoEnabled() && isExternalInvocation()) {
++      if (isAuditEnabled() && isExternalInvocation()) {
+         resultingStat = dir.getFileInfo(src, false);
+       }
+     } finally {
+       writeUnlock();
+     }
+     getEditLog().logSync();
+-    if (auditLog.isInfoEnabled() && isExternalInvocation()) {
++    if (isAuditEnabled() && isExternalInvocation()) {
+       logAuditEvent(UserGroupInformation.getCurrentUser(),
+                     getRemoteIp(),
+                     "setPermission", src, null, resultingStat);
+@@ -1096,7 +1140,7 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+     try {
+       setOwnerInt(src, username, group);
+     } catch (AccessControlException e) {
+-      if (auditLog.isInfoEnabled() && isExternalInvocation()) {
++      if (isAuditEnabled() && isExternalInvocation()) {
+         logAuditEvent(false, UserGroupInformation.getCurrentUser(),
+                       getRemoteIp(),
+                       "setOwner", src, null, null);
+@@ -1127,14 +1171,14 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+         }
+       }
+       dir.setOwner(src, username, group);
+-      if (auditLog.isInfoEnabled() && isExternalInvocation()) {
++      if (isAuditEnabled() && isExternalInvocation()) {
+         resultingStat = dir.getFileInfo(src, false);
+       }
+     } finally {
+       writeUnlock();
+     }
+     getEditLog().logSync();
+-    if (auditLog.isInfoEnabled() && isExternalInvocation()) {
++    if (isAuditEnabled() && isExternalInvocation()) {
+       logAuditEvent(UserGroupInformation.getCurrentUser(),
+                     getRemoteIp(),
+                     "setOwner", src, null, resultingStat);
+@@ -1169,7 +1213,7 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+       return getBlockLocationsInt(src, offset, length, doAccessTime,
+                                   needBlockToken, checkSafeMode);
+     } catch (AccessControlException e) {
+-      if (auditLog.isInfoEnabled() && isExternalInvocation()) {
++      if (isAuditEnabled() && isExternalInvocation()) {
+         logAuditEvent(false, UserGroupInformation.getCurrentUser(),
+                       getRemoteIp(),
+                       "open", src, null, null);
+@@ -1195,7 +1239,7 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+     }
+     final LocatedBlocks ret = getBlockLocationsUpdateTimes(src,
+         offset, length, doAccessTime, needBlockToken);  
+-    if (auditLog.isInfoEnabled() && isExternalInvocation()) {
++    if (isAuditEnabled() && isExternalInvocation()) {
+       logAuditEvent(UserGroupInformation.getCurrentUser(),
+                     getRemoteIp(),
+                     "open", src, null, null);
+@@ -1280,7 +1324,7 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+     try {
+       concatInt(target, srcs);
+     } catch (AccessControlException e) {
+-      if (auditLog.isInfoEnabled() && isExternalInvocation()) {
++      if (isAuditEnabled() && isExternalInvocation()) {
+         logAuditEvent(false, UserGroupInformation.getLoginUser(),
+                       getRemoteIp(),
+                       "concat", Arrays.toString(srcs), target, null);
+@@ -1323,14 +1367,14 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+         throw new SafeModeException("Cannot concat " + target, safeMode);
+       }
+       concatInternal(target, srcs);
+-      if (auditLog.isInfoEnabled() && isExternalInvocation()) {
++      if (isAuditEnabled() && isExternalInvocation()) {
+         resultingStat = dir.getFileInfo(target, false);
+       }
+     } finally {
+       writeUnlock();
+     }
+     getEditLog().logSync();
+-    if (auditLog.isInfoEnabled() && isExternalInvocation()) {
++    if (isAuditEnabled() && isExternalInvocation()) {
+       logAuditEvent(UserGroupInformation.getLoginUser(),
+                     getRemoteIp(),
+                     "concat", Arrays.toString(srcs), target, resultingStat);
+@@ -1447,7 +1491,7 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+     try {
+       setTimesInt(src, mtime, atime);
+     } catch (AccessControlException e) {
+-      if (auditLog.isInfoEnabled() && isExternalInvocation()) {
++      if (isAuditEnabled() && isExternalInvocation()) {
+         logAuditEvent(false, UserGroupInformation.getCurrentUser(),
+                       getRemoteIp(),
+                       "setTimes", src, null, null);
+@@ -1473,7 +1517,7 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+       INode inode = dir.getINode(src);
+       if (inode != null) {
+         dir.setTimes(src, inode, mtime, atime, true);
+-        if (auditLog.isInfoEnabled() && isExternalInvocation()) {
++        if (isAuditEnabled() && isExternalInvocation()) {
+           final HdfsFileStatus stat = dir.getFileInfo(src, false);
+           logAuditEvent(UserGroupInformation.getCurrentUser(),
+                         getRemoteIp(),
+@@ -1496,7 +1540,7 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+     try {
+       createSymlinkInt(target, link, dirPerms, createParent);
+     } catch (AccessControlException e) {
+-      if (auditLog.isInfoEnabled() && isExternalInvocation()) {
++      if (isAuditEnabled() && isExternalInvocation()) {
+         logAuditEvent(false, UserGroupInformation.getCurrentUser(),
+                       getRemoteIp(),
+                       "createSymlink", link, target, null);
+@@ -1517,14 +1561,14 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+         verifyParentDir(link);
+       }
+       createSymlinkInternal(target, link, dirPerms, createParent);
+-      if (auditLog.isInfoEnabled() && isExternalInvocation()) {
++      if (isAuditEnabled() && isExternalInvocation()) {
+         resultingStat = dir.getFileInfo(link, false);
+       }
+     } finally {
+       writeUnlock();
+     }
+     getEditLog().logSync();
+-    if (auditLog.isInfoEnabled() && isExternalInvocation()) {
++    if (isAuditEnabled() && isExternalInvocation()) {
+       logAuditEvent(UserGroupInformation.getCurrentUser(),
+                     getRemoteIp(),
+                     "createSymlink", link, target, resultingStat);
+@@ -1580,7 +1624,7 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+     try {
+       return setReplicationInt(src, replication);
+     } catch (AccessControlException e) {
+-      if (auditLog.isInfoEnabled() && isExternalInvocation()) {
++      if (isAuditEnabled() && isExternalInvocation()) {
+         logAuditEvent(false, UserGroupInformation.getCurrentUser(),
+                       getRemoteIp(),
+                       "setReplication", src, null, null);
+@@ -1616,7 +1660,7 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+     }
+ 
+     getEditLog().logSync();
+-    if (isFile && auditLog.isInfoEnabled() && isExternalInvocation()) {
++    if (isFile && isAuditEnabled() && isExternalInvocation()) {
+       logAuditEvent(UserGroupInformation.getCurrentUser(),
+                     getRemoteIp(),
+                     "setReplication", src, null, null);
+@@ -1673,7 +1717,7 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+       startFileInt(src, permissions, holder, clientMachine, flag, createParent,
+                    replication, blockSize);
+     } catch (AccessControlException e) {
+-      if (auditLog.isInfoEnabled() && isExternalInvocation()) {
++      if (isAuditEnabled() && isExternalInvocation()) {
+         logAuditEvent(false, UserGroupInformation.getCurrentUser(),
+                       getRemoteIp(),
+                       "create", src, null, null);
+@@ -1697,7 +1741,8 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+       writeUnlock();
+     }
+     getEditLog().logSync();
+-    if (auditLog.isInfoEnabled() && isExternalInvocation()) {
++
++    if (isAuditEnabled() && isExternalInvocation()) {
+       final HdfsFileStatus stat = dir.getFileInfo(src, false);
+       logAuditEvent(UserGroupInformation.getCurrentUser(),
+                     getRemoteIp(),
+@@ -1998,7 +2043,7 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+     try {
+       return appendFileInt(src, holder, clientMachine);
+     } catch (AccessControlException e) {
+-      if (auditLog.isInfoEnabled() && isExternalInvocation()) {
++      if (isAuditEnabled() && isExternalInvocation()) {
+         logAuditEvent(false, UserGroupInformation.getCurrentUser(),
+                       getRemoteIp(),
+                       "append", src, null, null);
+@@ -2036,7 +2081,7 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+             +" block size " + lb.getBlock().getNumBytes());
+       }
+     }
+-    if (auditLog.isInfoEnabled() && isExternalInvocation()) {
++    if (isAuditEnabled() && isExternalInvocation()) {
+       logAuditEvent(UserGroupInformation.getCurrentUser(),
+                     getRemoteIp(),
+                     "append", src, null, null);
+@@ -2502,7 +2547,7 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+     try {
+       return renameToInt(src, dst);
+     } catch (AccessControlException e) {
+-      if (auditLog.isInfoEnabled() && isExternalInvocation()) {
++      if (isAuditEnabled() && isExternalInvocation()) {
+         logAuditEvent(false, UserGroupInformation.getCurrentUser(),
+                       getRemoteIp(),
+                       "rename", src, dst, null);
+@@ -2524,14 +2569,14 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+       checkOperation(OperationCategory.WRITE);
+ 
+       status = renameToInternal(src, dst);
+-      if (status && auditLog.isInfoEnabled() && isExternalInvocation()) {
++      if (status && isAuditEnabled() && isExternalInvocation()) {
+         resultingStat = dir.getFileInfo(dst, false);
+       }
+     } finally {
+       writeUnlock();
+     }
+     getEditLog().logSync();
+-    if (status && auditLog.isInfoEnabled() && isExternalInvocation()) {
++    if (status && isAuditEnabled() && isExternalInvocation()) {
+       logAuditEvent(UserGroupInformation.getCurrentUser(),
+                     getRemoteIp(),
+                     "rename", src, dst, resultingStat);
+@@ -2581,14 +2626,14 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+       checkOperation(OperationCategory.WRITE);
+ 
+       renameToInternal(src, dst, options);
+-      if (auditLog.isInfoEnabled() && isExternalInvocation()) {
++      if (isAuditEnabled() && isExternalInvocation()) {
+         resultingStat = dir.getFileInfo(dst, false); 
+       }
+     } finally {
+       writeUnlock();
+     }
+     getEditLog().logSync();
+-    if (auditLog.isInfoEnabled() && isExternalInvocation()) {
++    if (isAuditEnabled() && isExternalInvocation()) {
+       StringBuilder cmd = new StringBuilder("rename options=");
+       for (Rename option : options) {
+         cmd.append(option.value()).append(" ");
+@@ -2629,7 +2674,7 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+     try {
+       return deleteInt(src, recursive);
+     } catch (AccessControlException e) {
+-      if (auditLog.isInfoEnabled() && isExternalInvocation()) {
++      if (isAuditEnabled() && isExternalInvocation()) {
+         logAuditEvent(false, UserGroupInformation.getCurrentUser(),
+                       getRemoteIp(),
+                       "delete", src, null, null);
+@@ -2645,7 +2690,7 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+       NameNode.stateChangeLog.debug("DIR* NameSystem.delete: " + src);
+     }
+     boolean status = deleteInternal(src, recursive, true);
+-    if (status && auditLog.isInfoEnabled() && isExternalInvocation()) {
++    if (status && isAuditEnabled() && isExternalInvocation()) {
+       logAuditEvent(UserGroupInformation.getCurrentUser(),
+                     getRemoteIp(),
+                     "delete", src, null, null);
+@@ -2801,7 +2846,7 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+       }
+       stat = dir.getFileInfo(src, resolveLink);
+     } catch (AccessControlException e) {
+-      if (auditLog.isInfoEnabled() && isExternalInvocation()) {
++      if (isAuditEnabled() && isExternalInvocation()) {
+         logAuditEvent(false, UserGroupInformation.getCurrentUser(),
+                       getRemoteIp(),
+                       "getfileinfo", src, null, null);
+@@ -2810,7 +2855,7 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+     } finally {
+       readUnlock();
+     }
+-    if (auditLog.isInfoEnabled() && isExternalInvocation()) {
++    if (isAuditEnabled() && isExternalInvocation()) {
+       logAuditEvent(UserGroupInformation.getCurrentUser(),
+                     getRemoteIp(),
+                     "getfileinfo", src, null, null);
+@@ -2826,7 +2871,7 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+     try {
+       return mkdirsInt(src, permissions, createParent);
+     } catch (AccessControlException e) {
+-      if (auditLog.isInfoEnabled() && isExternalInvocation()) {
++      if (isAuditEnabled() && isExternalInvocation()) {
+         logAuditEvent(false, UserGroupInformation.getCurrentUser(),
+                       getRemoteIp(),
+                       "mkdirs", src, null, null);
+@@ -2850,7 +2895,7 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+       writeUnlock();
+     }
+     getEditLog().logSync();
+-    if (status && auditLog.isInfoEnabled() && isExternalInvocation()) {
++    if (status && isAuditEnabled() && isExternalInvocation()) {
+       final HdfsFileStatus stat = dir.getFileInfo(src, false);
+       logAuditEvent(UserGroupInformation.getCurrentUser(),
+                     getRemoteIp(),
+@@ -3291,7 +3336,7 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+     try {
+       return getListingInt(src, startAfter, needLocation);
+     } catch (AccessControlException e) {
+-      if (auditLog.isInfoEnabled() && isExternalInvocation()) {
++      if (isAuditEnabled() && isExternalInvocation()) {
+         logAuditEvent(false, UserGroupInformation.getCurrentUser(),
+                       getRemoteIp(),
+                       "listStatus", src, null, null);
+@@ -3315,7 +3360,7 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+           checkTraverse(src);
+         }
+       }
+-      if (auditLog.isInfoEnabled() && isExternalInvocation()) {
++      if (isAuditEnabled() && isExternalInvocation()) {
+         logAuditEvent(UserGroupInformation.getCurrentUser(),
+                       getRemoteIp(),
+                       "listStatus", src, null, null);
+@@ -5314,7 +5359,7 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+    * Log fsck event in the audit log 
+    */
+   void logFsckEvent(String src, InetAddress remoteAddress) throws IOException {
+-    if (auditLog.isInfoEnabled()) {
++    if (isAuditEnabled()) {
+       logAuditEvent(UserGroupInformation.getCurrentUser(),
+                     remoteAddress,
+                     "fsck", src, null, null);
+@@ -5559,4 +5604,44 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+   public void setNNResourceChecker(NameNodeResourceChecker nnResourceChecker) {
+     this.nnResourceChecker = nnResourceChecker;
+   }
++
++  /**
++   * Default AuditLogger implementation; used when no access logger is
++   * defined in the config file. It can also be explicitly listed in the
++   * config file.
++   */
++  private static class DefaultAuditLogger implements AuditLogger {
++
++    @Override
++    public void initialize(Configuration conf) {
++      // Nothing to do.
++    }
++
++    @Override
++    public void logAuditEvent(boolean succeeded, String userName,
++        InetAddress addr, String cmd, String src, String dst,
++        FileStatus status) {
++      if (auditLog.isInfoEnabled()) {
++        final StringBuilder sb = auditBuffer.get();
++        sb.setLength(0);
++        sb.append("allowed=").append(succeeded).append("\t");
++        sb.append("ugi=").append(userName).append("\t");
++        sb.append("ip=").append(addr).append("\t");
++        sb.append("cmd=").append(cmd).append("\t");
++        sb.append("src=").append(src).append("\t");
++        sb.append("dst=").append(dst).append("\t");
++        if (null == status) {
++          sb.append("perm=null");
++        } else {
++          sb.append("perm=");
++          sb.append(status.getOwner()).append(":");
++          sb.append(status.getGroup()).append(":");
++          sb.append(status.getPermission());
++        }
++        auditLog.info(sb);
++      }
++    }
++
++  }
++
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml b/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+index 6ba2747..706903a 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+@@ -1111,4 +1111,17 @@
+   </description>
+ </property>
+ 
++<property>
++  <name>dfs.namenode.audit.loggers</name>
++  <value>default</value>
++  <description>
++    List of classes implementing audit loggers that will receive audit events.
++    These should be implementations of org.apache.hadoop.hdfs.server.namenode.AuditLogger.
++    The special value "default" can be used to reference the default audit
++    logger, which uses the configured log system. Installing custom audit loggers
++    may affect the performance and stability of the NameNode. Refer to the custom
++    logger's documentation for more details.
++  </description>
++</property>
++
+ </configuration>
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestAuditLogger.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestAuditLogger.java
+new file mode 100644
+index 0000000..3de27cb
+--- /dev/null
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestAuditLogger.java
+@@ -0,0 +1,123 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hdfs.server.namenode;
++
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_AUDIT_LOGGERS_KEY;
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertTrue;
++import static org.junit.Assert.fail;
++
++import java.io.IOException;
++import java.net.InetAddress;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileStatus;
++import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hdfs.HdfsConfiguration;
++import org.apache.hadoop.hdfs.MiniDFSCluster;
++import org.apache.hadoop.hdfs.protocol.HdfsFileStatus;
++import org.apache.hadoop.ipc.RemoteException;
++import org.apache.hadoop.security.UserGroupInformation;
++import org.junit.Test;
++
++/**
++ * Tests for the {@link AuditLogger} custom audit logging interface.
++ */
++public class TestAuditLogger {
++
++  /**
++   * Tests that AuditLogger works as expected.
++   */
++  @Test
++  public void testAuditLogger() throws IOException {
++    Configuration conf = new HdfsConfiguration();
++    conf.set(DFS_NAMENODE_AUDIT_LOGGERS_KEY,
++        DummyAuditLogger.class.getName());
++    MiniDFSCluster cluster = new MiniDFSCluster.Builder(conf).build();
++
++    try {
++      cluster.waitClusterUp();
++      assertTrue(DummyAuditLogger.initialized);
++
++      FileSystem fs = cluster.getFileSystem();
++      long time = System.currentTimeMillis();
++      fs.setTimes(new Path("/"), time, time);
++      assertEquals(1, DummyAuditLogger.logCount);
++    } finally {
++      cluster.shutdown();
++    }
++  }
++
++  /**
++   * Tests that a broken audit logger causes requests to fail.
++   */
++  @Test
++  public void testBrokenLogger() throws IOException {
++    Configuration conf = new HdfsConfiguration();
++    conf.set(DFS_NAMENODE_AUDIT_LOGGERS_KEY,
++        BrokenAuditLogger.class.getName());
++    MiniDFSCluster cluster = new MiniDFSCluster.Builder(conf).build();
++
++    try {
++      cluster.waitClusterUp();
++
++      FileSystem fs = cluster.getFileSystem();
++      long time = System.currentTimeMillis();
++      fs.setTimes(new Path("/"), time, time);
++      fail("Expected exception due to broken audit logger.");
++    } catch (RemoteException re) {
++      // Expected.
++    } finally {
++      cluster.shutdown();
++    }
++  }
++
++  public static class DummyAuditLogger implements AuditLogger {
++
++    static boolean initialized;
++    static int logCount;
++
++    public void initialize(Configuration conf) {
++      initialized = true;
++    }
++
++    public void logAuditEvent(boolean succeeded, String userName,
++        InetAddress addr, String cmd, String src, String dst,
++        FileStatus stat) {
++      logCount++;
++    }
++
++  }
++
++  public static class BrokenAuditLogger implements AuditLogger {
++
++    public void initialize(Configuration conf) {
++      // No op.
++    }
++
++    public void logAuditEvent(boolean succeeded, String userName,
++        InetAddress addr, String cmd, String src, String dst,
++        FileStatus stat) {
++      throw new RuntimeException("uh oh");
++    }
++
++  }
++
++}
+-- 
+1.7.0.4
+

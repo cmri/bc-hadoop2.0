@@ -1,0 +1,365 @@
+From 24db6d6294391c7a1f0c2b6de89922186c3d6d15 Mon Sep 17 00:00:00 2001
+From: Aaron Twining Myers <atm@apache.org>
+Date: Fri, 24 Aug 2012 18:52:59 +0000
+Subject: [PATCH 0416/1357] HDFS-3678. Edit log files are never being purged from 2NN. Contributed by Aaron T. Myers.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1377046 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 197678ed9782b70f037f83763e16579f3350799e)
+---
+ .../hadoop/hdfs/server/namenode/FSEditLog.java     |    3 +-
+ .../hadoop/hdfs/server/namenode/FSImage.java       |    2 +-
+ .../hdfs/server/namenode/JournalManager.java       |   14 +-----
+ .../hadoop/hdfs/server/namenode/LogsPurgeable.java |   37 ++++++++++++++
+ .../server/namenode/NNStorageRetentionManager.java |   15 +++---
+ .../hdfs/server/namenode/SecondaryNameNode.java    |   40 ++++++++++++++--
+ .../hdfs/server/namenode/TestCheckpoint.java       |   50 +++++++++++++++++++-
+ 7 files changed, 134 insertions(+), 27 deletions(-)
+ create mode 100644 hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/LogsPurgeable.java
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLog.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLog.java
+index aeeec5d..0afdebe 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLog.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLog.java
+@@ -63,7 +63,7 @@ import com.google.common.collect.Lists;
+  */
+ @InterfaceAudience.Private
+ @InterfaceStability.Evolving
+-public class FSEditLog  {
++public class FSEditLog implements LogsPurgeable {
+ 
+   static final Log LOG = LogFactory.getLog(FSEditLog.class);
+ 
+@@ -979,6 +979,7 @@ public class FSEditLog  {
+   /**
+    * Archive any log files that are older than the given txid.
+    */
++  @Override
+   public synchronized void purgeLogsOlderThan(final long minTxIdToKeep) {
+     assert curSegmentTxId == HdfsConstants.INVALID_TXID || // on format this is no-op
+       minTxIdToKeep <= curSegmentTxId :
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java
+index 22af950..4c996a8 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java
+@@ -91,7 +91,7 @@ public class FSImage implements Closeable {
+ 
+   final private Configuration conf;
+ 
+-  private final NNStorageRetentionManager archivalManager;
++  protected NNStorageRetentionManager archivalManager;
+ 
+   /**
+    * Construct an FSImage
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/JournalManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/JournalManager.java
+index c95cb20..cda1152 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/JournalManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/JournalManager.java
+@@ -35,7 +35,8 @@ import org.apache.hadoop.hdfs.server.protocol.NamespaceInfo;
+  */
+ @InterfaceAudience.Private
+ @InterfaceStability.Evolving
+-public interface JournalManager extends Closeable, FormatConfirmable {
++public interface JournalManager extends Closeable, FormatConfirmable,
++    LogsPurgeable {
+ 
+   /**
+    * Format the underlying storage, removing any previously
+@@ -74,17 +75,6 @@ public interface JournalManager extends Closeable, FormatConfirmable {
+   void setOutputBufferCapacity(int size);
+ 
+   /**
+-   * The JournalManager may archive/purge any logs for transactions less than
+-   * or equal to minImageTxId.
+-   *
+-   * @param minTxIdToKeep the earliest txid that must be retained after purging
+-   *                      old logs
+-   * @throws IOException if purging fails
+-   */
+-  void purgeLogsOlderThan(long minTxIdToKeep)
+-    throws IOException;
+-
+-  /**
+    * Recover segments which have not been finalized.
+    */
+   void recoverUnfinalizedSegments() throws IOException;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/LogsPurgeable.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/LogsPurgeable.java
+new file mode 100644
+index 0000000..d001363
+--- /dev/null
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/LogsPurgeable.java
+@@ -0,0 +1,37 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hdfs.server.namenode;
++
++import java.io.IOException;
++
++/**
++ * Interface used to abstract over classes which manage edit logs that may need
++ * to be purged.
++ */
++interface LogsPurgeable {
++  
++  /**
++   * Remove all edit logs with transaction IDs lower than the given transaction
++   * ID.
++   * 
++   * @param minTxIdToKeep the lowest transaction ID that should be retained
++   * @throws IOException in the event of error
++   */
++  public void purgeLogsOlderThan(long minTxIdToKeep) throws IOException;
++
++}
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NNStorageRetentionManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NNStorageRetentionManager.java
+index fe75247..677d7fa 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NNStorageRetentionManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NNStorageRetentionManager.java
+@@ -52,12 +52,12 @@ public class NNStorageRetentionManager {
+       NNStorageRetentionManager.class);
+   private final NNStorage storage;
+   private final StoragePurger purger;
+-  private final FSEditLog editLog;
++  private final LogsPurgeable purgeableLogs;
+   
+   public NNStorageRetentionManager(
+       Configuration conf,
+       NNStorage storage,
+-      FSEditLog editLog,
++      LogsPurgeable purgeableLogs,
+       StoragePurger purger) {
+     this.numCheckpointsToRetain = conf.getInt(
+         DFSConfigKeys.DFS_NAMENODE_NUM_CHECKPOINTS_RETAINED_KEY,
+@@ -72,13 +72,13 @@ public class NNStorageRetentionManager {
+         " must not be negative");
+     
+     this.storage = storage;
+-    this.editLog = editLog;
++    this.purgeableLogs = purgeableLogs;
+     this.purger = purger;
+   }
+   
+   public NNStorageRetentionManager(Configuration conf, NNStorage storage,
+-      FSEditLog editLog) {
+-    this(conf, storage, editLog, new DeletionStoragePurger());
++      LogsPurgeable purgeableLogs) {
++    this(conf, storage, purgeableLogs, new DeletionStoragePurger());
+   }
+ 
+   public void purgeOldStorage() throws IOException {
+@@ -95,7 +95,7 @@ public class NNStorageRetentionManager {
+     // handy for HA, where a remote node may not have as many
+     // new images.
+     long purgeLogsFrom = Math.max(0, minImageTxId + 1 - numExtraEditsToRetain);
+-    editLog.purgeLogsOlderThan(purgeLogsFrom);
++    purgeableLogs.purgeLogsOlderThan(purgeLogsFrom);
+   }
+   
+   private void purgeCheckpointsOlderThan(
+@@ -103,7 +103,6 @@ public class NNStorageRetentionManager {
+       long minTxId) {
+     for (FSImageFile image : inspector.getFoundImages()) {
+       if (image.getCheckpointTxId() < minTxId) {
+-        LOG.info("Purging old image " + image);
+         purger.purgeImage(image);
+       }
+     }
+@@ -146,11 +145,13 @@ public class NNStorageRetentionManager {
+   static class DeletionStoragePurger implements StoragePurger {
+     @Override
+     public void purgeLog(EditLogFile log) {
++      LOG.info("Purging old edit log " + log);
+       deleteOrWarn(log.getFile());
+     }
+ 
+     @Override
+     public void purgeImage(FSImageFile image) {
++      LOG.info("Purging old image " + image);
+       deleteOrWarn(image.getFile());
+       deleteOrWarn(MD5FileUtils.getDigestFileForFile(image.getFile()));
+     }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/SecondaryNameNode.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/SecondaryNameNode.java
+index ca0299c..64ef066 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/SecondaryNameNode.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/SecondaryNameNode.java
+@@ -58,6 +58,8 @@ import org.apache.hadoop.hdfs.server.common.Storage.StorageState;
+ 
+ import static org.apache.hadoop.util.ExitUtil.terminate;
+ 
++import org.apache.hadoop.hdfs.server.namenode.FileJournalManager.EditLogFile;
++import org.apache.hadoop.hdfs.server.namenode.NNStorageRetentionManager.StoragePurger;
+ import org.apache.hadoop.hdfs.server.protocol.NamenodeProtocol;
+ import org.apache.hadoop.hdfs.server.protocol.RemoteEditLog;
+ import org.apache.hadoop.hdfs.server.protocol.RemoteEditLogManifest;
+@@ -473,10 +475,6 @@ public class SecondaryNameNode implements Runnable {
+     LOG.warn("Checkpoint done. New Image Size: " 
+              + dstStorage.getFsImageName(txid).length());
+     
+-    // Since we've successfully checkpointed, we can remove some old
+-    // image files
+-    checkpointImage.purgeOldStorage();
+-    
+     return loadImage;
+   }
+   
+@@ -681,6 +679,34 @@ public class SecondaryNameNode implements Runnable {
+   }
+   
+   static class CheckpointStorage extends FSImage {
++    
++    private static class CheckpointLogPurger implements LogsPurgeable {
++      
++      private NNStorage storage;
++      private StoragePurger purger
++          = new NNStorageRetentionManager.DeletionStoragePurger();
++      
++      public CheckpointLogPurger(NNStorage storage) {
++        this.storage = storage;
++      }
++
++      @Override
++      public void purgeLogsOlderThan(long minTxIdToKeep) throws IOException {
++        Iterator<StorageDirectory> iter = storage.dirIterator();
++        while (iter.hasNext()) {
++          StorageDirectory dir = iter.next();
++          List<EditLogFile> editFiles = FileJournalManager.matchEditLogs(
++              dir.getCurrentDir());
++          for (EditLogFile f : editFiles) {
++            if (f.getLastTxId() < minTxIdToKeep) {
++              purger.purgeLog(f);
++            }
++          }
++        }
++      }
++      
++    }
++    
+     /**
+      * Construct a checkpoint image.
+      * @param conf Node configuration.
+@@ -697,6 +723,11 @@ public class SecondaryNameNode implements Runnable {
+       // we shouldn't have any editLog instance. Setting to null
+       // makes sure we don't accidentally depend on it.
+       editLog = null;
++      
++      // Replace the archival manager with one that can actually work on the
++      // 2NN's edits storage.
++      this.archivalManager = new NNStorageRetentionManager(conf, storage,
++          new CheckpointLogPurger(storage));
+     }
+ 
+     /**
+@@ -793,6 +824,7 @@ public class SecondaryNameNode implements Runnable {
+     }
+     
+     Checkpointer.rollForwardByApplyingLogs(manifest, dstImage, dstNamesystem);
++    // The following has the side effect of purging old fsimages/edit logs.
+     dstImage.saveFSImageInAllDirs(dstNamesystem, dstImage.getLastAppliedTxId());
+     dstStorage.writeAll();
+   }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestCheckpoint.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestCheckpoint.java
+index be99ffe..38479e0 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestCheckpoint.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestCheckpoint.java
+@@ -28,6 +28,7 @@ import static org.junit.Assert.assertTrue;
+ import static org.junit.Assert.fail;
+ 
+ import java.io.File;
++import java.io.FilenameFilter;
+ import java.io.IOException;
+ import java.lang.management.ManagementFactory;
+ import java.net.InetSocketAddress;
+@@ -60,6 +61,7 @@ import org.apache.hadoop.hdfs.server.common.HdfsServerConstants.StartupOption;
+ import org.apache.hadoop.hdfs.server.common.Storage;
+ import org.apache.hadoop.hdfs.server.common.Storage.StorageDirectory;
+ import org.apache.hadoop.hdfs.server.common.StorageInfo;
++import org.apache.hadoop.hdfs.server.namenode.FileJournalManager.EditLogFile;
+ import org.apache.hadoop.hdfs.server.namenode.NNStorage.NameNodeDirType;
+ import org.apache.hadoop.hdfs.server.namenode.SecondaryNameNode.CheckpointStorage;
+ import org.apache.hadoop.hdfs.server.protocol.NamenodeProtocol;
+@@ -1837,6 +1839,50 @@ public class TestCheckpoint {
+   }
+   
+   /**
++   * Regression test for HDFS-3678 "Edit log files are never being purged from 2NN"
++   */
++  @Test
++  public void testSecondaryPurgesEditLogs() throws IOException {
++    MiniDFSCluster cluster = null;
++    SecondaryNameNode secondary = null;
++    
++    Configuration conf = new HdfsConfiguration();
++    conf.setInt(DFSConfigKeys.DFS_NAMENODE_NUM_EXTRA_EDITS_RETAINED_KEY, 0);
++    try {
++      cluster = new MiniDFSCluster.Builder(conf).numDataNodes(0)
++          .format(true).build();
++      
++      FileSystem fs = cluster.getFileSystem();
++      fs.mkdirs(new Path("/foo"));
++  
++      secondary = startSecondaryNameNode(conf);
++      
++      // Checkpoint a few times. Doing this will cause a log roll, and thus
++      // several edit log segments on the 2NN.
++      for (int i = 0; i < 5; i++) {
++        secondary.doCheckpoint();
++      }
++      
++      // Make sure there are no more edit log files than there should be.
++      List<File> checkpointDirs = getCheckpointCurrentDirs(secondary);
++      for (File checkpointDir : checkpointDirs) {
++        List<EditLogFile> editsFiles = FileJournalManager.matchEditLogs(
++            checkpointDir);
++        assertEquals("Edit log files were not purged from 2NN", 1,
++            editsFiles.size());
++      }
++      
++    } finally {
++      if (secondary != null) {
++        secondary.shutdown();
++      }
++      if (cluster != null) {
++        cluster.shutdown();
++      }
++    }
++  }
++  
++  /**
+    * Regression test for HDFS-3835 - "Long-lived 2NN cannot perform a
+    * checkpoint if security is enabled and the NN restarts without outstanding
+    * delegation tokens"
+@@ -1940,7 +1986,7 @@ public class TestCheckpoint {
+         ImmutableSet.of("VERSION"));    
+   }
+   
+-  private List<File> getCheckpointCurrentDirs(SecondaryNameNode secondary) {
++  private static List<File> getCheckpointCurrentDirs(SecondaryNameNode secondary) {
+     List<File> ret = Lists.newArrayList();
+     for (URI u : secondary.getCheckpointDirs()) {
+       File checkpointDir = new File(u.getPath());
+@@ -1949,7 +1995,7 @@ public class TestCheckpoint {
+     return ret;
+   }
+ 
+-  private CheckpointStorage spyOnSecondaryImage(SecondaryNameNode secondary1) {
++  private static CheckpointStorage spyOnSecondaryImage(SecondaryNameNode secondary1) {
+     CheckpointStorage spy = Mockito.spy((CheckpointStorage)secondary1.getFSImage());;
+     secondary1.setFSImage(spy);
+     return spy;
+-- 
+1.7.0.4
+

@@ -1,0 +1,757 @@
+From 4ce73c91db2c4e9e3a167e03b138a9f927d26132 Mon Sep 17 00:00:00 2001
+From: Christopher Douglas <cdouglas@apache.org>
+Date: Thu, 19 Jul 2012 19:06:21 +0000
+Subject: [PATCH 1282/1357] MR1: CDH-8864. Support for splittable and concatenated BZip2 - backport HADOOP-7823 and MAPREDUCE-4888
+ 	  HADOOP-7823. Port HADOOP-4012 providing split support for bzip2 compressed files to branch-1. Contributed by Andrew Purtell
+ 	  MAPREDUCE-4888. Fixed NLineInputFormat one-off error which dropped data. Contributed by Vinod K V.
+
+Reason: Support splittable/concatenated bzip2 (customers' request)
+Ref: CDH-8864
+Author: Andrew Purtell / Abdul Qadeer / Vinod K V
+---
+ .../hadoop/mapred/KeyValueTextInputFormat.java     |   10 ++-
+ .../org/apache/hadoop/mapred/LineRecordReader.java |   97 ++++++++++++----
+ .../org/apache/hadoop/mapred/TextInputFormat.java  |    6 +-
+ .../apache/hadoop/mapred/lib/NLineInputFormat.java |   21 +++-
+ .../mapreduce/lib/input/LineRecordReader.java      |  101 +++++++++++-----
+ .../mapreduce/lib/input/TextInputFormat.java       |    6 +-
+ .../apache/hadoop/mapred/TestTextInputFormat.java  |  125 ++++++++++++++++++--
+ .../hadoop/mapred/lib/TestLineInputFormat.java     |   32 ++++--
+ 8 files changed, 319 insertions(+), 79 deletions(-)
+
+diff --git a/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/KeyValueTextInputFormat.java b/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/KeyValueTextInputFormat.java
+index d2d3a76..b141be1 100644
+--- a/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/KeyValueTextInputFormat.java
++++ b/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/KeyValueTextInputFormat.java
+@@ -23,7 +23,9 @@ import java.io.IOException;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.io.Text;
++import org.apache.hadoop.io.compress.CompressionCodec;
+ import org.apache.hadoop.io.compress.CompressionCodecFactory;
++import org.apache.hadoop.io.compress.SplittableCompressionCodec;
+ 
+ /**
+  * An {@link InputFormat} for plain text files. Files are broken into lines.
+@@ -41,9 +43,13 @@ public class KeyValueTextInputFormat extends FileInputFormat<Text, Text>
+   }
+   
+   protected boolean isSplitable(FileSystem fs, Path file) {
+-    return compressionCodecs.getCodec(file) == null;
++    final CompressionCodec codec = compressionCodecs.getCodec(file);
++    if (null == codec) {
++      return true;
++    }
++    return codec instanceof SplittableCompressionCodec;
+   }
+-  
++
+   public RecordReader<Text, Text> getRecordReader(InputSplit genericSplit,
+                                                   JobConf job,
+                                                   Reporter reporter)
+diff --git a/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/LineRecordReader.java b/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/LineRecordReader.java
+index 57d9bc6..553e70a 100644
+--- a/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/LineRecordReader.java
++++ b/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/LineRecordReader.java
+@@ -25,10 +25,15 @@ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FSDataInputStream;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.fs.Seekable;
+ import org.apache.hadoop.io.LongWritable;
+ import org.apache.hadoop.io.Text;
++import org.apache.hadoop.io.compress.CodecPool;
+ import org.apache.hadoop.io.compress.CompressionCodec;
+ import org.apache.hadoop.io.compress.CompressionCodecFactory;
++import org.apache.hadoop.io.compress.Decompressor;
++import org.apache.hadoop.io.compress.SplitCompressionInputStream;
++import org.apache.hadoop.io.compress.SplittableCompressionCodec;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.commons.logging.Log;
+ 
+@@ -45,6 +50,9 @@ public class LineRecordReader implements RecordReader<LongWritable, Text> {
+   private long end;
+   private LineReader in;
+   int maxLineLength;
++  private Seekable filePosition;
++  private CompressionCodec codec;
++  private Decompressor decompressor;
+ 
+   /**
+    * A class that provides a line reader from an input stream.
+@@ -86,31 +94,62 @@ public class LineRecordReader implements RecordReader<LongWritable, Text> {
+     end = start + split.getLength();
+     final Path file = split.getPath();
+     compressionCodecs = new CompressionCodecFactory(job);
+-    final CompressionCodec codec = compressionCodecs.getCodec(file);
++    codec = compressionCodecs.getCodec(file);
+ 
+     // open the file and seek to the start of the split
+     FileSystem fs = file.getFileSystem(job);
+     FSDataInputStream fileIn = fs.open(split.getPath());
+-    boolean skipFirstLine = false;
+-    if (codec != null) {
+-      in = new LineReader(codec.createInputStream(fileIn), job,
++
++    if (isCompressedInput()) {
++      decompressor = CodecPool.getDecompressor(codec);
++      if (codec instanceof SplittableCompressionCodec) {
++        final SplitCompressionInputStream cIn =
++          ((SplittableCompressionCodec)codec).createInputStream(
++            fileIn, decompressor, start, end,
++            SplittableCompressionCodec.READ_MODE.BYBLOCK);
++        in = new LineReader(cIn, job, recordDelimiter);
++        start = cIn.getAdjustedStart();
++        end = cIn.getAdjustedEnd();
++        filePosition = cIn; // take pos from compressed stream
++      } else {
++        in = new LineReader(codec.createInputStream(fileIn, decompressor), job,
+             recordDelimiter);
+-      end = Long.MAX_VALUE;
+-    } else {
+-      if (start != 0) {
+-        skipFirstLine = true;
+-        --start;
+-        fileIn.seek(start);
++        filePosition = fileIn;
+       }
++    } else {
++      fileIn.seek(start);
+       in = new LineReader(fileIn, job, recordDelimiter);
++      filePosition = fileIn;
+     }
+-    if (skipFirstLine) {  // skip first line and re-establish "start".
+-      start += in.readLine(new Text(), 0,
+-                           (int)Math.min((long)Integer.MAX_VALUE, end - start));
++    // If this is not the first split, we always throw away first record
++    // because we always (except the last split) read one extra line in
++    // next() method.
++    if (start != 0) {
++      start += in.readLine(new Text(), 0, maxBytesToConsume(start));
+     }
+     this.pos = start;
+   }
+-  
++
++  private boolean isCompressedInput() {
++    return (codec != null);
++  }
++
++  private int maxBytesToConsume(long pos) {
++    return isCompressedInput()
++      ? Integer.MAX_VALUE
++      : (int) Math.min(Integer.MAX_VALUE, end - pos);
++  }
++
++  private long getFilePosition() throws IOException {
++    long retVal;
++    if (isCompressedInput() && null != filePosition) {
++      retVal = filePosition.getPos();
++    } else {
++      retVal = pos;
++    }
++    return retVal;
++  }
++
+   public LineRecordReader(InputStream in, long offset, long endOffset,
+                           int maxLineLength) {
+     this(in, offset, endOffset, maxLineLength, null);
+@@ -122,7 +161,8 @@ public class LineRecordReader implements RecordReader<LongWritable, Text> {
+     this.in = new LineReader(in, recordDelimiter);
+     this.start = offset;
+     this.pos = offset;
+-    this.end = endOffset;    
++    this.end = endOffset;
++    this.filePosition = null;
+   }
+ 
+   public LineRecordReader(InputStream in, long offset, long endOffset,
+@@ -140,6 +180,7 @@ public class LineRecordReader implements RecordReader<LongWritable, Text> {
+     this.start = offset;
+     this.pos = offset;
+     this.end = endOffset;    
++    this.filePosition = null;
+   }
+   
+   public LongWritable createKey() {
+@@ -154,12 +195,13 @@ public class LineRecordReader implements RecordReader<LongWritable, Text> {
+   public synchronized boolean next(LongWritable key, Text value)
+     throws IOException {
+ 
+-    while (pos < end) {
++    // We always read one extra line, which lies outside the upper
++    // split limit i.e. (end - 1)
++    while (getFilePosition() <= end) {
+       key.set(pos);
+ 
+       int newSize = in.readLine(value, maxLineLength,
+-                                Math.max((int)Math.min(Integer.MAX_VALUE, end-pos),
+-                                         maxLineLength));
++          Math.max(maxBytesToConsume(pos), maxLineLength));
+       if (newSize == 0) {
+         return false;
+       }
+@@ -182,17 +224,28 @@ public class LineRecordReader implements RecordReader<LongWritable, Text> {
+     if (start == end) {
+       return 0.0f;
+     } else {
+-      return Math.min(1.0f, (pos - start) / (float)(end - start));
++      try {
++        return Math.min(1.0f, (getFilePosition() - start)
++            / (float) (end - start));
++      } catch (IOException ioe) {
++        throw new RuntimeException(ioe);
++      }
+     }
+   }
+   
+-  public  synchronized long getPos() throws IOException {
++  public synchronized long getPos() throws IOException {
+     return pos;
+   }
+ 
+   public synchronized void close() throws IOException {
+-    if (in != null) {
+-      in.close(); 
++    try {
++      if (in != null) {
++        in.close();
++      }
++    } finally {
++      if (decompressor != null) {
++        CodecPool.returnDecompressor(decompressor);
++      }
+     }
+   }
+ }
+diff --git a/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/TextInputFormat.java b/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/TextInputFormat.java
+index 1839b04..23e0a08 100644
+--- a/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/TextInputFormat.java
++++ b/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/TextInputFormat.java
+@@ -39,7 +39,11 @@ public class TextInputFormat extends FileInputFormat<LongWritable, Text>
+   }
+   
+   protected boolean isSplitable(FileSystem fs, Path file) {
+-    return compressionCodecs.getCodec(file) == null;
++    final CompressionCodec codec = compressionCodecs.getCodec(file);
++    if (null == codec) {
++      return true;
++    }
++    return codec instanceof SplittableCompressionCodec;
+   }
+ 
+   public RecordReader<LongWritable, Text> getRecordReader(
+diff --git a/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/lib/NLineInputFormat.java b/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/lib/NLineInputFormat.java
+index 42f250a..01744b1 100644
+--- a/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/lib/NLineInputFormat.java
++++ b/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/lib/NLineInputFormat.java
+@@ -97,14 +97,14 @@ public class NLineInputFormat extends FileInputFormat<LongWritable, Text>
+           numLines++;
+           length += num;
+           if (numLines == N) {
+-            splits.add(new FileSplit(fileName, begin, length, new String[]{}));
++            splits.add(createFileSplit(fileName, begin, length));
+             begin += length;
+             length = 0;
+             numLines = 0;
+           }
+         }
+         if (numLines != 0) {
+-          splits.add(new FileSplit(fileName, begin, length, new String[]{}));
++          splits.add(createFileSplit(fileName, begin, length));
+         }
+    
+       } finally {
+@@ -116,6 +116,23 @@ public class NLineInputFormat extends FileInputFormat<LongWritable, Text>
+     return splits.toArray(new FileSplit[splits.size()]);
+   }
+ 
++  /**
++   * NLineInputFormat uses LineRecordReader, which always reads
++   * (and consumes) at least one character out of its upper split
++   * boundary. So to make sure that each mapper gets N lines, we
++   * move back the upper split limits of each split 
++   * by one character here.
++   * @param fileName  Path of file
++   * @param begin  the position of the first byte in the file to process
++   * @param length  number of bytes in InputSplit
++   * @return  FileSplit
++   */
++  protected static FileSplit createFileSplit(Path fileName, long begin, long length) {
++    return (begin == 0) 
++    ? new FileSplit(fileName, begin, length - 1, new String[] {})
++    : new FileSplit(fileName, begin - 1, length, new String[] {});
++  }
++
+   public void configure(JobConf conf) {
+     N = conf.getInt("mapred.line.input.format.linespermap", 1);
+   }
+diff --git a/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapreduce/lib/input/LineRecordReader.java b/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapreduce/lib/input/LineRecordReader.java
+index 8ea3a34..fff3d41 100644
+--- a/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapreduce/lib/input/LineRecordReader.java
++++ b/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapreduce/lib/input/LineRecordReader.java
+@@ -24,10 +24,15 @@ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FSDataInputStream;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.fs.Seekable;
+ import org.apache.hadoop.io.LongWritable;
+ import org.apache.hadoop.io.Text;
++import org.apache.hadoop.io.compress.CodecPool;
+ import org.apache.hadoop.io.compress.CompressionCodec;
+ import org.apache.hadoop.io.compress.CompressionCodecFactory;
++import org.apache.hadoop.io.compress.Decompressor;
++import org.apache.hadoop.io.compress.SplitCompressionInputStream;
++import org.apache.hadoop.io.compress.SplittableCompressionCodec;
+ import org.apache.hadoop.mapreduce.InputSplit;
+ import org.apache.hadoop.mapreduce.RecordReader;
+ import org.apache.hadoop.mapreduce.TaskAttemptContext;
+@@ -49,7 +54,10 @@ public class LineRecordReader extends RecordReader<LongWritable, Text> {
+   private int maxLineLength;
+   private LongWritable key = null;
+   private Text value = null;
+-  private byte[] recordDelimiterBytes;
++  private Seekable filePosition;
++  private CompressionCodec codec;
++  private Decompressor decompressor;
++  private byte[] recordDelimiterBytes = null;
+ 
+   public LineRecordReader() {
+   }
+@@ -68,39 +76,62 @@ public class LineRecordReader extends RecordReader<LongWritable, Text> {
+     end = start + split.getLength();
+     final Path file = split.getPath();
+     compressionCodecs = new CompressionCodecFactory(job);
+-    final CompressionCodec codec = compressionCodecs.getCodec(file);
++    codec = compressionCodecs.getCodec(file);
+ 
+     // open the file and seek to the start of the split
+     FileSystem fs = file.getFileSystem(job);
+     FSDataInputStream fileIn = fs.open(split.getPath());
+-    boolean skipFirstLine = false;
+-    if (codec != null) {
+-      if (null == this.recordDelimiterBytes) {
+-        in = new LineReader(codec.createInputStream(fileIn), job);
++
++    if (isCompressedInput()) {
++      decompressor = CodecPool.getDecompressor(codec);
++      if (codec instanceof SplittableCompressionCodec) {
++        final SplitCompressionInputStream cIn =
++          ((SplittableCompressionCodec)codec).createInputStream(
++            fileIn, decompressor, start, end,
++            SplittableCompressionCodec.READ_MODE.BYBLOCK);
++        in = new LineReader(cIn, job, recordDelimiterBytes);
++        start = cIn.getAdjustedStart();
++        end = cIn.getAdjustedEnd();
++        filePosition = cIn;
+       } else {
+-        in = new LineReader(codec.createInputStream(fileIn), job,
+-            this.recordDelimiterBytes);
++        in = new LineReader(codec.createInputStream(fileIn, decompressor), job,
++            recordDelimiterBytes);
++        filePosition = fileIn;
+       }
+-      end = Long.MAX_VALUE;
+     } else {
+-      if (start != 0) {
+-        skipFirstLine = true;
+-        --start;
+-        fileIn.seek(start);
+-      }
+-      if (null == this.recordDelimiterBytes) {
+-        in = new LineReader(fileIn, job);
+-      } else {
+-        in = new LineReader(fileIn, job, this.recordDelimiterBytes);
+-      }
++      fileIn.seek(start);
++      in = new LineReader(fileIn, job, recordDelimiterBytes);
++      filePosition = fileIn;
+     }
+-    if (skipFirstLine) {  // skip first line and re-establish "start".
+-      start += in.readLine(new Text(), 0,
+-                           (int)Math.min((long)Integer.MAX_VALUE, end - start));
++    // If this is not the first split, we always throw away first record
++    // because we always (except the last split) read one extra line in
++    // next() method.
++    if (start != 0) {
++      start += in.readLine(new Text(), 0, maxBytesToConsume(start));
+     }
+     this.pos = start;
+   }
+   
++  private boolean isCompressedInput() {
++    return (codec != null);
++  }
++
++  private int maxBytesToConsume(long pos) {
++    return isCompressedInput()
++      ? Integer.MAX_VALUE
++      : (int) Math.min(Integer.MAX_VALUE, end - pos);
++  }
++
++  private long getFilePosition() throws IOException {
++    long retVal;
++    if (isCompressedInput() && null != filePosition) {
++      retVal = filePosition.getPos();
++    } else {
++      retVal = pos;
++    }
++    return retVal;
++  }
++
+   public boolean nextKeyValue() throws IOException {
+     if (key == null) {
+       key = new LongWritable();
+@@ -110,10 +141,11 @@ public class LineRecordReader extends RecordReader<LongWritable, Text> {
+       value = new Text();
+     }
+     int newSize = 0;
+-    while (pos < end) {
++    // We always read one extra line, which lies outside the upper
++    // split limit i.e. (end - 1)
++    while (getFilePosition() <= end) {
+       newSize = in.readLine(value, maxLineLength,
+-                            Math.max((int)Math.min(Integer.MAX_VALUE, end-pos),
+-                                     maxLineLength));
++          Math.max(maxBytesToConsume(pos), maxLineLength));
+       if (newSize == 0) {
+         break;
+       }
+@@ -152,13 +184,24 @@ public class LineRecordReader extends RecordReader<LongWritable, Text> {
+     if (start == end) {
+       return 0.0f;
+     } else {
+-      return Math.min(1.0f, (pos - start) / (float)(end - start));
++      try { 
++        return Math.min(1.0f, (getFilePosition() - start)
++            / (float) (end - start));
++      } catch (IOException ioe) {
++        throw new RuntimeException(ioe);
++      }
+     }
+   }
+-  
++
+   public synchronized void close() throws IOException {
+-    if (in != null) {
+-      in.close(); 
++    try {
++      if (in != null) {
++        in.close();
++      }
++    } finally {
++      if (decompressor != null) {
++        CodecPool.returnDecompressor(decompressor);
++      }
+     }
+   }
+ }
+diff --git a/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapreduce/lib/input/TextInputFormat.java b/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapreduce/lib/input/TextInputFormat.java
+index 85d562e..60e24a3 100644
+--- a/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapreduce/lib/input/TextInputFormat.java
++++ b/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapreduce/lib/input/TextInputFormat.java
+@@ -23,6 +23,7 @@ import org.apache.hadoop.io.LongWritable;
+ import org.apache.hadoop.io.Text;
+ import org.apache.hadoop.io.compress.CompressionCodec;
+ import org.apache.hadoop.io.compress.CompressionCodecFactory;
++import org.apache.hadoop.io.compress.SplittableCompressionCodec;
+ import org.apache.hadoop.mapreduce.InputFormat;
+ import org.apache.hadoop.mapreduce.InputSplit;
+ import org.apache.hadoop.mapreduce.JobContext;
+@@ -50,7 +51,10 @@ public class TextInputFormat extends FileInputFormat<LongWritable, Text> {
+   protected boolean isSplitable(JobContext context, Path file) {
+     CompressionCodec codec = 
+       new CompressionCodecFactory(context.getConfiguration()).getCodec(file);
+-    return codec == null;
++    if (null == codec) {
++      return true;
++    }
++    return codec instanceof SplittableCompressionCodec;
+   }
+ 
+ }
+diff --git a/hadoop-mapreduce1-project/src/test/org/apache/hadoop/mapred/TestTextInputFormat.java b/hadoop-mapreduce1-project/src/test/org/apache/hadoop/mapred/TestTextInputFormat.java
+index 4a30e70..157097d 100644
+--- a/hadoop-mapreduce1-project/src/test/org/apache/hadoop/mapred/TestTextInputFormat.java
++++ b/hadoop-mapreduce1-project/src/test/org/apache/hadoop/mapred/TestTextInputFormat.java
+@@ -20,16 +20,20 @@ package org.apache.hadoop.mapred;
+ 
+ import java.io.*;
+ import java.util.*;
+-import junit.framework.TestCase;
+ 
+-import org.apache.commons.logging.*;
+ import org.apache.hadoop.fs.*;
+ import org.apache.hadoop.io.*;
+ import org.apache.hadoop.io.compress.*;
+ import org.apache.hadoop.util.LineReader;
+ import org.apache.hadoop.util.ReflectionUtils;
+ 
+-public class TestTextInputFormat extends TestCase {
++import org.junit.Test;
++import static junit.framework.Assert.*;
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++
++public class TestTextInputFormat {
+   private static final Log LOG =
+     LogFactory.getLog(TestTextInputFormat.class.getName());
+ 
+@@ -39,17 +43,20 @@ public class TestTextInputFormat extends TestCase {
+   private static FileSystem localFs = null; 
+   static {
+     try {
++      defaultConf.set("fs.default.name", "file:///");
+       localFs = FileSystem.getLocal(defaultConf);
+     } catch (IOException e) {
+       throw new RuntimeException("init failure", e);
+     }
+   }
+-  private static Path workDir = 
+-    new Path(new Path(System.getProperty("test.build.data", "."), "data"),
+-             "TestTextInputFormat");
+-  
++
++  private static Path workDir =
++    new Path(new Path(System.getProperty("test.build.data", "/tmp")),
++             "TestTextInputFormat").makeQualified(localFs);
++
++  @Test
+   public void testFormat() throws Exception {
+-    JobConf job = new JobConf();
++    JobConf job = new JobConf(defaultConf);
+     Path file = new Path(workDir, "test.txt");
+ 
+     // A reporter that does nothing
+@@ -127,6 +134,95 @@ public class TestTextInputFormat extends TestCase {
+     }
+   }
+ 
++  @Test
++  public void testSplitableCodecs() throws IOException {
++    JobConf conf = new JobConf(defaultConf);
++    int seed = new Random().nextInt();
++    // Create the codec
++    CompressionCodec codec = null;
++    try {
++      codec = (CompressionCodec)
++      ReflectionUtils.newInstance(conf.getClassByName("org.apache.hadoop.io.compress.BZip2Codec"), conf);
++    } catch (ClassNotFoundException cnfe) {
++      throw new IOException("Illegal codec!");
++    }
++    Path file = new Path(workDir, "test"+codec.getDefaultExtension());
++
++    // A reporter that does nothing
++    Reporter reporter = Reporter.NULL;
++    LOG.info("seed = "+seed);
++    Random random = new Random(seed);
++    FileSystem localFs = FileSystem.getLocal(conf);
++
++    localFs.delete(workDir, true);
++    FileInputFormat.setInputPaths(conf, workDir);
++
++    final int MAX_LENGTH = 500000;
++
++    // for a variety of lengths
++    for (int length = MAX_LENGTH / 2; length < MAX_LENGTH;
++        length += random.nextInt(MAX_LENGTH / 4)+1) {
++
++      LOG.info("creating; entries = " + length);
++
++      // create a file with length entries
++      Writer writer =
++        new OutputStreamWriter(codec.createOutputStream(localFs.create(file)));
++      try {
++        for (int i = 0; i < length; i++) {
++          writer.write(Integer.toString(i));
++          writer.write("\n");
++        }
++      } finally {
++        writer.close();
++      }
++
++      // try splitting the file in a variety of sizes
++      TextInputFormat format = new TextInputFormat();
++      format.configure(conf);
++      LongWritable key = new LongWritable();
++      Text value = new Text();
++      for (int i = 0; i < 3; i++) {
++        int numSplits = random.nextInt(MAX_LENGTH/2000)+1;
++        LOG.info("splitting: requesting = " + numSplits);
++        InputSplit[] splits = format.getSplits(conf, numSplits);
++        LOG.info("splitting: got =        " + splits.length);
++
++        // check each split
++        BitSet bits = new BitSet(length);
++        for (int j = 0; j < splits.length; j++) {
++          LOG.debug("split["+j+"]= " + splits[j]);
++          RecordReader<LongWritable, Text> reader =
++            format.getRecordReader(splits[j], conf, reporter);
++          try {
++            int counter = 0;
++            while (reader.next(key, value)) {
++              int v = Integer.parseInt(value.toString());
++              LOG.debug("read " + v);
++
++              if (bits.get(v)) {
++                LOG.warn("conflict with " + v +
++                    " in split " + j +
++                    " at position "+reader.getPos());
++              }
++              assertFalse("Key in multiple partitions.", bits.get(v));
++              bits.set(v);
++              counter++;
++            }
++            if (counter > 0) {
++              LOG.info("splits["+j+"]="+splits[j]+" count=" + counter);
++            } else {
++              LOG.debug("splits["+j+"]="+splits[j]+" count=" + counter);
++            }
++          } finally {
++            reader.close();
++          }
++        }
++        assertEquals("Some keys in no partition.", length, bits.cardinality());
++      }
++    }
++  }
++
+   private static LineReader makeStream(String str) throws IOException {
+     return new LineReader(new ByteArrayInputStream
+                                              (str.getBytes("UTF-8")), 
+@@ -138,6 +234,7 @@ public class TestTextInputFormat extends TestCase {
+                                            bufsz);
+   }
+   
++  @Test
+   public void testUTF8() throws Exception {
+     LineReader in = makeStream("abcd\u20acbdcd\u20ac");
+     Text line = new Text();
+@@ -156,6 +253,7 @@ public class TestTextInputFormat extends TestCase {
+    *
+    * @throws Exception
+    */
++  @Test
+   public void testNewLines() throws Exception {
+     final String STR = "a\nbb\n\nccc\rdddd\r\r\r\n\r\neeeee";
+     final int STRLENBYTES = STR.getBytes().length;
+@@ -195,6 +293,7 @@ public class TestTextInputFormat extends TestCase {
+    *
+    * @throws Exception
+    */
++  @Test
+   public void testMaxLineLength() throws Exception {
+     final String STR = "a\nbb\n\nccc\rdddd\r\neeeee";
+     final int STRLENBYTES = STR.getBytes().length;
+@@ -253,8 +352,9 @@ public class TestTextInputFormat extends TestCase {
+   /**
+    * Test using the gzip codec for reading
+    */
+-  public static void testGzip() throws IOException {
+-    JobConf job = new JobConf();
++  @Test
++  public void testGzip() throws IOException {
++    JobConf job = new JobConf(defaultConf);
+     CompressionCodec gzip = new GzipCodec();
+     ReflectionUtils.setConf(gzip, job);
+     localFs.delete(workDir, true);
+@@ -286,8 +386,9 @@ public class TestTextInputFormat extends TestCase {
+   /**
+    * Test using the gzip codec and an empty input file
+    */
+-  public static void testGzipEmpty() throws IOException {
+-    JobConf job = new JobConf();
++  @Test
++  public void testGzipEmpty() throws IOException {
++    JobConf job = new JobConf(defaultConf);
+     CompressionCodec gzip = new GzipCodec();
+     ReflectionUtils.setConf(gzip, job);
+     localFs.delete(workDir, true);
+diff --git a/hadoop-mapreduce1-project/src/test/org/apache/hadoop/mapred/lib/TestLineInputFormat.java b/hadoop-mapreduce1-project/src/test/org/apache/hadoop/mapred/lib/TestLineInputFormat.java
+index 1f06fdc..250469e 100644
+--- a/hadoop-mapreduce1-project/src/test/org/apache/hadoop/mapred/lib/TestLineInputFormat.java
++++ b/hadoop-mapreduce1-project/src/test/org/apache/hadoop/mapred/lib/TestLineInputFormat.java
+@@ -48,9 +48,6 @@ public class TestLineInputFormat extends TestCase {
+     JobConf job = new JobConf();
+     Path file = new Path(workDir, "test.txt");
+ 
+-    int seed = new Random().nextInt();
+-    Random random = new Random(seed);
+-
+     localFs.delete(workDir, true);
+     FileInputFormat.setInputPaths(job, workDir);
+     int numLinesPerMap = 5;
+@@ -58,7 +55,8 @@ public class TestLineInputFormat extends TestCase {
+ 
+     // for a variety of lengths
+     for (int length = 0; length < MAX_LENGTH;
+-         length += random.nextInt(MAX_LENGTH/10) + 1) {
++         length += 1) {
++      System.out.println("Processing file of length "+length);
+       // create a file with length entries
+       Writer writer = new OutputStreamWriter(localFs.create(file));
+       try {
+@@ -69,14 +67,21 @@ public class TestLineInputFormat extends TestCase {
+       } finally {
+         writer.close();
+       }
+-      checkFormat(job, numLinesPerMap);
++      int lastN = 0;
++      if (length != 0) {
++        lastN = length % numLinesPerMap;
++        if (lastN == 0) {
++          lastN = numLinesPerMap;
++        }
++      }
++      checkFormat(job, numLinesPerMap, lastN);
+     }
+   }
+ 
+   // A reporter that does nothing
+   private static final Reporter voidReporter = Reporter.NULL;
+   
+-  void checkFormat(JobConf job, int expectedN) throws IOException{
++  void checkFormat(JobConf job, int expectedN, int lastN) throws IOException{
+     NLineInputFormat format = new NLineInputFormat();
+     format.configure(job);
+     int ignoredNumSplits = 1;
+@@ -84,7 +89,8 @@ public class TestLineInputFormat extends TestCase {
+ 
+     // check all splits except last one
+     int count = 0;
+-    for (int j = 0; j < splits.length -1; j++) {
++    for (int j = 0; j < splits.length; j++) {
++      System.out.println("Processing split "+splits[j]);
+       assertEquals("There are no split locations", 0,
+                    splits[j].getLocations().length);
+       RecordReader<LongWritable, Text> reader =
+@@ -102,16 +108,22 @@ public class TestLineInputFormat extends TestCase {
+       try {
+         count = 0;
+         while (reader.next(key, value)) {
++          System.out.println("Got "+key+" "+value+" at count "+count+" of split "+j);
+           count++;
+         }
+       } finally {
+         reader.close();
+       }
+-      assertEquals("number of lines in split is " + expectedN ,
+-                   expectedN, count);
++      if ( j == splits.length - 1) {
++        assertEquals("number of lines in split(" + j + ") is wrong" ,
++                     lastN, count);
++      } else {
++        assertEquals("number of lines in split(" + j + ") is wrong" ,
++                     expectedN, count);
++      }
+     }
+   }
+-  
++
+   public static void main(String[] args) throws Exception {
+     new TestLineInputFormat().testFormat();
+   }
+-- 
+1.7.0.4
+

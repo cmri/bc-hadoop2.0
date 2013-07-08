@@ -1,0 +1,432 @@
+From 2d12742d9557d58da5d8767d2c75027fa770f664 Mon Sep 17 00:00:00 2001
+From: Alejandro Abdelnur <tucu@cloudera.com>
+Date: Tue, 15 Jan 2013 10:39:42 -0800
+Subject: [PATCH 1251/1357] MR1: CLOUDERA-BUILD. JT HA: Support delegation tokens with logical JT names under JT HA
+
+  Reason: bug
+  Author: Alejandro Abdelnur
+  Ref: CDH-9178/CDH-9615
+---
+ .../mapred/ConfiguredFailoverProxyProvider.java    |   11 +-
+ src/mapred/org/apache/hadoop/mapred/HAUtil.java    |   64 ++++++++-
+ src/mapred/org/apache/hadoop/mapred/JobClient.java |   39 +++--
+ .../hadoop/mapred/JobSubmissionProtocol.java       |    3 +-
+ .../apache/hadoop/mapred/JobTrackerProxies.java    |    8 +-
+ .../hadoop/mapred/TestHADelegationToken.java       |  166 ++++++++++++++++++++
+ 6 files changed, 263 insertions(+), 28 deletions(-)
+ create mode 100644 src/test/org/apache/hadoop/mapred/TestHADelegationToken.java
+
+diff --git a/src/mapred/org/apache/hadoop/mapred/ConfiguredFailoverProxyProvider.java b/src/mapred/org/apache/hadoop/mapred/ConfiguredFailoverProxyProvider.java
+index 8e40a6c..a008762 100644
+--- a/src/mapred/org/apache/hadoop/mapred/ConfiguredFailoverProxyProvider.java
++++ b/src/mapred/org/apache/hadoop/mapred/ConfiguredFailoverProxyProvider.java
+@@ -19,9 +19,7 @@ package org.apache.hadoop.mapred;
+ 
+ import java.io.Closeable;
+ import java.io.IOException;
+-import java.io.PrintWriter;
+ import java.net.InetSocketAddress;
+-import java.net.URI;
+ import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.List;
+@@ -31,14 +29,11 @@ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.CommonConfigurationKeysPublic;
+-import org.apache.hadoop.ha.HAServiceProtocol;
+ import org.apache.hadoop.io.retry.FailoverProxyProvider;
+ import org.apache.hadoop.ipc.RPC;
+-import org.apache.hadoop.net.NetUtils;
+ import org.apache.hadoop.security.UserGroupInformation;
+ 
+ import com.google.common.base.Preconditions;
+-import com.google.common.collect.Maps;
+ 
+ /**
+  * A FailoverProxyProvider implementation which allows one to configure two URIs
+@@ -97,7 +92,11 @@ public class ConfiguredFailoverProxyProvider<T> implements
+         proxies.add(new AddressRpcProxyPair<T>(address));
+       }
+ 
+-    } catch (IOException e) {
++      // The client may have a delegation token set for the logical
++      // URI of the cluster. Clone this token to apply to each of the
++      // underlying IPC addresses so that the IPC code can find it.
++      HAUtil.cloneDelegationTokenForLogicalAddress(ugi, jtAddress, addressesOfJTs);    
++    } catch (Exception e) {
+       throw new RuntimeException(e);
+     }
+   }
+diff --git a/src/mapred/org/apache/hadoop/mapred/HAUtil.java b/src/mapred/org/apache/hadoop/mapred/HAUtil.java
+index 322ad8a..a21535c 100644
+--- a/src/mapred/org/apache/hadoop/mapred/HAUtil.java
++++ b/src/mapred/org/apache/hadoop/mapred/HAUtil.java
+@@ -32,8 +32,13 @@ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.HadoopIllegalArgumentException;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hdfs.DFSUtil;
+-import org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenSelector;
++import org.apache.hadoop.io.Text;
++import org.apache.hadoop.mapreduce.security.token.delegation.DelegationTokenIdentifier;
++import org.apache.hadoop.mapreduce.security.token.delegation.DelegationTokenSelector;
+ import org.apache.hadoop.net.NetUtils;
++import org.apache.hadoop.security.SecurityUtil;
++import org.apache.hadoop.security.UserGroupInformation;
++import org.apache.hadoop.security.token.Token;
+ 
+ public class HAUtil {
+   
+@@ -338,4 +343,61 @@ public class HAUtil {
+     }
+   }
+ 
++  /**
++   * A prefix put before the jobtracker address inside the "service" field
++   * of a delegation token, indicating that the address is a logical (HA)
++   * address.
++   */
++  public static final String HA_DT_SERVICE_PREFIX = "ha-jt:";
++
++  private static final DelegationTokenSelector tokenSelector =
++    new DelegationTokenSelector();
++
++  /**
++   * Get the service name used in the delegation token for the given logical
++   * HA service.
++   * @param haJtAddress the logical URI of the cluster
++   * @return the service name
++   */
++  public static Text buildTokenServiceForLogicalAddress(String haJtAddress) {
++    return new Text(HA_DT_SERVICE_PREFIX + haJtAddress);
++  }
++
++  /**
++   * @return true if this token corresponds to a logical address
++   * rather than a specific jobtracker.
++   */
++  public static boolean isTokenForLogicalAddress(
++    Token<?> token) {
++    return token.getService().toString().startsWith(HA_DT_SERVICE_PREFIX);
++  }
++
++  public static String getServiceAddressFromToken(Token<?> token) {
++    String service = token.getService().toString();
++    return isTokenForLogicalAddress(token) 
++      ? service.substring(HA_DT_SERVICE_PREFIX.length()) : service;
++  }
++  
++  public static void cloneDelegationTokenForLogicalAddress(
++    UserGroupInformation ugi, String haJtAddress,
++    Collection<InetSocketAddress> jtAddresses) {
++    Text haService = HAUtil.buildTokenServiceForLogicalAddress(haJtAddress);
++    Token<DelegationTokenIdentifier> haToken =
++      tokenSelector.selectToken(haService, ugi.getTokens());
++    
++    if (haToken != null) {
++      for (InetSocketAddress singleJtAddr : jtAddresses) {
++        Token<DelegationTokenIdentifier> specificToken =
++          new Token<DelegationTokenIdentifier>(haToken);
++        SecurityUtil.setTokenService(specificToken, singleJtAddr);
++        ugi.addToken(specificToken);
++        LOG.debug("Mapped HA service delegation token for logical address " +
++          haJtAddress + " to jt " + singleJtAddr);
++      }
++    } else {
++      LOG.debug("No HA service delegation token found for logical address " +
++        haJtAddress);
++    }
++  }
++
+ }
+diff --git a/src/mapred/org/apache/hadoop/mapred/JobClient.java b/src/mapred/org/apache/hadoop/mapred/JobClient.java
+index faa7ba2..a9d6d57 100644
+--- a/src/mapred/org/apache/hadoop/mapred/JobClient.java
++++ b/src/mapred/org/apache/hadoop/mapred/JobClient.java
+@@ -563,13 +563,23 @@ public class JobClient extends Configured implements MRConstants, Tool  {
+       return DelegationTokenIdentifier.MAPREDUCE_DELEGATION_KIND.equals(kind);
+     }
+ 
++    private JobSubmissionProtocol createJTProxy(Token<?> token, Configuration conf) 
++      throws IOException {
++      JobSubmissionProtocol jt;
++      String addr = HAUtil.getServiceAddressFromToken(token);
++      if (HAUtil.isTokenForLogicalAddress(token))  {
++        jt = createRPCProxy(NetUtils.createSocketAddr(conf.get("mapred.job.tracker")), conf);
++      } else {
++        jt = createRPCProxy(NetUtils.createSocketAddr(addr), conf);
++      }
++      return jt;
++    }
++    
+     @SuppressWarnings("unchecked")
+     @Override
+     public long renew(Token<?> token, Configuration conf
+                       ) throws IOException, InterruptedException {
+-      InetSocketAddress addr = 
+-          NetUtils.createSocketAddr(token.getService().toString());
+-      JobSubmissionProtocol jt = createRPCProxy(addr, conf);
++      JobSubmissionProtocol jt = createJTProxy(token, conf);
+       return jt.renewDelegationToken((Token<DelegationTokenIdentifier>) token);
+     }
+ 
+@@ -577,9 +587,7 @@ public class JobClient extends Configured implements MRConstants, Tool  {
+     @Override
+     public void cancel(Token<?> token, Configuration conf
+                        ) throws IOException, InterruptedException {
+-      InetSocketAddress addr = 
+-          NetUtils.createSocketAddr(token.getService().toString());
+-      JobSubmissionProtocol jt = createRPCProxy(addr, conf);
++      JobSubmissionProtocol jt = createJTProxy(token, conf);
+       jt.cancelDelegationToken((Token<DelegationTokenIdentifier>) token);
+     }
+ 
+@@ -2090,13 +2098,18 @@ public class JobClient extends Configured implements MRConstants, Tool  {
+     getDelegationToken(Text renewer) throws IOException, InterruptedException {
+     Token<DelegationTokenIdentifier> result =
+       jobSubmitClient.getDelegationToken(renewer);
+-    InetSocketAddress addr = JobTracker.getAddress(getConf());
+-    StringBuilder service = new StringBuilder();
+-    service.append(NetUtils.normalizeHostName(addr.getAddress().
+-                                              getHostAddress()));
+-    service.append(':');
+-    service.append(addr.getPort());
+-    result.setService(new Text(service.toString()));
++    String jtAddress = getConf().get("mapred.job.tracker");
++    if (!HAUtil.isHAEnabled(getConf(), jtAddress)) {
++      InetSocketAddress addr = JobTracker.getAddress(getConf());
++      StringBuilder service = new StringBuilder();
++      service.append(NetUtils.normalizeHostName(addr.getAddress().
++                                                getHostAddress()));
++      service.append(':');
++      service.append(addr.getPort());
++      result.setService(new Text(service.toString()));
++    } else {
++      result.setService(HAUtil.buildTokenServiceForLogicalAddress(jtAddress));      
++    }
+     return result;
+   }
+ 
+diff --git a/src/mapred/org/apache/hadoop/mapred/JobSubmissionProtocol.java b/src/mapred/org/apache/hadoop/mapred/JobSubmissionProtocol.java
+index 76cde1c..9226545 100644
+--- a/src/mapred/org/apache/hadoop/mapred/JobSubmissionProtocol.java
++++ b/src/mapred/org/apache/hadoop/mapred/JobSubmissionProtocol.java
+@@ -303,7 +303,8 @@ interface JobSubmissionProtocol extends VersionedProtocol {
+    * @return the new expiration time
+    * @throws IOException
+    * @throws InterruptedException
+-   */ 
++   */
++  @Idempotent
+   public long renewDelegationToken(Token<DelegationTokenIdentifier> token
+                                    ) throws IOException,
+                                             InterruptedException;
+diff --git a/src/mapred/org/apache/hadoop/mapred/JobTrackerProxies.java b/src/mapred/org/apache/hadoop/mapred/JobTrackerProxies.java
+index 6f6bdb9..9ac1e03 100644
+--- a/src/mapred/org/apache/hadoop/mapred/JobTrackerProxies.java
++++ b/src/mapred/org/apache/hadoop/mapred/JobTrackerProxies.java
+@@ -23,20 +23,14 @@ import com.google.common.base.Preconditions;
+ import java.io.IOException;
+ import java.lang.reflect.Constructor;
+ import java.net.InetSocketAddress;
+-import java.net.URI;
+-import java.util.HashMap;
+-import java.util.Map;
+-import java.util.concurrent.TimeUnit;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hdfs.DFSUtil;
+ import org.apache.hadoop.io.Text;
+-import org.apache.hadoop.io.retry.DefaultFailoverProxyProvider;
+ import org.apache.hadoop.io.retry.FailoverProxyProvider;
+ import org.apache.hadoop.io.retry.RetryPolicies;
+-import org.apache.hadoop.io.retry.RetryPolicy;
+ import org.apache.hadoop.io.retry.RetryProxy;
+ import org.apache.hadoop.ipc.*;
+ import org.apache.hadoop.net.NetUtils;
+@@ -100,7 +94,7 @@ public class JobTrackerProxies {
+               maxFailoverAttempts, failoverSleepBaseMillis,
+               failoverSleepMaxMillis));
+       
+-      Text dtService = new Text(jtAddress);
++      Text dtService = HAUtil.buildTokenServiceForLogicalAddress(jtAddress);
+       return new ProxyAndInfo<T>(proxy, dtService);
+     }
+   }
+diff --git a/src/test/org/apache/hadoop/mapred/TestHADelegationToken.java b/src/test/org/apache/hadoop/mapred/TestHADelegationToken.java
+new file mode 100644
+index 0000000..fe97eae
+--- /dev/null
++++ b/src/test/org/apache/hadoop/mapred/TestHADelegationToken.java
+@@ -0,0 +1,166 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.mapred;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.fs.FileUtil;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.fs.permission.FsPermission;
++import org.apache.hadoop.hdfs.MiniDFSCluster;
++import org.apache.hadoop.ha.TestNodeFencer.AlwaysSucceedFencer;
++import org.apache.hadoop.io.Text;
++import org.apache.hadoop.mapreduce.security.token.delegation.DelegationTokenIdentifier;
++import org.apache.hadoop.security.SecurityUtil;
++import org.apache.hadoop.security.UserGroupInformation;
++import org.apache.hadoop.security.token.Token;
++import org.apache.hadoop.security.token.TokenIdentifier;
++import org.apache.hadoop.util.ExitUtil;
++import org.junit.After;
++import org.junit.Test;
++
++import java.io.File;
++import java.net.InetSocketAddress;
++import java.security.PrivilegedExceptionAction;
++import java.util.Collection;
++import java.util.HashSet;
++import java.util.Map;
++import java.util.Set;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++
++/**
++ * Tests JT HA delegation tokens.
++ */
++public class TestHADelegationToken {
++  private static final String TMP_DIR = 
++    new File("build/test/" + TestHADelegationToken.class.getSimpleName()).getAbsolutePath();
++
++  private static MiniDFSCluster miniDFS = null;
++  private MiniMRHACluster cluster;
++  private JobTrackerHADaemon jt1;
++  private JobTrackerHADaemon jt2;
++  private JobTrackerHAServiceTarget target1;
++  private JobTrackerHAServiceTarget target2;
++  private Configuration conf;
++  
++  private void startCluster() throws Exception {
++    startCluster(new Configuration());
++  }
++  
++  private void startCluster(Configuration conf) throws Exception {
++    ExitUtil.disableSystemExit();
++
++    File tmpDir = new File(TMP_DIR);
++    FileUtil.fullyDelete(tmpDir);
++    tmpDir.mkdirs();
++    this.conf = conf;
++
++    conf.set("fs.hdfs.impl.disable.cache", "true");
++    conf.set("dfs.block.access.token.enable", "false");
++    conf.set("dfs.permissions", "true");
++    conf.set("hadoop.security.authentication", "simple");
++    conf.set("hadoop.tmp.dir", TMP_DIR);
++    miniDFS = new MiniDFSCluster(conf, 1, true, null);
++    FileSystem fileSystem = miniDFS.getFileSystem();
++    fileSystem.mkdirs(new Path("/tmp"));
++    fileSystem.mkdirs(new Path("/user"));
++    fileSystem.mkdirs(new Path(TMP_DIR));
++    fileSystem.mkdirs(new Path(TMP_DIR, "mapred"));
++    fileSystem.setPermission(new Path("/tmp"), FsPermission.valueOf("-rwxrwxrwx"));
++    fileSystem.setPermission(new Path("/user"), FsPermission.valueOf("-rwxrwxrwx"));
++    Path tmp = new Path(TMP_DIR, "mapred");
++    while (tmp != null) {      
++      fileSystem.setPermission(tmp, new FsPermission((short)0777));      
++      tmp = tmp.getParent();
++    }
++    conf.set("fs.default.name", fileSystem.getUri().toString());
++    
++    conf.set(HAUtil.MR_HA_FENCING_METHODS_KEY, AlwaysSucceedFencer.class.getName());
++    cluster = new MiniMRHACluster(conf);
++    cluster.getJobTrackerHaDaemon(0).makeActive();
++    cluster.startTaskTracker(0, 1);
++    cluster.waitActive();
++
++    jt1 = cluster.getJobTrackerHaDaemon(0);
++    jt2 = cluster.getJobTrackerHaDaemon(1);
++    target1 = new JobTrackerHAServiceTarget(jt1.getConf());
++    target2 = new JobTrackerHAServiceTarget(jt2.getConf());
++  }
++  
++  @After
++  public void tearDown() throws Exception {
++    if (cluster != null) {
++      cluster.shutdown();
++      FileSystem.closeAll();
++      miniDFS.shutdown();
++    }
++  }
++  
++  @Test
++  public void tokenCloningServiceWithLogicalRealNames() throws Exception {
++    UserGroupInformation user = UserGroupInformation.createUserForTesting("alice",
++      new String[]{"users"});
++    startCluster();
++
++    user.doAs(new PrivilegedExceptionAction<Void>() {
++      @Override
++      public Void run() throws Exception {
++        JobClient jc = new JobClient(conf);
++        assertFalse(conf.get("mapred.job.tracker").contains(":"));
++
++        Token<DelegationTokenIdentifier> haToken =
++          jc.getDelegationToken(
++            new Text(UserGroupInformation.getCurrentUser().getShortUserName()));
++
++        // verify the token has the correct service name with JT HA prefix
++        assertEquals(HAUtil.buildTokenServiceForLogicalAddress(conf.get("mapred.job.tracker")),
++          haToken.getService());
++
++        // inject the token as credential in the UGI
++        UserGroupInformation ugi = UserGroupInformation.getCurrentUser();
++        ugi.addToken(haToken);
++
++        // create a new jobclient so it gets the token from the UGI
++        jc = new JobClient(conf);
++
++        // collect the service from tokens in the UGI
++        Collection<Token<? extends TokenIdentifier>> tokensInUGI = ugi.getTokens();
++        Set<Text> found = new HashSet<Text>();
++        for (Token<? extends TokenIdentifier> t : tokensInUGI) {
++          found.add(t.getService());
++        }
++
++        // create a set with the expected service from tokens in the UGI, we are looking for
++        // services from cloned tokens with logical and real names
++        Set<Text> expected = new HashSet<Text>();
++        Map<String, InetSocketAddress> map = HAUtil.getHaJtRpcAddresses(conf);
++        for (InetSocketAddress address : map.values()) {
++          expected.add(SecurityUtil.buildTokenService(address));
++        }
++        expected.add(HAUtil.buildTokenServiceForLogicalAddress(conf.get("mapred.job.tracker")));
++
++        assertEquals(expected, found);
++        return null;
++      }
++    });
++  }
++
++}
+-- 
+1.7.0.4
+

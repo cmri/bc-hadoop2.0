@@ -1,0 +1,363 @@
+From 9076f04f2cf7f588ef5a2abe3fa1ef66442c9038 Mon Sep 17 00:00:00 2001
+From: Eli Collins <eli@apache.org>
+Date: Wed, 5 Sep 2012 22:19:40 +0000
+Subject: [PATCH 0485/1357] HADOOP-8648. libhadoop: native CRC32 validation crashes when io.bytes.per.checksum=1. Contributed by Colin Patrick McCabe
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1381419 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit d2b46d18183ad70c0aad5ce278f49fbd52c88a08)
+---
+ hadoop-common-project/hadoop-common/pom.xml        |   14 ++++
+ .../hadoop-common/src/CMakeLists.txt               |    8 ++
+ .../native/src/org/apache/hadoop/util/bulk_crc32.c |   59 +++++++++++-----
+ .../native/src/org/apache/hadoop/util/bulk_crc32.h |   40 +++++++++--
+ .../test/org/apache/hadoop/util/test_bulk_crc32.c  |   77 ++++++++++++++++++++
+ 5 files changed, 175 insertions(+), 23 deletions(-)
+ create mode 100644 hadoop-common-project/hadoop-common/src/main/native/src/test/org/apache/hadoop/util/test_bulk_crc32.c
+
+diff --git a/hadoop-common-project/hadoop-common/pom.xml b/hadoop-common-project/hadoop-common/pom.xml
+index 9362a13..9b8d0c2 100644
+--- a/hadoop-common-project/hadoop-common/pom.xml
++++ b/hadoop-common-project/hadoop-common/pom.xml
+@@ -522,6 +522,20 @@
+                   </target>
+                 </configuration>
+               </execution>
++              <execution>
++                <id>native_tests</id>
++                <phase>test</phase>
++                <goals><goal>run</goal></goals>
++                <configuration>
++                  <target>
++                    <exec executable="sh" failonerror="true" dir="${project.build.directory}/native">
++                      <arg value="-c"/>
++                      <arg value="[ x$SKIPTESTS = xtrue ] || ${project.build.directory}/native/test_bulk_crc32"/>
++                      <env key="SKIPTESTS" value="${skipTests}"/>
++                    </exec>
++                  </target>
++                </configuration>
++              </execution>
+             </executions>
+           </plugin>
+         </plugins>
+diff --git a/hadoop-common-project/hadoop-common/src/CMakeLists.txt b/hadoop-common-project/hadoop-common/src/CMakeLists.txt
+index 8ff2f12..5c3d77d 100644
+--- a/hadoop-common-project/hadoop-common/src/CMakeLists.txt
++++ b/hadoop-common-project/hadoop-common/src/CMakeLists.txt
+@@ -60,6 +60,7 @@ find_package(ZLIB REQUIRED)
+ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -g -Wall -O2")
+ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -D_REENTRANT -D_FILE_OFFSET_BITS=64")
+ set(D main/native/src/org/apache/hadoop)
++set(T main/native/src/test/org/apache/hadoop)
+ 
+ GET_FILENAME_COMPONENT(HADOOP_ZLIB_LIBRARY ${ZLIB_LIBRARIES} NAME)
+ 
+@@ -98,9 +99,16 @@ include_directories(
+     ${JNI_INCLUDE_DIRS}
+     ${ZLIB_INCLUDE_DIRS}
+     ${SNAPPY_INCLUDE_DIR}
++    ${D}/util
+ )
+ CONFIGURE_FILE(${CMAKE_SOURCE_DIR}/config.h.cmake ${CMAKE_BINARY_DIR}/config.h)
+ 
++add_executable(test_bulk_crc32
++    ${D}/util/bulk_crc32.c
++    ${T}/util/test_bulk_crc32.c
++)
++set_property(SOURCE main.cpp PROPERTY INCLUDE_DIRECTORIES "\"-Werror\" \"-Wall\"")
++
+ add_dual_library(hadoop
+     ${D}/io/compress/lz4/Lz4Compressor.c
+     ${D}/io/compress/lz4/Lz4Decompressor.c
+diff --git a/hadoop-common-project/hadoop-common/src/main/native/src/org/apache/hadoop/util/bulk_crc32.c b/hadoop-common-project/hadoop-common/src/main/native/src/org/apache/hadoop/util/bulk_crc32.c
+index d2491d7..7009bf1 100644
+--- a/hadoop-common-project/hadoop-common/src/main/native/src/org/apache/hadoop/util/bulk_crc32.c
++++ b/hadoop-common-project/hadoop-common/src/main/native/src/org/apache/hadoop/util/bulk_crc32.c
+@@ -23,6 +23,7 @@
+  */
+ #include <assert.h>
+ #include <arpa/inet.h>
++#include <errno.h>
+ #include <stdint.h>
+ #include <unistd.h>
+ 
+@@ -33,9 +34,10 @@
+ 
+ #define USE_PIPELINED
+ 
++#define CRC_INITIAL_VAL 0xffffffff
++
+ typedef uint32_t (*crc_update_func_t)(uint32_t, const uint8_t *, size_t);
+-static uint32_t crc_init();
+-static uint32_t crc_val(uint32_t crc);
++static inline uint32_t crc_val(uint32_t crc);
+ static uint32_t crc32_zlib_sb8(uint32_t crc, const uint8_t *buf, size_t length);
+ static uint32_t crc32c_sb8(uint32_t crc, const uint8_t *buf, size_t length);
+ 
+@@ -45,6 +47,35 @@ static void pipelined_crc32c(uint32_t *crc1, uint32_t *crc2, uint32_t *crc3, con
+ static int cached_cpu_supports_crc32; // initialized by constructor below
+ static uint32_t crc32c_hardware(uint32_t crc, const uint8_t* data, size_t length);
+ 
++int bulk_calculate_crc(const uint8_t *data, size_t data_len,
++                    uint32_t *sums, int checksum_type,
++                    int bytes_per_checksum) {
++  uint32_t crc;
++  crc_update_func_t crc_update_func;
++
++  switch (checksum_type) {
++    case CRC32_ZLIB_POLYNOMIAL:
++      crc_update_func = crc32_zlib_sb8;
++      break;
++    case CRC32C_POLYNOMIAL:
++      crc_update_func = crc32c_sb8;
++      break;
++    default:
++      return -EINVAL;
++      break;
++  }
++  while (likely(data_len > 0)) {
++    int len = likely(data_len >= bytes_per_checksum) ? bytes_per_checksum : data_len;
++    crc = CRC_INITIAL_VAL;
++    crc = crc_update_func(crc, data, len);
++    *sums = ntohl(crc_val(crc));
++    data += len;
++    data_len -= len;
++    sums++;
++  }
++  return 0;
++}
++
+ int bulk_verify_crc(const uint8_t *data, size_t data_len,
+                     const uint32_t *sums, int checksum_type,
+                     int bytes_per_checksum,
+@@ -80,7 +111,7 @@ int bulk_verify_crc(const uint8_t *data, size_t data_len,
+   if (do_pipelined) {
+     /* Process three blocks at a time */
+     while (likely(n_blocks >= 3)) {
+-      crc1 = crc2 = crc3 = crc_init();  
++      crc1 = crc2 = crc3 = CRC_INITIAL_VAL;
+       pipelined_crc32c(&crc1, &crc2, &crc3, data, bytes_per_checksum, 3);
+ 
+       crc = ntohl(crc_val(crc1));
+@@ -101,7 +132,7 @@ int bulk_verify_crc(const uint8_t *data, size_t data_len,
+ 
+     /* One or two blocks */
+     if (n_blocks) {
+-      crc1 = crc2 = crc_init();
++      crc1 = crc2 = crc3 = CRC_INITIAL_VAL;
+       pipelined_crc32c(&crc1, &crc2, &crc3, data, bytes_per_checksum, n_blocks);
+ 
+       if ((crc = ntohl(crc_val(crc1))) != *sums)
+@@ -118,7 +149,7 @@ int bulk_verify_crc(const uint8_t *data, size_t data_len,
+  
+     /* For something smaller than a block */
+     if (remainder) {
+-      crc1 = crc_init();
++      crc1 = crc2 = crc3 = CRC_INITIAL_VAL;
+       pipelined_crc32c(&crc1, &crc2, &crc3, data, remainder, 1);
+ 
+       if ((crc = ntohl(crc_val(crc1))) != *sums)
+@@ -130,7 +161,7 @@ int bulk_verify_crc(const uint8_t *data, size_t data_len,
+ 
+   while (likely(data_len > 0)) {
+     int len = likely(data_len >= bytes_per_checksum) ? bytes_per_checksum : data_len;
+-    crc = crc_init();
++    crc = CRC_INITIAL_VAL;
+     crc = crc_update_func(crc, data, len);
+     crc = ntohl(crc_val(crc));
+     if (unlikely(crc != *sums)) {
+@@ -151,18 +182,10 @@ return_crc_error:
+   return INVALID_CHECKSUM_DETECTED;
+ }
+ 
+-
+-/**
+- * Initialize a CRC
+- */
+-static uint32_t crc_init() {
+-  return 0xffffffff;
+-}
+-
+ /**
+  * Extract the final result of a CRC
+  */
+-static uint32_t crc_val(uint32_t crc) {
++static inline uint32_t crc_val(uint32_t crc) {
+   return ~crc;
+ }
+ 
+@@ -398,7 +421,7 @@ static void pipelined_crc32c(uint32_t *crc1, uint32_t *crc2, uint32_t *crc3, con
+         counter--;
+       }
+ 
+-      /* Take care of the remainder. They are only up to three bytes,
++      /* Take care of the remainder. They are only up to seven bytes,
+        * so performing byte-level crc32 won't take much time.
+        */
+       bdata = (uint8_t*)data;
+@@ -433,7 +456,7 @@ static void pipelined_crc32c(uint32_t *crc1, uint32_t *crc2, uint32_t *crc3, con
+         "crc32b (%5), %0;\n\t"
+         "crc32b (%5,%4,1), %1;\n\t"
+          : "=r"(c1), "=r"(c2) 
+-         : "r"(c1), "r"(c2), "r"(c3), "r"(block_size), "r"(bdata)
++         : "r"(c1), "r"(c2), "r"(block_size), "r"(bdata)
+         );
+         bdata++;
+         remainder--;
+@@ -593,7 +616,7 @@ static void pipelined_crc32c(uint32_t *crc1, uint32_t *crc2, uint32_t *crc3, con
+         "crc32b (%5), %0;\n\t"
+         "crc32b (%5,%4,1), %1;\n\t"
+          : "=r"(c1), "=r"(c2) 
+-         : "r"(c1), "r"(c2), "r"(c3), "r"(block_size), "r"(bdata)
++         : "r"(c1), "r"(c2), "r"(block_size), "r"(bdata)
+         );
+         bdata++;
+         remainder--;
+diff --git a/hadoop-common-project/hadoop-common/src/main/native/src/org/apache/hadoop/util/bulk_crc32.h b/hadoop-common-project/hadoop-common/src/main/native/src/org/apache/hadoop/util/bulk_crc32.h
+index 2ab1bd3..44cf52e 100644
+--- a/hadoop-common-project/hadoop-common/src/main/native/src/org/apache/hadoop/util/bulk_crc32.h
++++ b/hadoop-common-project/hadoop-common/src/main/native/src/org/apache/hadoop/util/bulk_crc32.h
+@@ -19,6 +19,7 @@
+ #define BULK_CRC32_H_INCLUDED
+ 
+ #include <stdint.h>
++#include <unistd.h> /* for size_t */
+ 
+ // Constants for different CRC algorithms
+ #define CRC32C_POLYNOMIAL 1
+@@ -42,16 +43,45 @@ typedef struct crc32_error {
+  * of bytes_per_checksum bytes. The checksums are each 32 bits
+  * and are stored in sequential indexes of the 'sums' array.
+  *
+- *  checksum_type - one of the CRC32 constants defined above
+- *  error_info - if non-NULL, will be filled in if an error
+- *               is detected
++ * @param data                  The data to checksum
++ * @param dataLen               Length of the data buffer
++ * @param sums                  (out param) buffer to write checksums into.
++ *                              It must contain at least dataLen * 4 bytes.
++ * @param checksum_type         One of the CRC32 algorithm constants defined 
++ *                              above
++ * @param bytes_per_checksum    How many bytes of data to process per checksum.
++ * @param error_info            If non-NULL, will be filled in if an error
++ *                              is detected
+  *
+- * Returns: 0 for success, non-zero for an error, result codes
+- *          for which are defined above
++ * @return                      0 for success, non-zero for an error, result codes
++ *                              for which are defined above
+  */
+ extern int bulk_verify_crc(const uint8_t *data, size_t data_len,
+     const uint32_t *sums, int checksum_type,
+     int bytes_per_checksum,
+     crc32_error_t *error_info);
+ 
++/**
++ * Calculate checksums for some data.
++ *
++ * The checksums are each 32 bits and are stored in sequential indexes of the
++ * 'sums' array.
++ *
++ * This function is not (yet) optimized.  It is provided for testing purposes
++ * only.
++ *
++ * @param data                  The data to checksum
++ * @param dataLen               Length of the data buffer
++ * @param sums                  (out param) buffer to write checksums into.
++ *                              It must contain at least dataLen * 4 bytes.
++ * @param checksum_type         One of the CRC32 algorithm constants defined 
++ *                              above
++ * @param bytesPerChecksum      How many bytes of data to process per checksum.
++ *
++ * @return                      0 for success, non-zero for an error
++ */
++int bulk_calculate_crc(const uint8_t *data, size_t data_len,
++                    uint32_t *sums, int checksum_type,
++                    int bytes_per_checksum);
++
+ #endif
+diff --git a/hadoop-common-project/hadoop-common/src/main/native/src/test/org/apache/hadoop/util/test_bulk_crc32.c b/hadoop-common-project/hadoop-common/src/main/native/src/test/org/apache/hadoop/util/test_bulk_crc32.c
+new file mode 100644
+index 0000000..ff77537
+--- /dev/null
++++ b/hadoop-common-project/hadoop-common/src/main/native/src/test/org/apache/hadoop/util/test_bulk_crc32.c
+@@ -0,0 +1,77 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "bulk_crc32.h"
++
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++
++#define EXPECT_ZERO(x) \
++    do { \
++        int __my_ret__ = x; \
++        if (__my_ret__) { \
++            fprintf(stderr, "TEST_ERROR: failed on line %d with return " \
++              "code %d: got nonzero from %s\n", __LINE__, __my_ret__, #x); \
++            return __my_ret__; \
++        } \
++    } while (0);
++
++static int testBulkVerifyCrc(int dataLen, int crcType, int bytesPerChecksum)
++{
++  int i;
++  uint8_t *data;
++  uint32_t *sums;
++  crc32_error_t errorData;
++
++  data = malloc(dataLen);
++  for (i = 0; i < dataLen; i++) {
++    data[i] = (i % 16) + 1;
++  }
++  sums = calloc(sizeof(uint32_t),
++                (dataLen + bytesPerChecksum - 1) / bytesPerChecksum);
++
++  EXPECT_ZERO(bulk_calculate_crc(data, dataLen, sums, crcType,
++                                 bytesPerChecksum));
++  EXPECT_ZERO(bulk_verify_crc(data, dataLen, sums, crcType,
++                            bytesPerChecksum, &errorData));
++  free(data);
++  free(sums);
++  return 0;
++}
++
++int main(int argc, char **argv)
++{
++  /* Test running bulk_calculate_crc with some different algorithms and
++   * bytePerChecksum values. */
++  EXPECT_ZERO(testBulkVerifyCrc(4096, CRC32C_POLYNOMIAL, 512));
++  EXPECT_ZERO(testBulkVerifyCrc(4096, CRC32_ZLIB_POLYNOMIAL, 512));
++  EXPECT_ZERO(testBulkVerifyCrc(256, CRC32C_POLYNOMIAL, 1));
++  EXPECT_ZERO(testBulkVerifyCrc(256, CRC32_ZLIB_POLYNOMIAL, 1));
++  EXPECT_ZERO(testBulkVerifyCrc(1, CRC32C_POLYNOMIAL, 1));
++  EXPECT_ZERO(testBulkVerifyCrc(1, CRC32_ZLIB_POLYNOMIAL, 1));
++  EXPECT_ZERO(testBulkVerifyCrc(2, CRC32C_POLYNOMIAL, 1));
++  EXPECT_ZERO(testBulkVerifyCrc(17, CRC32C_POLYNOMIAL, 1));
++  EXPECT_ZERO(testBulkVerifyCrc(17, CRC32C_POLYNOMIAL, 2));
++  EXPECT_ZERO(testBulkVerifyCrc(17, CRC32_ZLIB_POLYNOMIAL, 2));
++  EXPECT_ZERO(testBulkVerifyCrc(17, CRC32C_POLYNOMIAL, 4));
++  EXPECT_ZERO(testBulkVerifyCrc(17, CRC32_ZLIB_POLYNOMIAL, 4));
++
++  fprintf(stderr, "%s: SUCCESS.\n", argv[0]);
++  return EXIT_SUCCESS;
++}
+-- 
+1.7.0.4
+

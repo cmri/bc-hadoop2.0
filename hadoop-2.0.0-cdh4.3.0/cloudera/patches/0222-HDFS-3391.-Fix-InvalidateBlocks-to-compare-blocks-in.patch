@@ -1,0 +1,287 @@
+From dd7a4d327520a4777492a3357532d8f1516699a0 Mon Sep 17 00:00:00 2001
+From: Todd Lipcon <todd@apache.org>
+Date: Thu, 17 May 2012 22:30:52 +0000
+Subject: [PATCH 0222/1357] HDFS-3391. Fix InvalidateBlocks to compare blocks including their generation stamps. Contributed by Todd Lipcon.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/branch-2@1339898 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 4e30d27225701aaf3da0b68040d2745eeea7ecc0)
+---
+ .../server/blockmanagement/InvalidateBlocks.java   |   20 +++++++--
+ .../hdfs/server/datanode/BPOfferService.java       |    3 +-
+ .../hadoop/hdfs/server/datanode/DataNode.java      |   21 +++++----
+ .../hadoop/hdfs/util/LightWeightHashSet.java       |   27 +++++++++----
+ .../hadoop/hdfs/util/LightWeightLinkedSet.java     |    2 +-
+ .../hdfs/server/datanode/TestBlockRecovery.java    |    6 +-
+ .../hadoop/hdfs/util/TestLightWeightHashSet.java   |   43 ++++++++++++++++++++
+ 7 files changed, 96 insertions(+), 26 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/InvalidateBlocks.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/InvalidateBlocks.java
+index 74c2fa8..4d5547d 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/InvalidateBlocks.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/InvalidateBlocks.java
+@@ -19,7 +19,6 @@ package org.apache.hadoop.hdfs.server.blockmanagement;
+ 
+ import java.io.PrintWriter;
+ import java.util.ArrayList;
+-import java.util.Collection;
+ import java.util.HashSet;
+ import java.util.Iterator;
+ import java.util.List;
+@@ -56,10 +55,23 @@ class InvalidateBlocks {
+     return numBlocks;
+   }
+ 
+-  /** Does this contain the block which is associated with the storage? */
++  /**
++   * @return true if the given storage has the given block listed for
++   * invalidation. Blocks are compared including their generation stamps:
++   * if a block is pending invalidation but with a different generation stamp,
++   * returns false.
++   * @param storageID the storage to check
++   * @param the block to look for
++   * 
++   */
+   synchronized boolean contains(final String storageID, final Block block) {
+-    final Collection<Block> s = node2blocks.get(storageID);
+-    return s != null && s.contains(block);
++    final LightWeightHashSet<Block> s = node2blocks.get(storageID);
++    if (s == null) {
++      return false; // no invalidate blocks for this storage ID
++    }
++    Block blockInSet = s.getElement(block);
++    return blockInSet != null &&
++        block.getGenerationStamp() == blockInSet.getGenerationStamp();
+   }
+ 
+   /**
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BPOfferService.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BPOfferService.java
+index dc3b8ca..75ee2a4 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BPOfferService.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BPOfferService.java
+@@ -597,7 +597,8 @@ class BPOfferService {
+       processDistributedUpgradeCommand((UpgradeCommand)cmd);
+       break;
+     case DatanodeProtocol.DNA_RECOVERBLOCK:
+-      dn.recoverBlocks(((BlockRecoveryCommand)cmd).getRecoveringBlocks());
++      String who = "NameNode at " + actor.getNNSocketAddress();
++      dn.recoverBlocks(who, ((BlockRecoveryCommand)cmd).getRecoveringBlocks());
+       break;
+     case DatanodeProtocol.DNA_ACCESSKEYUPDATE:
+       LOG.info("DatanodeCommand action: DNA_ACCESSKEYUPDATE");
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNode.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNode.java
+index ab47600..25298fd 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNode.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNode.java
+@@ -169,6 +169,7 @@ import org.apache.hadoop.util.Time;
+ import org.apache.hadoop.util.VersionInfo;
+ import org.mortbay.util.ajax.JSON;
+ 
++import com.google.common.base.Joiner;
+ import com.google.common.base.Preconditions;
+ import com.google.common.collect.Sets;
+ import com.google.common.annotations.VisibleForTesting;
+@@ -1722,14 +1723,17 @@ public class DataNode extends Configured
+     secureMain(args, null);
+   }
+ 
+-  public Daemon recoverBlocks(final Collection<RecoveringBlock> blocks) {
++  public Daemon recoverBlocks(
++      final String who,
++      final Collection<RecoveringBlock> blocks) {
++    
+     Daemon d = new Daemon(threadGroup, new Runnable() {
+       /** Recover a list of blocks. It is run by the primary datanode. */
+       @Override
+       public void run() {
+         for(RecoveringBlock b : blocks) {
+           try {
+-            logRecoverBlock("NameNode", b.getBlock(), b.getLocations());
++            logRecoverBlock(who, b);
+             recoverBlock(b);
+           } catch (IOException e) {
+             LOG.warn("recoverBlocks FAILED: " + b, e);
+@@ -1990,14 +1994,13 @@ public class DataNode extends Configured
+         datanodes, storages);
+   }
+   
+-  private static void logRecoverBlock(String who,
+-      ExtendedBlock block, DatanodeID[] targets) {
+-    StringBuilder msg = new StringBuilder(targets[0].toString());
+-    for (int i = 1; i < targets.length; i++) {
+-      msg.append(", " + targets[i]);
+-    }
++  private static void logRecoverBlock(String who, RecoveringBlock rb) {
++    ExtendedBlock block = rb.getBlock();
++    DatanodeInfo[] targets = rb.getLocations();
++    
+     LOG.info(who + " calls recoverBlock(block=" + block
+-        + ", targets=[" + msg + "])");
++        + ", targets=[" + Joiner.on(", ").join(targets) + "]"
++        + ", newGenerationStamp=" + rb.getNewGenerationStamp() + ")");
+   }
+ 
+   @Override // ClientDataNodeProtocol
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/util/LightWeightHashSet.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/util/LightWeightHashSet.java
+index 8b42161..f2800e4 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/util/LightWeightHashSet.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/util/LightWeightHashSet.java
+@@ -177,31 +177,42 @@ public class LightWeightHashSet<T> implements Collection<T> {
+    * @return true if element present, false otherwise.
+    */
+   @SuppressWarnings("unchecked")
++  @Override
+   public boolean contains(final Object key) {
++    return getElement((T)key) != null;
++  }
++  
++  /**
++   * Return the element in this set which is equal to
++   * the given key, if such an element exists.
++   * Otherwise returns null.
++   */
++  public T getElement(final T key) {
+     // validate key
+     if (key == null) {
+       throw new IllegalArgumentException("Null element is not supported.");
+     }
+     // find element
+-    final int hashCode = ((T)key).hashCode();
++    final int hashCode = key.hashCode();
+     final int index = getIndex(hashCode);
+-    return containsElem(index, (T) key, hashCode);
++    return getContainedElem(index, key, hashCode);
+   }
+ 
+   /**
+-   * Check if the set contains given element at given index.
++   * Check if the set contains given element at given index. If it
++   * does, return that element.
+    *
+-   * @return true if element present, false otherwise.
++   * @return the element, or null, if no element matches
+    */
+-  protected boolean containsElem(int index, final T key, int hashCode) {
++  protected T getContainedElem(int index, final T key, int hashCode) {
+     for (LinkedElement<T> e = entries[index]; e != null; e = e.next) {
+       // element found
+       if (hashCode == e.hashCode && e.element.equals(key)) {
+-        return true;
++        return e.element;
+       }
+     }
+     // element not found
+-    return false;
++    return null;
+   }
+ 
+   /**
+@@ -246,7 +257,7 @@ public class LightWeightHashSet<T> implements Collection<T> {
+     final int hashCode = element.hashCode();
+     final int index = getIndex(hashCode);
+     // return false if already present
+-    if (containsElem(index, element, hashCode)) {
++    if (getContainedElem(index, element, hashCode) != null) {
+       return false;
+     }
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/util/LightWeightLinkedSet.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/util/LightWeightLinkedSet.java
+index e7abf5c..f470cdd 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/util/LightWeightLinkedSet.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/util/LightWeightLinkedSet.java
+@@ -90,7 +90,7 @@ public class LightWeightLinkedSet<T> extends LightWeightHashSet<T> {
+     final int hashCode = element.hashCode();
+     final int index = getIndex(hashCode);
+     // return false if already present
+-    if (containsElem(index, element, hashCode)) {
++    if (getContainedElem(index, element, hashCode) != null) {
+       return false;
+     }
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestBlockRecovery.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestBlockRecovery.java
+index 73005ac..1a6c9ec 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestBlockRecovery.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestBlockRecovery.java
+@@ -431,7 +431,7 @@ public class TestBlockRecovery {
+     DataNode spyDN = spy(dn);
+     doThrow(new RecoveryInProgressException("Replica recovery is in progress")).
+        when(spyDN).initReplicaRecovery(any(RecoveringBlock.class));
+-    Daemon d = spyDN.recoverBlocks(initRecoveringBlocks());
++    Daemon d = spyDN.recoverBlocks("fake NN", initRecoveringBlocks());
+     d.join();
+     verify(spyDN, never()).syncBlock(
+         any(RecoveringBlock.class), anyListOf(BlockRecord.class));
+@@ -451,7 +451,7 @@ public class TestBlockRecovery {
+     DataNode spyDN = spy(dn);
+     doThrow(new IOException()).
+        when(spyDN).initReplicaRecovery(any(RecoveringBlock.class));
+-    Daemon d = spyDN.recoverBlocks(initRecoveringBlocks());
++    Daemon d = spyDN.recoverBlocks("fake NN", initRecoveringBlocks());
+     d.join();
+     verify(spyDN, never()).syncBlock(
+         any(RecoveringBlock.class), anyListOf(BlockRecord.class));
+@@ -471,7 +471,7 @@ public class TestBlockRecovery {
+     doReturn(new ReplicaRecoveryInfo(block.getBlockId(), 0,
+         block.getGenerationStamp(), ReplicaState.FINALIZED)).when(spyDN).
+         initReplicaRecovery(any(RecoveringBlock.class));
+-    Daemon d = spyDN.recoverBlocks(initRecoveringBlocks());
++    Daemon d = spyDN.recoverBlocks("fake NN", initRecoveringBlocks());
+     d.join();
+     DatanodeProtocol dnP = dn.getActiveNamenodeForBP(POOL_ID);
+     verify(dnP).commitBlockSynchronization(
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/util/TestLightWeightHashSet.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/util/TestLightWeightHashSet.java
+index 71b9455..9465e46 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/util/TestLightWeightHashSet.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/util/TestLightWeightHashSet.java
+@@ -422,5 +422,48 @@ public class TestLightWeightHashSet{
+ 
+     LOG.info("Test other - DONE");
+   }
++  
++  @Test
++  public void testGetElement() {
++    LightWeightHashSet<TestObject> objSet = new LightWeightHashSet<TestObject>();
++    TestObject objA = new TestObject("object A");
++    TestObject equalToObjA = new TestObject("object A");
++    TestObject objB = new TestObject("object B");
++    objSet.add(objA);
++    objSet.add(objB);
++    
++    assertSame(objA, objSet.getElement(objA));
++    assertSame(objA, objSet.getElement(equalToObjA));
++    assertSame(objB, objSet.getElement(objB));
++    assertNull(objSet.getElement(new TestObject("not in set")));
++  }
++  
++  /**
++   * Wrapper class which is used in
++   * {@link TestLightWeightHashSet#testGetElement()}
++   */
++  private static class TestObject {
++    private final String value;
++
++    public TestObject(String value) {
++      super();
++      this.value = value;
++    }
++
++    @Override
++    public int hashCode() {
++      return value.hashCode();
++    }
++
++    @Override
++    public boolean equals(Object obj) {
++      if (this == obj) return true;
++      if (obj == null) return false;
++      if (getClass() != obj.getClass())
++        return false;
++      TestObject other = (TestObject) obj;
++      return this.value.equals(other.value);
++    }
++  }
+ 
+ }
+\ No newline at end of file
+-- 
+1.7.0.4
+

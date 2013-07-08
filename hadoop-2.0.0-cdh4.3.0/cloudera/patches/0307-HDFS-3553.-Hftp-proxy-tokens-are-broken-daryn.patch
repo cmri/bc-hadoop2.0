@@ -1,0 +1,480 @@
+From edb2e0fb90dcc8ee6b02432f9ea7ea59196892f5 Mon Sep 17 00:00:00 2001
+From: Daryn Sharp <daryn@apache.org>
+Date: Fri, 27 Jul 2012 19:08:10 +0000
+Subject: [PATCH 0307/1357] HDFS-3553. Hftp proxy tokens are broken (daryn)
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/branch-2@1366501 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit f700f1de65dc9719f439626630179b57bc1c32c7)
+---
+ hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt        |    2 +
+ .../hadoop/hdfs/server/common/JspHelper.java       |  133 +++++-----
+ .../hadoop/hdfs/server/common/TestJspHelper.java   |  263 ++++++++++++++++++++
+ 3 files changed, 331 insertions(+), 67 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt b/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+index 5fd7bd9..c60ac4c 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
++++ b/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+@@ -881,6 +881,8 @@ Release 0.23.3 - UNRELEASED
+     HDFS-3696. Set chunked streaming mode in WebHdfsFileSystem write operations
+     to get around a Java library bug causing OutOfMemoryError.  (szetszwo)
+ 
++    HDFS-3553. Hftp proxy tokens are broken (daryn)
++
+ Release 0.23.2 - UNRELEASED
+ 
+   INCOMPATIBLE CHANGES
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/common/JspHelper.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/common/JspHelper.java
+index 60edb2f..60a1216 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/common/JspHelper.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/common/JspHelper.java
+@@ -489,12 +489,17 @@ public class JspHelper {
+    */
+   public static UserGroupInformation getDefaultWebUser(Configuration conf
+                                                        ) throws IOException {
++    return UserGroupInformation.createRemoteUser(getDefaultWebUserName(conf));
++  }
++
++  private static String getDefaultWebUserName(Configuration conf
++      ) throws IOException {
+     String user = conf.get(
+         HADOOP_HTTP_STATIC_USER, DEFAULT_HADOOP_HTTP_STATIC_USER);
+     if (user == null || user.length() == 0) {
+       throw new IOException("Cannot determine UGI from request or conf");
+     }
+-    return UserGroupInformation.createRemoteUser(user);
++    return user;
+   }
+ 
+   private static InetSocketAddress getNNServiceAddress(ServletContext context,
+@@ -540,64 +545,45 @@ public class JspHelper {
+       HttpServletRequest request, Configuration conf,
+       final AuthenticationMethod secureAuthMethod,
+       final boolean tryUgiParameter) throws IOException {
+-    final UserGroupInformation ugi;
++    UserGroupInformation ugi = null;
+     final String usernameFromQuery = getUsernameFromQuery(request, tryUgiParameter);
+     final String doAsUserFromQuery = request.getParameter(DoAsParam.NAME);
+-
+-    if(UserGroupInformation.isSecurityEnabled()) {
+-      final String remoteUser = request.getRemoteUser();
+-      String tokenString = request.getParameter(DELEGATION_PARAMETER_NAME);
++    final String remoteUser;
++   
++    if (UserGroupInformation.isSecurityEnabled()) {
++      remoteUser = request.getRemoteUser();
++      final String tokenString = request.getParameter(DELEGATION_PARAMETER_NAME);
+       if (tokenString != null) {
+-        Token<DelegationTokenIdentifier> token = 
+-          new Token<DelegationTokenIdentifier>();
+-        token.decodeFromUrlString(tokenString);
+-        InetSocketAddress serviceAddress = getNNServiceAddress(context, request);
+-        if (serviceAddress != null) {
+-          SecurityUtil.setTokenService(token, serviceAddress);
+-          token.setKind(DelegationTokenIdentifier.HDFS_DELEGATION_KIND);
+-        }
+-        ByteArrayInputStream buf = new ByteArrayInputStream(token
+-            .getIdentifier());
+-        DataInputStream in = new DataInputStream(buf);
+-        DelegationTokenIdentifier id = new DelegationTokenIdentifier();
+-        id.readFields(in);
+-        if (context != null) {
+-          final NameNode nn = NameNodeHttpServer.getNameNodeFromContext(context);
+-          if (nn != null) {
+-            // Verify the token.
+-            nn.getNamesystem().verifyToken(id, token.getPassword());
+-          }
+-        }
+-        ugi = id.getUser();
+-        if (ugi.getRealUser() == null) {
+-          //non-proxy case
+-          checkUsername(ugi.getShortUserName(), usernameFromQuery);
+-          checkUsername(null, doAsUserFromQuery);
+-        } else {
+-          //proxy case
+-          checkUsername(ugi.getRealUser().getShortUserName(), usernameFromQuery);
+-          checkUsername(ugi.getShortUserName(), doAsUserFromQuery);
+-          ProxyUsers.authorize(ugi, request.getRemoteAddr(), conf);
+-        }
+-        ugi.addToken(token);
+-      } else {
+-        if(remoteUser == null) {
+-          throw new IOException("Security enabled but user not " +
+-                                "authenticated by filter");
+-        }
+-        final UserGroupInformation realUgi = UserGroupInformation.createRemoteUser(remoteUser);
+-        checkUsername(realUgi.getShortUserName(), usernameFromQuery);
++        // Token-based connections need only verify the effective user, and
++        // disallow proxying to different user.  Proxy authorization checks
++        // are not required since the checks apply to issuing a token.
++        ugi = getTokenUGI(context, request, tokenString, conf);
++        checkUsername(ugi.getShortUserName(), usernameFromQuery);
++        checkUsername(ugi.getShortUserName(), doAsUserFromQuery);
++      } else if (remoteUser == null) {
++        throw new IOException(
++            "Security enabled but user not authenticated by filter");
++      }
++    } else {
++      // Security's not on, pull from url or use default web user
++      remoteUser = (usernameFromQuery == null)
++          ? getDefaultWebUserName(conf) // not specified in request
++          : usernameFromQuery;
++    }
++
++    if (ugi == null) { // security is off, or there's no token
++      ugi = UserGroupInformation.createRemoteUser(remoteUser);
++      checkUsername(ugi.getShortUserName(), usernameFromQuery);
++      if (UserGroupInformation.isSecurityEnabled()) {
+         // This is not necessarily true, could have been auth'ed by user-facing
+         // filter
+-        realUgi.setAuthenticationMethod(secureAuthMethod);
+-        ugi = initUGI(realUgi, doAsUserFromQuery, request, true, conf);
++        ugi.setAuthenticationMethod(secureAuthMethod);
++      }
++      if (doAsUserFromQuery != null) {
++        // create and attempt to authorize a proxy user
++        ugi = UserGroupInformation.createProxyUser(doAsUserFromQuery, ugi);
++        ProxyUsers.authorize(ugi, request.getRemoteAddr(), conf);
+       }
+-    } else { // Security's not on, pull from url
+-      final UserGroupInformation realUgi = usernameFromQuery == null?
+-          getDefaultWebUser(conf) // not specified in request
+-          : UserGroupInformation.createRemoteUser(usernameFromQuery);
+-      realUgi.setAuthenticationMethod(AuthenticationMethod.SIMPLE);
+-      ugi = initUGI(realUgi, doAsUserFromQuery, request, false, conf);
+     }
+     
+     if(LOG.isDebugEnabled())
+@@ -605,21 +591,34 @@ public class JspHelper {
+     return ugi;
+   }
+ 
+-  private static UserGroupInformation initUGI(final UserGroupInformation realUgi,
+-      final String doAsUserFromQuery, final HttpServletRequest request,
+-      final boolean isSecurityEnabled, final Configuration conf
+-      ) throws AuthorizationException {
+-    final UserGroupInformation ugi;
+-    if (doAsUserFromQuery == null) {
+-      //non-proxy case
+-      ugi = realUgi;
+-    } else {
+-      //proxy case
+-      ugi = UserGroupInformation.createProxyUser(doAsUserFromQuery, realUgi);
+-      ugi.setAuthenticationMethod(
+-          isSecurityEnabled? AuthenticationMethod.PROXY: AuthenticationMethod.SIMPLE);
+-      ProxyUsers.authorize(ugi, request.getRemoteAddr(), conf);
++  private static UserGroupInformation getTokenUGI(ServletContext context,
++                                                  HttpServletRequest request,
++                                                  String tokenString,
++                                                  Configuration conf)
++                                                      throws IOException {
++    final Token<DelegationTokenIdentifier> token =
++        new Token<DelegationTokenIdentifier>();
++    token.decodeFromUrlString(tokenString);
++    InetSocketAddress serviceAddress = getNNServiceAddress(context, request);
++    if (serviceAddress != null) {
++      SecurityUtil.setTokenService(token, serviceAddress);
++      token.setKind(DelegationTokenIdentifier.HDFS_DELEGATION_KIND);
++    }
++
++    ByteArrayInputStream buf =
++        new ByteArrayInputStream(token.getIdentifier());
++    DataInputStream in = new DataInputStream(buf);
++    DelegationTokenIdentifier id = new DelegationTokenIdentifier();
++    id.readFields(in);
++    if (context != null) {
++      final NameNode nn = NameNodeHttpServer.getNameNodeFromContext(context);
++      if (nn != null) {
++        // Verify the token.
++        nn.getNamesystem().verifyToken(id, token.getPassword());
++      }
+     }
++    UserGroupInformation ugi = id.getUser();
++    ugi.addToken(token);
+     return ugi;
+   }
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/common/TestJspHelper.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/common/TestJspHelper.java
+index c7fafdb..d024bcd 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/common/TestJspHelper.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/common/TestJspHelper.java
+@@ -31,8 +31,13 @@ import org.apache.hadoop.hdfs.DFSConfigKeys;
+ import org.apache.hadoop.hdfs.HdfsConfiguration;
+ import org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenIdentifier;
+ import org.apache.hadoop.hdfs.server.namenode.NameNodeHttpServer;
++import org.apache.hadoop.hdfs.web.resources.DoAsParam;
++import org.apache.hadoop.hdfs.web.resources.UserParam;
+ import org.apache.hadoop.io.Text;
+ import org.apache.hadoop.security.UserGroupInformation;
++import org.apache.hadoop.security.UserGroupInformation.AuthenticationMethod;
++import org.apache.hadoop.security.authorize.AuthorizationException;
++import org.apache.hadoop.security.authorize.ProxyUsers;
+ import org.apache.hadoop.security.token.Token;
+ import org.apache.hadoop.security.token.TokenIdentifier;
+ import org.apache.hadoop.security.token.delegation.AbstractDelegationTokenSecretManager;
+@@ -136,4 +141,262 @@ public class TestJspHelper {
+     Assert.assertEquals("", delegationTokenParam);
+   }
+ 
++  @Test
++  public void testGetUgiFromToken() throws IOException {
++    conf.set(DFSConfigKeys.FS_DEFAULT_NAME_KEY, "hdfs://localhost:4321/");
++    ServletContext context = mock(ServletContext.class);
++    String realUser = "TheDoctor";
++    String user = "TheNurse";
++    conf.set(DFSConfigKeys.HADOOP_SECURITY_AUTHENTICATION, "kerberos");
++    UserGroupInformation.setConfiguration(conf);
++    UserGroupInformation ugi;
++    HttpServletRequest request;
++    
++    Text ownerText = new Text(user);
++    DelegationTokenIdentifier dtId = new DelegationTokenIdentifier(
++        ownerText, ownerText, new Text(realUser));
++    Token<DelegationTokenIdentifier> token = new Token<DelegationTokenIdentifier>(
++        dtId, new DummySecretManager(0, 0, 0, 0));
++    String tokenString = token.encodeToUrlString();
++    
++    // token with no auth-ed user
++    request = getMockRequest(null, null, null);
++    when(request.getParameter(JspHelper.DELEGATION_PARAMETER_NAME)).thenReturn(
++        tokenString);
++    ugi = JspHelper.getUGI(context, request, conf);
++    Assert.assertNotNull(ugi.getRealUser());
++    Assert.assertEquals(ugi.getRealUser().getShortUserName(), realUser);
++    Assert.assertEquals(ugi.getShortUserName(), user);
++    checkUgiFromToken(ugi);
++    
++    // token with auth-ed user
++    request = getMockRequest(realUser, null, null);
++    when(request.getParameter(JspHelper.DELEGATION_PARAMETER_NAME)).thenReturn(
++        tokenString);
++    ugi = JspHelper.getUGI(context, request, conf);
++    Assert.assertNotNull(ugi.getRealUser());
++    Assert.assertEquals(ugi.getRealUser().getShortUserName(), realUser);
++    Assert.assertEquals(ugi.getShortUserName(), user);    
++    checkUgiFromToken(ugi);
++    
++    // completely different user, token trumps auth
++    request = getMockRequest("rogue", null, null);
++    when(request.getParameter(JspHelper.DELEGATION_PARAMETER_NAME)).thenReturn(
++        tokenString);
++    ugi = JspHelper.getUGI(context, request, conf);
++    Assert.assertNotNull(ugi.getRealUser());
++    Assert.assertEquals(ugi.getRealUser().getShortUserName(), realUser);
++    Assert.assertEquals(ugi.getShortUserName(), user);    
++    checkUgiFromToken(ugi);
++    
++    // expected case
++    request = getMockRequest(null, user, null);
++    when(request.getParameter(JspHelper.DELEGATION_PARAMETER_NAME)).thenReturn(
++        tokenString);
++    ugi = JspHelper.getUGI(context, request, conf);
++    Assert.assertNotNull(ugi.getRealUser());
++    Assert.assertEquals(ugi.getRealUser().getShortUserName(), realUser);
++    Assert.assertEquals(ugi.getShortUserName(), user);    
++    checkUgiFromToken(ugi);
++    
++    // can't proxy with a token!
++    request = getMockRequest(null, null, "rogue");
++    when(request.getParameter(JspHelper.DELEGATION_PARAMETER_NAME)).thenReturn(
++        tokenString);
++    try {
++      JspHelper.getUGI(context, request, conf);
++      Assert.fail("bad request allowed");
++    } catch (IOException ioe) {
++      Assert.assertEquals(
++          "Usernames not matched: name=rogue != expected="+user,
++          ioe.getMessage());
++    }
++    
++    // can't proxy with a token!
++    request = getMockRequest(null, user, "rogue");
++    when(request.getParameter(JspHelper.DELEGATION_PARAMETER_NAME)).thenReturn(
++        tokenString);
++    try {
++      JspHelper.getUGI(context, request, conf);
++      Assert.fail("bad request allowed");
++    } catch (IOException ioe) {
++      Assert.assertEquals(
++          "Usernames not matched: name=rogue != expected="+user,
++          ioe.getMessage());
++    }
++  }
++  
++  @Test
++  public void testGetNonProxyUgi() throws IOException {
++    conf.set(DFSConfigKeys.FS_DEFAULT_NAME_KEY, "hdfs://localhost:4321/");
++    ServletContext context = mock(ServletContext.class);
++    String realUser = "TheDoctor";
++    String user = "TheNurse";
++    conf.set(DFSConfigKeys.HADOOP_SECURITY_AUTHENTICATION, "kerberos");
++    UserGroupInformation.setConfiguration(conf);
++    UserGroupInformation ugi;
++    HttpServletRequest request;
++    
++    // have to be auth-ed with remote user
++    request = getMockRequest(null, null, null);
++    try {
++      JspHelper.getUGI(context, request, conf);
++      Assert.fail("bad request allowed");
++    } catch (IOException ioe) {
++      Assert.assertEquals(
++          "Security enabled but user not authenticated by filter",
++          ioe.getMessage());
++    }
++    request = getMockRequest(null, realUser, null);
++    try {
++      JspHelper.getUGI(context, request, conf);
++      Assert.fail("bad request allowed");
++    } catch (IOException ioe) {
++      Assert.assertEquals(
++          "Security enabled but user not authenticated by filter",
++          ioe.getMessage());
++    }
++    
++    // ugi for remote user
++    request = getMockRequest(realUser, null, null);
++    ugi = JspHelper.getUGI(context, request, conf);
++    Assert.assertNull(ugi.getRealUser());
++    Assert.assertEquals(ugi.getShortUserName(), realUser);
++    checkUgiFromAuth(ugi);
++    
++    // ugi for remote user = real user
++    request = getMockRequest(realUser, realUser, null);
++    ugi = JspHelper.getUGI(context, request, conf);
++    Assert.assertNull(ugi.getRealUser());
++    Assert.assertEquals(ugi.getShortUserName(), realUser);
++    checkUgiFromAuth(ugi);
++    
++    // ugi for remote user != real user 
++    request = getMockRequest(realUser, user, null);
++    try {
++      JspHelper.getUGI(context, request, conf);
++      Assert.fail("bad request allowed");
++    } catch (IOException ioe) {
++      Assert.assertEquals(
++          "Usernames not matched: name="+user+" != expected="+realUser,
++          ioe.getMessage());
++    }
++  }
++  
++  @Test
++  public void testGetProxyUgi() throws IOException {
++    conf.set(DFSConfigKeys.FS_DEFAULT_NAME_KEY, "hdfs://localhost:4321/");
++    ServletContext context = mock(ServletContext.class);
++    String realUser = "TheDoctor";
++    String user = "TheNurse";
++    conf.set(DFSConfigKeys.HADOOP_SECURITY_AUTHENTICATION, "kerberos");
++    
++    conf.set(ProxyUsers.CONF_HADOOP_PROXYUSER+realUser+".groups", "*");
++    conf.set(ProxyUsers.CONF_HADOOP_PROXYUSER+realUser+".hosts", "*");
++    ProxyUsers.refreshSuperUserGroupsConfiguration(conf);
++    UserGroupInformation.setConfiguration(conf);
++    UserGroupInformation ugi;
++    HttpServletRequest request;
++    
++    // have to be auth-ed with remote user
++    request = getMockRequest(null, null, user);
++    try {
++      JspHelper.getUGI(context, request, conf);
++      Assert.fail("bad request allowed");
++    } catch (IOException ioe) {
++      Assert.assertEquals(
++          "Security enabled but user not authenticated by filter",
++          ioe.getMessage());
++    }
++    request = getMockRequest(null, realUser, user);
++    try {
++      JspHelper.getUGI(context, request, conf);
++      Assert.fail("bad request allowed");
++    } catch (IOException ioe) {
++      Assert.assertEquals(
++          "Security enabled but user not authenticated by filter",
++          ioe.getMessage());
++    }
++    
++    // proxy ugi for user via remote user
++    request = getMockRequest(realUser, null, user);
++    ugi = JspHelper.getUGI(context, request, conf);
++    Assert.assertNotNull(ugi.getRealUser());
++    Assert.assertEquals(ugi.getRealUser().getShortUserName(), realUser);
++    Assert.assertEquals(ugi.getShortUserName(), user);
++    checkUgiFromAuth(ugi);
++    
++    // proxy ugi for user vi a remote user = real user
++    request = getMockRequest(realUser, realUser, user);
++    ugi = JspHelper.getUGI(context, request, conf);
++    Assert.assertNotNull(ugi.getRealUser());
++    Assert.assertEquals(ugi.getRealUser().getShortUserName(), realUser);
++    Assert.assertEquals(ugi.getShortUserName(), user);
++    checkUgiFromAuth(ugi);
++    
++    // proxy ugi for user via remote user != real user
++    request = getMockRequest(realUser, user, user);
++    try {
++      JspHelper.getUGI(context, request, conf);
++      Assert.fail("bad request allowed");
++    } catch (IOException ioe) {
++      Assert.assertEquals(
++          "Usernames not matched: name="+user+" != expected="+realUser,
++          ioe.getMessage());
++    }
++    
++    // try to get get a proxy user with unauthorized user
++    try {
++      request = getMockRequest(user, null, realUser);
++      JspHelper.getUGI(context, request, conf);
++      Assert.fail("bad proxy request allowed");
++    } catch (AuthorizationException ae) {
++      Assert.assertEquals(
++          "User: " + user + " is not allowed to impersonate " + realUser,
++           ae.getMessage());
++    }
++    try {
++      request = getMockRequest(user, user, realUser);
++      JspHelper.getUGI(context, request, conf);
++      Assert.fail("bad proxy request allowed");
++    } catch (AuthorizationException ae) {
++      Assert.assertEquals(
++          "User: " + user + " is not allowed to impersonate " + realUser,
++           ae.getMessage());
++    }
++  }
++  
++  private HttpServletRequest getMockRequest(String remoteUser, String user, String doAs) {
++    HttpServletRequest request = mock(HttpServletRequest.class);
++    when(request.getParameter(UserParam.NAME)).thenReturn(user);
++    if (doAs != null) {
++      when(request.getParameter(DoAsParam.NAME)).thenReturn(doAs);
++    }
++    when(request.getRemoteUser()).thenReturn(remoteUser);
++    return request;
++  }
++  
++  private void checkUgiFromAuth(UserGroupInformation ugi) {
++    if (ugi.getRealUser() != null) {
++      Assert.assertEquals(AuthenticationMethod.PROXY,
++                          ugi.getAuthenticationMethod());
++      Assert.assertEquals(AuthenticationMethod.KERBEROS_SSL,
++                          ugi.getRealUser().getAuthenticationMethod());
++    } else {
++      Assert.assertEquals(AuthenticationMethod.KERBEROS_SSL,
++                          ugi.getAuthenticationMethod()); 
++    }
++  }
++  
++  private void checkUgiFromToken(UserGroupInformation ugi) {
++    if (ugi.getRealUser() != null) {
++      Assert.assertEquals(AuthenticationMethod.PROXY,
++                          ugi.getAuthenticationMethod());
++      Assert.assertEquals(AuthenticationMethod.TOKEN,
++                          ugi.getRealUser().getAuthenticationMethod());
++    } else {
++      Assert.assertEquals(AuthenticationMethod.TOKEN,
++                          ugi.getAuthenticationMethod());
++    }
++  }
+ }
+-- 
+1.7.0.4
+

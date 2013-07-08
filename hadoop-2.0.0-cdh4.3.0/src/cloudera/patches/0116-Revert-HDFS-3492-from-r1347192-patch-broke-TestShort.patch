@@ -1,0 +1,179 @@
+From 109772d285a6e42360c59b3fe13f14125bf89dab Mon Sep 17 00:00:00 2001
+From: Todd Lipcon <todd@apache.org>
+Date: Thu, 7 Jun 2012 21:06:13 +0000
+Subject: [PATCH 0116/1357] Revert HDFS-3492 from r1347192: patch broke TestShortCircuitLocalRead
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1347796 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 0b658968a062a1f43e2ab01a11678dc8e9928ec6)
+---
+ .../apache/hadoop/lib/wsrs/InputStreamEntity.java  |    5 ++-
+ .../org/apache/hadoop/hdfs/BlockReaderLocal.java   |   34 +++++++++++++++----
+ .../hadoop/hdfs/server/namenode/FSEditLogOp.java   |    7 +---
+ .../hadoop/hdfs/TestShortCircuitLocalRead.java     |    7 ++--
+ .../hdfs/server/datanode/SimulatedFSDataset.java   |    3 +-
+ 5 files changed, 38 insertions(+), 18 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/lib/wsrs/InputStreamEntity.java b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/lib/wsrs/InputStreamEntity.java
+index 21c25bd..e5361a8 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/lib/wsrs/InputStreamEntity.java
++++ b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/lib/wsrs/InputStreamEntity.java
+@@ -42,7 +42,10 @@ public class InputStreamEntity implements StreamingOutput {
+ 
+   @Override
+   public void write(OutputStream os) throws IOException {
+-    IOUtils.skipFully(is, offset);
++    long skipped = is.skip(offset);
++    if (skipped < offset) {
++      throw new IOException("Requested offset beyond stream size");
++    }
+     if (len == -1) {
+       IOUtils.copyBytes(is, os, 4096, true);
+     } else {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/BlockReaderLocal.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/BlockReaderLocal.java
+index a51b710..cd85eba 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/BlockReaderLocal.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/BlockReaderLocal.java
+@@ -39,7 +39,6 @@ import org.apache.hadoop.hdfs.security.token.block.BlockTokenIdentifier;
+ import org.apache.hadoop.hdfs.server.datanode.BlockMetadataHeader;
+ import org.apache.hadoop.hdfs.util.DirectBufferPool;
+ import org.apache.hadoop.ipc.RPC;
+-import org.apache.hadoop.io.IOUtils;
+ import org.apache.hadoop.security.token.Token;
+ import org.apache.hadoop.util.DataChecksum;
+ 
+@@ -316,10 +315,23 @@ class BlockReaderLocal implements BlockReader {
+     boolean success = false;
+     try {
+       // Skip both input streams to beginning of the chunk containing startOffset
+-      IOUtils.skipFully(dataIn, firstChunkOffset);
++      long toSkip = firstChunkOffset;
++      while (toSkip > 0) {
++        long skipped = dataIn.skip(toSkip);
++        if (skipped == 0) {
++          throw new IOException("Couldn't initialize input stream");
++        }
++        toSkip -= skipped;
++      }
+       if (checksumIn != null) {
+         long checkSumOffset = (firstChunkOffset / bytesPerChecksum) * checksumSize;
+-        IOUtils.skipFully(dataIn, checkSumOffset);
++        while (checkSumOffset > 0) {
++          long skipped = checksumIn.skip(checkSumOffset);
++          if (skipped == 0) {
++            throw new IOException("Couldn't initialize checksum input stream");
++          }
++          checkSumOffset -= skipped;
++        }
+       }
+       success = true;
+     } finally {
+@@ -624,9 +636,17 @@ class BlockReaderLocal implements BlockReader {
+     slowReadBuff.position(slowReadBuff.limit());
+     checksumBuff.position(checksumBuff.limit());
+   
+-    IOUtils.skipFully(dataIn, toskip);
+-    long checkSumOffset = (toskip / bytesPerChecksum) * checksumSize;
+-    IOUtils.skipFully(checksumIn, checkSumOffset);
++    long dataSkipped = dataIn.skip(toskip);
++    if (dataSkipped != toskip) {
++      throw new IOException("skip error in data input stream");
++    }
++    long checkSumOffset = (dataSkipped / bytesPerChecksum) * checksumSize;
++    if (checkSumOffset > 0) {
++      long skipped = checksumIn.skip(checkSumOffset);
++      if (skipped != checkSumOffset) {
++        throw new IOException("skip error in checksum input stream");
++      }
++    }
+ 
+     // read into the middle of the chunk
+     if (skipBuf == null) {
+@@ -681,4 +701,4 @@ class BlockReaderLocal implements BlockReader {
+   public boolean hasSentStatusCode() {
+     return false;
+   }
+-}
++}
+\ No newline at end of file
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLogOp.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLogOp.java
+index 2aa8f73..489f030 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLogOp.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLogOp.java
+@@ -44,7 +44,6 @@ import org.apache.hadoop.security.token.delegation.DelegationKey;
+ import org.apache.hadoop.io.BytesWritable;
+ import org.apache.hadoop.io.DataOutputBuffer;
+ import org.apache.hadoop.io.ArrayWritable;
+-import org.apache.hadoop.io.IOUtils;
+ import org.apache.hadoop.io.Text;
+ import org.apache.hadoop.io.Writable;
+ import org.apache.hadoop.io.WritableFactories;
+@@ -2290,11 +2289,9 @@ public abstract class FSEditLogOp {
+           // 0xff, we want to skip over that region, because there's nothing
+           // interesting there.
+           long numSkip = e.getNumAfterTerminator();
+-          try {
+-            IOUtils.skipFully(in, numSkip);
+-          } catch (IOException t) {
++          if (in.skip(numSkip) < numSkip) {
+             FSImage.LOG.error("Failed to skip " + numSkip + " bytes of " +
+-              "garbage after an OP_INVALID.  Unexpected early EOF.", t);
++              "garbage after an OP_INVALID.  Unexpected early EOF.");
+             return null;
+           }
+         } catch (IOException e) {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestShortCircuitLocalRead.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestShortCircuitLocalRead.java
+index 6dfd5b8..ccac0e8 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestShortCircuitLocalRead.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestShortCircuitLocalRead.java
+@@ -40,7 +40,6 @@ import org.apache.hadoop.hdfs.security.token.block.BlockTokenIdentifier;
+ import org.apache.hadoop.hdfs.server.datanode.DataNode;
+ import org.apache.hadoop.hdfs.server.datanode.DataNodeTestUtils;
+ import org.apache.hadoop.hdfs.server.datanode.SimulatedFSDataset;
+-import org.apache.hadoop.io.IOUtils;
+ import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.security.token.Token;
+ import org.junit.Assert;
+@@ -95,7 +94,8 @@ public class TestShortCircuitLocalRead {
+     // Now read using a different API.
+     actual = new byte[expected.length-readOffset];
+     stm = fs.open(name);
+-    IOUtils.skipFully(stm, readOffset);
++    long skipped = stm.skip(readOffset);
++    Assert.assertEquals(skipped, readOffset);
+     //Read a small number of bytes first.
+     int nread = stm.read(actual, 0, 3);
+     nread += stm.read(actual, nread, 2);
+@@ -123,7 +123,8 @@ public class TestShortCircuitLocalRead {
+ 
+     ByteBuffer actual = ByteBuffer.allocate(expected.length - readOffset);
+ 
+-    IOUtils.skipFully(stm, readOffset);
++    long skipped = stm.skip(readOffset);
++    Assert.assertEquals(skipped, readOffset);
+ 
+     actual.limit(3);
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/SimulatedFSDataset.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/SimulatedFSDataset.java
+index d4a7b3a..e69b1c3 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/SimulatedFSDataset.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/SimulatedFSDataset.java
+@@ -47,7 +47,6 @@ import org.apache.hadoop.hdfs.server.datanode.fsdataset.RollingLogs;
+ import org.apache.hadoop.hdfs.server.datanode.metrics.FSDatasetMBean;
+ import org.apache.hadoop.hdfs.server.protocol.BlockRecoveryCommand.RecoveringBlock;
+ import org.apache.hadoop.hdfs.server.protocol.ReplicaRecoveryInfo;
+-import org.apache.hadoop.io.IOUtils;
+ import org.apache.hadoop.metrics2.util.MBeans;
+ import org.apache.hadoop.util.DataChecksum;
+ import org.apache.hadoop.util.DiskChecker.DiskErrorException;
+@@ -687,7 +686,7 @@ public class SimulatedFSDataset implements FsDatasetSpi<FsVolumeSpi> {
+   public synchronized InputStream getBlockInputStream(ExtendedBlock b,
+       long seekOffset) throws IOException {
+     InputStream result = getBlockInputStream(b);
+-    IOUtils.skipFully(result, seekOffset);
++    result.skip(seekOffset);
+     return result;
+   }
+ 
+-- 
+1.7.0.4
+

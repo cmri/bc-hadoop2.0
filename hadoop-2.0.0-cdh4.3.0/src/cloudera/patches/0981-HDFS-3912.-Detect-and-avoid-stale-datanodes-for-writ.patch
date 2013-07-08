@@ -1,0 +1,1220 @@
+From f7779f6e3f1eb45449b517405cbac7530d58fc11 Mon Sep 17 00:00:00 2001
+From: Suresh Srinivas <suresh@apache.org>
+Date: Thu, 11 Oct 2012 18:08:27 +0000
+Subject: [PATCH 0981/1357] HDFS-3912. Detect and avoid stale datanodes for writes. Contributed by Jing Zhao
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1397211 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit b50d46a05870f81713691deb3e758f83153e5475)
+---
+ .../java/org/apache/hadoop/hdfs/DFSConfigKeys.java |   14 +-
+ .../BlockPlacementPolicyDefault.java               |  164 +++++++----
+ .../server/blockmanagement/DatanodeManager.java    |  157 ++++++++--
+ .../server/blockmanagement/HeartbeatManager.java   |   73 ++++-
+ .../hadoop/hdfs/server/datanode/DataNode.java      |    2 +-
+ .../hdfs/server/namenode/FSClusterStats.java       |   12 +-
+ .../hadoop/hdfs/server/namenode/FSNamesystem.java  |    5 +
+ .../src/main/resources/hdfs-default.xml            |   50 +++-
+ .../blockmanagement/TestReplicationPolicy.java     |  311 ++++++++++++++++----
+ 9 files changed, 635 insertions(+), 153 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+index 3757657..827b594 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+@@ -184,9 +184,21 @@ public class DFSConfigKeys extends CommonConfigurationKeys {
+   // Whether to enable datanode's stale state detection and usage
+   public static final String DFS_NAMENODE_CHECK_STALE_DATANODE_KEY = "dfs.namenode.check.stale.datanode";
+   public static final boolean DFS_NAMENODE_CHECK_STALE_DATANODE_DEFAULT = false;
++  // Whether to enable datanode's stale state detection and usage
++  public static final String DFS_NAMENODE_AVOID_STALE_DATANODE_FOR_WRITE_KEY = "dfs.namenode.avoid.write.stale.datanode";
++  public static final boolean DFS_NAMENODE_AVOID_STALE_DATANODE_FOR_WRITE_DEFAULT = false;
+   // The default value of the time interval for marking datanodes as stale
+   public static final String DFS_NAMENODE_STALE_DATANODE_INTERVAL_KEY = "dfs.namenode.stale.datanode.interval";
+-  public static final long DFS_NAMENODE_STALE_DATANODE_INTERVAL_MILLI_DEFAULT = 30 * 1000; // 30s
++  public static final long DFS_NAMENODE_STALE_DATANODE_INTERVAL_DEFAULT = 30 * 1000; // 30s
++  // The stale interval cannot be too small since otherwise this may cause too frequent churn on stale states. 
++  // This value uses the times of heartbeat interval to define the minimum value for stale interval.  
++  public static final String DFS_NAMENODE_STALE_DATANODE_MINIMUM_INTERVAL_KEY = "dfs.namenode.stale.datanode.minimum.interval";
++  public static final int DFS_NAMENODE_STALE_DATANODE_MINIMUM_INTERVAL_DEFAULT = 3; // i.e. min_interval is 3 * heartbeat_interval = 9s
++  
++  // When the number stale datanodes marked as stale reached this certian ratio, 
++  // stop avoiding writing to stale nodes so as to prevent causing hotspots.
++  public static final String DFS_NAMENODE_USE_STALE_DATANODE_FOR_WRITE_RATIO_KEY = "dfs.namenode.write.stale.datanode.ratio";
++  public static final float DFS_NAMENODE_USE_STALE_DATANODE_FOR_WRITE_RATIO_DEFAULT = 0.5f;
+ 
+   // Replication monitoring related keys
+   public static final String DFS_NAMENODE_INVALIDATE_WORK_PCT_PER_ITERATION =
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyDefault.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyDefault.java
+index eb02146..a6a2f50 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyDefault.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyDefault.java
+@@ -66,7 +66,9 @@ public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
+   private boolean preferLocalNode = true;
+   protected NetworkTopology clusterMap;
+   private FSClusterStats stats;
+-  protected long heartbeatInterval;   // interval for DataNode heartbeats
++  private long heartbeatInterval;   // interval for DataNode heartbeats
++  private long staleInterval;   // interval used to identify stale DataNodes
++  
+   /**
+    * A miss of that many heartbeats is tolerated for replica deletion policy.
+    */
+@@ -83,7 +85,8 @@ public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
+   @Override
+   public void initialize(Configuration conf,  FSClusterStats stats,
+                          NetworkTopology clusterMap) {
+-    this.considerLoad = conf.getBoolean(DFSConfigKeys.DFS_NAMENODE_REPLICATION_CONSIDERLOAD_KEY, true);
++    this.considerLoad = conf.getBoolean(
++        DFSConfigKeys.DFS_NAMENODE_REPLICATION_CONSIDERLOAD_KEY, true);
+     this.stats = stats;
+     this.clusterMap = clusterMap;
+     this.heartbeatInterval = conf.getLong(
+@@ -92,6 +95,9 @@ public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
+     this.tolerateHeartbeatMultiplier = conf.getInt(
+         DFSConfigKeys.DFS_NAMENODE_TOLERATE_HEARTBEAT_MULTIPLIER_KEY,
+         DFSConfigKeys.DFS_NAMENODE_TOLERATE_HEARTBEAT_MULTIPLIER_DEFAULT);
++    this.staleInterval = conf.getLong(
++        DFSConfigKeys.DFS_NAMENODE_STALE_DATANODE_INTERVAL_KEY, 
++        DFSConfigKeys.DFS_NAMENODE_STALE_DATANODE_INTERVAL_DEFAULT);
+   }
+ 
+   protected ThreadLocal<StringBuilder> threadLocalBuilder =
+@@ -160,8 +166,10 @@ public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
+       writer=null;
+     }
+       
+-    DatanodeDescriptor localNode = chooseTarget(numOfReplicas, writer, 
+-                                                excludedNodes, blocksize, maxNodesPerRack, results);
++    boolean avoidStaleNodes = (stats != null
++        && stats.isAvoidingStaleDataNodesForWrite());
++    DatanodeDescriptor localNode = chooseTarget(numOfReplicas, writer,
++        excludedNodes, blocksize, maxNodesPerRack, results, avoidStaleNodes);
+     if (!returnChosenNodes) {  
+       results.removeAll(chosenNodes);
+     }
+@@ -177,8 +185,8 @@ public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
+                                           HashMap<Node, Node> excludedNodes,
+                                           long blocksize,
+                                           int maxNodesPerRack,
+-                                          List<DatanodeDescriptor> results) {
+-      
++                                          List<DatanodeDescriptor> results,
++                                          final boolean avoidStaleNodes) {
+     if (numOfReplicas == 0 || clusterMap.getNumOfLeaves()==0) {
+       return writer;
+     }
+@@ -189,18 +197,21 @@ public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
+     if (writer == null && !newBlock) {
+       writer = results.get(0);
+     }
+-      
++
++    // Keep a copy of original excludedNodes
++    final HashMap<Node, Node> oldExcludedNodes = avoidStaleNodes ? 
++        new HashMap<Node, Node>(excludedNodes) : null;
+     try {
+       if (numOfResults == 0) {
+-        writer = chooseLocalNode(writer, excludedNodes, 
+-                                 blocksize, maxNodesPerRack, results);
++        writer = chooseLocalNode(writer, excludedNodes, blocksize,
++            maxNodesPerRack, results, avoidStaleNodes);
+         if (--numOfReplicas == 0) {
+           return writer;
+         }
+       }
+       if (numOfResults <= 1) {
+-        chooseRemoteRack(1, results.get(0), excludedNodes, 
+-                         blocksize, maxNodesPerRack, results);
++        chooseRemoteRack(1, results.get(0), excludedNodes, blocksize,
++            maxNodesPerRack, results, avoidStaleNodes);
+         if (--numOfReplicas == 0) {
+           return writer;
+         }
+@@ -208,24 +219,36 @@ public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
+       if (numOfResults <= 2) {
+         if (clusterMap.isOnSameRack(results.get(0), results.get(1))) {
+           chooseRemoteRack(1, results.get(0), excludedNodes,
+-                           blocksize, maxNodesPerRack, results);
++                           blocksize, maxNodesPerRack, 
++                           results, avoidStaleNodes);
+         } else if (newBlock){
+           chooseLocalRack(results.get(1), excludedNodes, blocksize, 
+-                          maxNodesPerRack, results);
++                          maxNodesPerRack, results, avoidStaleNodes);
+         } else {
+-          chooseLocalRack(writer, excludedNodes, blocksize,
+-                          maxNodesPerRack, results);
++          chooseLocalRack(writer, excludedNodes, blocksize, maxNodesPerRack,
++              results, avoidStaleNodes);
+         }
+         if (--numOfReplicas == 0) {
+           return writer;
+         }
+       }
+-      chooseRandom(numOfReplicas, NodeBase.ROOT, excludedNodes, 
+-                   blocksize, maxNodesPerRack, results);
++      chooseRandom(numOfReplicas, NodeBase.ROOT, excludedNodes, blocksize,
++          maxNodesPerRack, results, avoidStaleNodes);
+     } catch (NotEnoughReplicasException e) {
+       LOG.warn("Not able to place enough replicas, still in need of "
+                + numOfReplicas + " to reach " + totalReplicasExpected + "\n"
+                + e.getMessage());
++      if (avoidStaleNodes) {
++        // ecxludedNodes now has - initial excludedNodes, any nodes that were
++        // chosen and nodes that were tried but were not chosen because they
++        // were stale, decommissioned or for any other reason a node is not
++        // chosen for write. Retry again now not avoiding stale node
++        for (Node node : results) {
++          oldExcludedNodes.put(node, node);
++        }
++        return chooseTarget(numOfReplicas, writer, oldExcludedNodes, blocksize,
++            maxNodesPerRack, results, false);
++      }
+     }
+     return writer;
+   }
+@@ -240,26 +263,27 @@ public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
+                                              HashMap<Node, Node> excludedNodes,
+                                              long blocksize,
+                                              int maxNodesPerRack,
+-                                             List<DatanodeDescriptor> results)
++                                             List<DatanodeDescriptor> results,
++                                             boolean avoidStaleNodes)
+     throws NotEnoughReplicasException {
+     // if no local machine, randomly choose one node
+     if (localMachine == null)
+-      return chooseRandom(NodeBase.ROOT, excludedNodes, 
+-                          blocksize, maxNodesPerRack, results);
++      return chooseRandom(NodeBase.ROOT, excludedNodes, blocksize,
++          maxNodesPerRack, results, avoidStaleNodes);
+     if (preferLocalNode) {
+       // otherwise try local machine first
+       Node oldNode = excludedNodes.put(localMachine, localMachine);
+       if (oldNode == null) { // was not in the excluded list
+-        if (isGoodTarget(localMachine, blocksize,
+-                         maxNodesPerRack, false, results)) {
++        if (isGoodTarget(localMachine, blocksize, maxNodesPerRack, false,
++            results, avoidStaleNodes)) {
+           results.add(localMachine);
+           return localMachine;
+         }
+       } 
+     }      
+     // try a node on local rack
+-    return chooseLocalRack(localMachine, excludedNodes, 
+-                           blocksize, maxNodesPerRack, results);
++    return chooseLocalRack(localMachine, excludedNodes, blocksize,
++        maxNodesPerRack, results, avoidStaleNodes);
+   }
+     
+   /* choose one node from the rack that <i>localMachine</i> is on.
+@@ -274,19 +298,19 @@ public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
+                                              HashMap<Node, Node> excludedNodes,
+                                              long blocksize,
+                                              int maxNodesPerRack,
+-                                             List<DatanodeDescriptor> results)
++                                             List<DatanodeDescriptor> results,
++                                             boolean avoidStaleNodes)
+     throws NotEnoughReplicasException {
+     // no local machine, so choose a random machine
+     if (localMachine == null) {
+-      return chooseRandom(NodeBase.ROOT, excludedNodes, 
+-                          blocksize, maxNodesPerRack, results);
++      return chooseRandom(NodeBase.ROOT, excludedNodes, blocksize,
++          maxNodesPerRack, results, avoidStaleNodes);
+     }
+       
+     // choose one from the local rack
+     try {
+-      return chooseRandom(
+-                          localMachine.getNetworkLocation(),
+-                          excludedNodes, blocksize, maxNodesPerRack, results);
++      return chooseRandom(localMachine.getNetworkLocation(), excludedNodes,
++          blocksize, maxNodesPerRack, results, avoidStaleNodes);
+     } catch (NotEnoughReplicasException e1) {
+       // find the second replica
+       DatanodeDescriptor newLocal=null;
+@@ -300,18 +324,17 @@ public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
+       }
+       if (newLocal != null) {
+         try {
+-          return chooseRandom(
+-                              newLocal.getNetworkLocation(),
+-                              excludedNodes, blocksize, maxNodesPerRack, results);
++          return chooseRandom(newLocal.getNetworkLocation(), excludedNodes,
++              blocksize, maxNodesPerRack, results, avoidStaleNodes);
+         } catch(NotEnoughReplicasException e2) {
+           //otherwise randomly choose one from the network
+-          return chooseRandom(NodeBase.ROOT, excludedNodes,
+-                              blocksize, maxNodesPerRack, results);
++          return chooseRandom(NodeBase.ROOT, excludedNodes, blocksize,
++              maxNodesPerRack, results, avoidStaleNodes);
+         }
+       } else {
+         //otherwise randomly choose one from the network
+-        return chooseRandom(NodeBase.ROOT, excludedNodes,
+-                            blocksize, maxNodesPerRack, results);
++        return chooseRandom(NodeBase.ROOT, excludedNodes, blocksize,
++            maxNodesPerRack, results, avoidStaleNodes);
+       }
+     }
+   }
+@@ -327,17 +350,19 @@ public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
+                                 HashMap<Node, Node> excludedNodes,
+                                 long blocksize,
+                                 int maxReplicasPerRack,
+-                                List<DatanodeDescriptor> results)
++                                List<DatanodeDescriptor> results,
++                                boolean avoidStaleNodes)
+     throws NotEnoughReplicasException {
+     int oldNumOfReplicas = results.size();
+     // randomly choose one node from remote racks
+     try {
+-      chooseRandom(numOfReplicas, "~"+localMachine.getNetworkLocation(),
+-                   excludedNodes, blocksize, maxReplicasPerRack, results);
++      chooseRandom(numOfReplicas, "~" + localMachine.getNetworkLocation(),
++          excludedNodes, blocksize, maxReplicasPerRack, results,
++          avoidStaleNodes);
+     } catch (NotEnoughReplicasException e) {
+       chooseRandom(numOfReplicas-(results.size()-oldNumOfReplicas),
+                    localMachine.getNetworkLocation(), excludedNodes, blocksize, 
+-                   maxReplicasPerRack, results);
++                   maxReplicasPerRack, results, avoidStaleNodes);
+     }
+   }
+ 
+@@ -349,7 +374,8 @@ public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
+                                           HashMap<Node, Node> excludedNodes,
+                                           long blocksize,
+                                           int maxNodesPerRack,
+-                                          List<DatanodeDescriptor> results) 
++                                          List<DatanodeDescriptor> results,
++                                          boolean avoidStaleNodes) 
+     throws NotEnoughReplicasException {
+     int numOfAvailableNodes =
+       clusterMap.countNumOfAvailableNodes(nodes, excludedNodes.keySet());
+@@ -367,7 +393,8 @@ public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
+       Node oldNode = excludedNodes.put(chosenNode, chosenNode);
+       if (oldNode == null) { // choosendNode was not in the excluded list
+         numOfAvailableNodes--;
+-        if (isGoodTarget(chosenNode, blocksize, maxNodesPerRack, results)) {
++        if (isGoodTarget(chosenNode, blocksize, 
++                maxNodesPerRack, results, avoidStaleNodes)) {
+           results.add(chosenNode);
+           return chosenNode;
+         } else {
+@@ -393,7 +420,8 @@ public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
+                             HashMap<Node, Node> excludedNodes,
+                             long blocksize,
+                             int maxNodesPerRack,
+-                            List<DatanodeDescriptor> results)
++                            List<DatanodeDescriptor> results,
++                            boolean avoidStaleNodes)
+     throws NotEnoughReplicasException {
+       
+     int numOfAvailableNodes =
+@@ -412,7 +440,8 @@ public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
+       if (oldNode == null) {
+         numOfAvailableNodes--;
+ 
+-        if (isGoodTarget(chosenNode, blocksize, maxNodesPerRack, results)) {
++        if (isGoodTarget(chosenNode, blocksize, 
++              maxNodesPerRack, results, avoidStaleNodes)) {
+           numOfReplicas--;
+           results.add(chosenNode);
+         } else {
+@@ -438,16 +467,34 @@ public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
+    * does not have too much load, and the rack does not have too many nodes
+    */
+   private boolean isGoodTarget(DatanodeDescriptor node,
+-                               long blockSize, int maxTargetPerLoc,
+-                               List<DatanodeDescriptor> results) {
+-    return isGoodTarget(node, blockSize, maxTargetPerLoc,
+-                        this.considerLoad, results);
++                               long blockSize, int maxTargetPerRack,
++                               List<DatanodeDescriptor> results, 
++                               boolean avoidStaleNodes) {
++    return isGoodTarget(node, blockSize, maxTargetPerRack, this.considerLoad,
++        results, avoidStaleNodes);
+   }
+-    
++  
++  /**
++   * Determine if a node is a good target. 
++   * 
++   * @param node The target node
++   * @param blockSize Size of block
++   * @param maxTargetPerRack Maximum number of targets per rack. The value of 
++   *                       this parameter depends on the number of racks in 
++   *                       the cluster and total number of replicas for a block
++   * @param considerLoad whether or not to consider load of the target node
++   * @param results A list containing currently chosen nodes. Used to check if 
++   *                too many nodes has been chosen in the target rack.
++   * @param avoidStaleNodes Whether or not to avoid choosing stale nodes
++   * @return Return true if <i>node</i> has enough space, 
++   *         does not have too much load, 
++   *         and the rack does not have too many nodes.
++   */
+   protected boolean isGoodTarget(DatanodeDescriptor node,
+-                               long blockSize, int maxTargetPerLoc,
++                               long blockSize, int maxTargetPerRack,
+                                boolean considerLoad,
+-                               List<DatanodeDescriptor> results) {
++                               List<DatanodeDescriptor> results,                           
++                               boolean avoidStaleNodes) {
+     // check if the node is (being) decommissed
+     if (node.isDecommissionInProgress() || node.isDecommissioned()) {
+       if(LOG.isDebugEnabled()) {
+@@ -458,6 +505,17 @@ public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
+       return false;
+     }
+ 
++    if (avoidStaleNodes) {
++      if (node.isStale(this.staleInterval)) {
++        if (LOG.isDebugEnabled()) {
++          threadLocalBuilder.get().append(node.toString()).append(": ")
++              .append("Node ").append(NodeBase.getPath(node))
++              .append(" is not chosen because the node is staled ");
++        }
++        return false;
++      }
++    }
++    
+     long remaining = node.getRemaining() - 
+                      (node.getBlocksScheduled() * blockSize); 
+     // check the remaining capacity of the target machine
+@@ -497,7 +555,7 @@ public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
+         counter++;
+       }
+     }
+-    if (counter>maxTargetPerLoc) {
++    if (counter>maxTargetPerRack) {
+       if(LOG.isDebugEnabled()) {
+         threadLocalBuilder.get().append(node.toString()).append(": ")
+           .append("Node ").append(NodeBase.getPath(node))
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeManager.java
+index 660a5f0..fc81159 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeManager.java
+@@ -78,6 +78,7 @@ import org.apache.hadoop.util.ReflectionUtils;
+ import org.apache.hadoop.util.Time;
+ 
+ import com.google.common.annotations.VisibleForTesting;
++import com.google.common.base.Preconditions;
+ import com.google.common.net.InetAddresses;
+ 
+ /**
+@@ -90,8 +91,8 @@ public class DatanodeManager {
+ 
+   private final Namesystem namesystem;
+   private final BlockManager blockManager;
+-
+   private final HeartbeatManager heartbeatManager;
++  private Daemon decommissionthread = null;
+ 
+   /**
+    * Stores the datanode -> block map.  
+@@ -129,20 +130,26 @@ public class DatanodeManager {
+   /** Ask Datanode only up to this many blocks to delete. */
+   final int blockInvalidateLimit;
+   
++  /** Whether or not to check stale DataNodes for read/write */
++  private final boolean checkForStaleDataNodes;
++
++  /** The interval for judging stale DataNodes for read/write */
++  private final long staleInterval;
++  
++  /** Whether or not to avoid using stale DataNodes for writing */
++  private volatile boolean avoidStaleDataNodesForWrite;
++  
++  /** The number of stale DataNodes */
++  private volatile int numStaleNodes;
++  
+   /**
+    * Whether or not this cluster has ever consisted of more than 1 rack,
+    * according to the NetworkTopology.
+    */
+   private boolean hasClusterEverBeenMultiRack = false;
+   
+-  /** Whether or not to check the stale datanodes */
+-  private volatile boolean checkForStaleNodes;
+-  /** The time interval for detecting stale datanodes */
+-  private volatile long staleInterval;
+-  
+-  DatanodeManager(final BlockManager blockManager,
+-      final Namesystem namesystem, final Configuration conf
+-      ) throws IOException {
++  DatanodeManager(final BlockManager blockManager, final Namesystem namesystem,
++      final Configuration conf) throws IOException {
+     this.namesystem = namesystem;
+     this.blockManager = blockManager;
+     
+@@ -183,25 +190,69 @@ public class DatanodeManager {
+         DFSConfigKeys.DFS_BLOCK_INVALIDATE_LIMIT_KEY, blockInvalidateLimit);
+     LOG.info(DFSConfigKeys.DFS_BLOCK_INVALIDATE_LIMIT_KEY
+         + "=" + this.blockInvalidateLimit);
+-    // set the value of stale interval based on configuration
+-    this.checkForStaleNodes = conf.getBoolean(
++    
++    checkForStaleDataNodes = conf.getBoolean(
+         DFSConfigKeys.DFS_NAMENODE_CHECK_STALE_DATANODE_KEY,
+         DFSConfigKeys.DFS_NAMENODE_CHECK_STALE_DATANODE_DEFAULT);
+-    if (this.checkForStaleNodes) {
+-      this.staleInterval = conf.getLong(
+-          DFSConfigKeys.DFS_NAMENODE_STALE_DATANODE_INTERVAL_KEY,
+-          DFSConfigKeys.DFS_NAMENODE_STALE_DATANODE_INTERVAL_MILLI_DEFAULT);
+-      if (this.staleInterval < DFSConfigKeys.DFS_NAMENODE_STALE_DATANODE_INTERVAL_MILLI_DEFAULT) {
+-        LOG.warn("The given interval for marking stale datanode = "
+-            + this.staleInterval + ", which is smaller than the default value "
+-            + DFSConfigKeys.DFS_NAMENODE_STALE_DATANODE_INTERVAL_MILLI_DEFAULT
+-            + ".");
+-      }
++
++    staleInterval = getStaleIntervalFromConf(conf, heartbeatExpireInterval);
++    avoidStaleDataNodesForWrite = getAvoidStaleForWriteFromConf(conf,
++        checkForStaleDataNodes);
++  }
++  
++  private static long getStaleIntervalFromConf(Configuration conf,
++      long heartbeatExpireInterval) {
++    long staleInterval = conf.getLong(
++        DFSConfigKeys.DFS_NAMENODE_STALE_DATANODE_INTERVAL_KEY, 
++        DFSConfigKeys.DFS_NAMENODE_STALE_DATANODE_INTERVAL_DEFAULT);
++    Preconditions.checkArgument(staleInterval > 0,
++        DFSConfigKeys.DFS_NAMENODE_STALE_DATANODE_INTERVAL_KEY +
++        " = '" + staleInterval + "' is invalid. " +
++        "It should be a positive non-zero value.");
++    
++    final long heartbeatIntervalSeconds = conf.getLong(
++        DFSConfigKeys.DFS_HEARTBEAT_INTERVAL_KEY,
++        DFSConfigKeys.DFS_HEARTBEAT_INTERVAL_DEFAULT);
++    // The stale interval value cannot be smaller than 
++    // 3 times of heartbeat interval 
++    final long minStaleInterval = conf.getInt(
++        DFSConfigKeys.DFS_NAMENODE_STALE_DATANODE_MINIMUM_INTERVAL_KEY,
++        DFSConfigKeys.DFS_NAMENODE_STALE_DATANODE_MINIMUM_INTERVAL_DEFAULT)
++        * heartbeatIntervalSeconds * 1000;
++    if (staleInterval < minStaleInterval) {
++      LOG.warn("The given interval for marking stale datanode = "
++          + staleInterval + ", which is less than "
++          + DFSConfigKeys.DFS_NAMENODE_STALE_DATANODE_MINIMUM_INTERVAL_DEFAULT
++          + " heartbeat intervals. This may cause too frequent changes of " 
++          + "stale states of DataNodes since a heartbeat msg may be missing " 
++          + "due to temporary short-term failures. Reset stale interval to " 
++          + minStaleInterval + ".");
++      staleInterval = minStaleInterval;
+     }
++    if (staleInterval > heartbeatExpireInterval) {
++      LOG.warn("The given interval for marking stale datanode = "
++          + staleInterval + ", which is larger than heartbeat expire interval "
++          + heartbeatExpireInterval + ".");
++    }
++    return staleInterval;
+   }
+-
+-  private Daemon decommissionthread = null;
+-
++  
++  static boolean getAvoidStaleForWriteFromConf(Configuration conf,
++      boolean checkForStale) {
++    boolean avoid = conf.getBoolean(
++        DFSConfigKeys.DFS_NAMENODE_AVOID_STALE_DATANODE_FOR_WRITE_KEY,
++        DFSConfigKeys.DFS_NAMENODE_AVOID_STALE_DATANODE_FOR_WRITE_DEFAULT);
++    boolean avoidStaleDataNodesForWrite = checkForStale && avoid;
++    if (!checkForStale && avoid) {
++      LOG.warn("Cannot set "
++          + DFSConfigKeys.DFS_NAMENODE_CHECK_STALE_DATANODE_KEY
++          + " as false while setting "
++          + DFSConfigKeys.DFS_NAMENODE_AVOID_STALE_DATANODE_FOR_WRITE_KEY
++          + " as true.");
++    }
++    return avoidStaleDataNodesForWrite;
++  }
++  
+   void activate(final Configuration conf) {
+     final DecommissionManager dm = new DecommissionManager(namesystem, blockManager);
+     this.decommissionthread = new Daemon(dm.new Monitor(
+@@ -747,7 +798,7 @@ public class DatanodeManager {
+    * 3. Added to exclude --> start decommission.
+    * 4. Removed from exclude --> stop decommission.
+    */
+-  private void refreshDatanodes() throws IOException {
++  private void refreshDatanodes() {
+     for(DatanodeDescriptor node : datanodeMap.values()) {
+       // Check if not include.
+       if (!inHostsList(node)) {
+@@ -806,7 +857,61 @@ public class DatanodeManager {
+       namesystem.readUnlock();
+     }
+   }
++  
++  /* Getter and Setter for stale DataNodes related attributes */
++  
++  /**
++   * @return whether or not to avoid writing to stale datanodes
++   */
++  public boolean isAvoidingStaleDataNodesForWrite() {
++    return avoidStaleDataNodesForWrite;
++  }
+ 
++  /**
++   * Set the value of {@link DatanodeManager#avoidStaleDataNodesForWrite}. 
++   * The HeartbeatManager disable avoidStaleDataNodesForWrite when more than
++   * half of the DataNodes are marked as stale.
++   * 
++   * @param avoidStaleDataNodesForWrite
++   *          The value to set to
++   *          {@link DatanodeManager#avoidStaleDataNodesForWrite}
++   */
++  void setAvoidStaleDataNodesForWrite(boolean avoidStaleDataNodesForWrite) {
++    this.avoidStaleDataNodesForWrite = avoidStaleDataNodesForWrite;
++  }
++
++  /**
++   * @return Whether or not to check stale DataNodes for R/W
++   */
++  boolean isCheckingForStaleDataNodes() {
++    return checkForStaleDataNodes;
++  }
++  
++  /**
++   * @return The time interval used to mark DataNodes as stale.
++   */
++  long getStaleInterval() {
++    return staleInterval;
++  }
++
++  /**
++   * Set the number of current stale DataNodes. The HeartbeatManager got this
++   * number based on DataNodes' heartbeats.
++   * 
++   * @param numStaleNodes
++   *          The number of stale DataNodes to be set.
++   */
++  void setNumStaleNodes(int numStaleNodes) {
++    this.numStaleNodes = numStaleNodes;
++  }
++  
++  /**
++   * @return Return the current number of stale DataNodes (detected by
++   * HeartbeatManager). 
++   */
++  int getNumStaleNodes() {
++    return this.numStaleNodes;
++  }
+ 
+   /** Fetch live and dead datanodes. */
+   public void fetchDatanodes(final List<DatanodeDescriptor> live, 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/HeartbeatManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/HeartbeatManager.java
+index 7ceb048..e2aa837 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/HeartbeatManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/HeartbeatManager.java
+@@ -31,6 +31,8 @@ import org.apache.hadoop.hdfs.server.namenode.Namesystem;
+ import org.apache.hadoop.util.Daemon;
+ import org.apache.hadoop.util.Time;
+ 
++import com.google.common.base.Preconditions;
++
+ /**
+  * Manage the heartbeats received from datanodes.
+  * The datanode list and statistics are synchronized
+@@ -55,18 +57,48 @@ class HeartbeatManager implements DatanodeStatistics {
+   private final long heartbeatRecheckInterval;
+   /** Heartbeat monitor thread */
+   private final Daemon heartbeatThread = new Daemon(new Monitor());
+-
++  /**
++   * The initial setting of end user which indicates whether or not to avoid
++   * writing to stale datanodes.
++   */
++  private final boolean initialAvoidWriteStaleNodes;
++  /**
++   * When the ratio of stale datanodes reaches this number, stop avoiding 
++   * writing to stale datanodes, i.e., continue using stale nodes for writing.
++   */
++  private final float ratioUseStaleDataNodesForWrite;
++    
+   final Namesystem namesystem;
+   final BlockManager blockManager;
+ 
+-  HeartbeatManager(final Namesystem namesystem, final BlockManager blockManager,
+-      final Configuration conf) {
+-    this.heartbeatRecheckInterval = conf.getInt(
+-        DFSConfigKeys.DFS_NAMENODE_HEARTBEAT_RECHECK_INTERVAL_KEY, 
+-        DFSConfigKeys.DFS_NAMENODE_HEARTBEAT_RECHECK_INTERVAL_DEFAULT); // 5 minutes
+-
++  HeartbeatManager(final Namesystem namesystem,
++      final BlockManager blockManager, final Configuration conf) {
+     this.namesystem = namesystem;
+     this.blockManager = blockManager;
++    boolean checkStaleNodes = conf.getBoolean(
++        DFSConfigKeys.DFS_NAMENODE_CHECK_STALE_DATANODE_KEY,
++        DFSConfigKeys.DFS_NAMENODE_CHECK_STALE_DATANODE_DEFAULT);
++    long recheckInterval = conf.getInt(
++        DFSConfigKeys.DFS_NAMENODE_HEARTBEAT_RECHECK_INTERVAL_KEY, 
++        DFSConfigKeys.DFS_NAMENODE_HEARTBEAT_RECHECK_INTERVAL_DEFAULT); // 5 min
++    long staleInterval = conf.getLong(
++        DFSConfigKeys.DFS_NAMENODE_STALE_DATANODE_INTERVAL_KEY, 
++        DFSConfigKeys.DFS_NAMENODE_STALE_DATANODE_INTERVAL_DEFAULT);// 30s
++    this.initialAvoidWriteStaleNodes = DatanodeManager
++        .getAvoidStaleForWriteFromConf(conf, checkStaleNodes);
++    this.ratioUseStaleDataNodesForWrite = conf.getFloat(
++        DFSConfigKeys.DFS_NAMENODE_USE_STALE_DATANODE_FOR_WRITE_RATIO_KEY,
++        DFSConfigKeys.DFS_NAMENODE_USE_STALE_DATANODE_FOR_WRITE_RATIO_DEFAULT);
++    Preconditions.checkArgument(
++        (ratioUseStaleDataNodesForWrite > 0 && 
++            ratioUseStaleDataNodesForWrite <= 1.0f),
++        DFSConfigKeys.DFS_NAMENODE_USE_STALE_DATANODE_FOR_WRITE_RATIO_KEY +
++        " = '" + ratioUseStaleDataNodesForWrite + "' is invalid. " +
++        "It should be a positive non-zero float value, not greater than 1.0f.");
++    
++    this.heartbeatRecheckInterval = (checkStaleNodes 
++        && initialAvoidWriteStaleNodes 
++        && staleInterval < recheckInterval) ? staleInterval : recheckInterval;
+   }
+ 
+   void activate(Configuration conf) {
+@@ -211,16 +243,39 @@ class HeartbeatManager implements DatanodeStatistics {
+     if (namesystem.isInSafeMode()) {
+       return;
+     }
++    boolean checkStaleNodes = dm.isCheckingForStaleDataNodes();
+     boolean allAlive = false;
+     while (!allAlive) {
+       // locate the first dead node.
+       DatanodeID dead = null;
++      // check the number of stale nodes
++      int numOfStaleNodes = 0;
+       synchronized(this) {
+         for (DatanodeDescriptor d : datanodes) {
+-          if (dm.isDatanodeDead(d)) {
++          if (dead == null && dm.isDatanodeDead(d)) {
+             stats.incrExpiredHeartbeats();
+             dead = d;
+-            break;
++            if (!checkStaleNodes) {
++              break;
++            }
++          }
++          if (checkStaleNodes && 
++              d.isStale(dm.getStaleInterval())) {
++            numOfStaleNodes++;
++          }
++        }
++        
++        // Change whether to avoid using stale datanodes for writing
++        // based on proportion of stale datanodes
++        if (checkStaleNodes) {
++          dm.setNumStaleNodes(numOfStaleNodes);
++          if (numOfStaleNodes > 
++                datanodes.size() * ratioUseStaleDataNodesForWrite) {
++            dm.setAvoidStaleDataNodesForWrite(false);
++          } else {
++            if (this.initialAvoidWriteStaleNodes) {
++              dm.setAvoidStaleDataNodesForWrite(true);
++            }
+           }
+         }
+       }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNode.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNode.java
+index 0b01d04..78b056b 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNode.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNode.java
+@@ -256,7 +256,7 @@ public class DataNode extends Configured
+   Daemon localDataXceiverServer = null;
+   ThreadGroup threadGroup = null;
+   private DNConf dnConf;
+-  private boolean heartbeatsDisabledForTests = false;
++  private volatile boolean heartbeatsDisabledForTests = false;
+   private DataStorage storage = null;
+   private HttpServer infoServer = null;
+   DataNodeMetrics metrics;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSClusterStats.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSClusterStats.java
+index 0840b84..f4827f3 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSClusterStats.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSClusterStats.java
+@@ -32,8 +32,16 @@ public interface FSClusterStats {
+    * @return a count of the total number of block transfers and block
+    *         writes that are currently occuring on the cluster.
+    */
+-
+-  public int getTotalLoad() ;
++  public int getTotalLoad();
++  
++  /**
++   * Indicate whether or not the cluster is now avoiding 
++   * to use stale DataNodes for writing.
++   * 
++   * @return True if the cluster is currently avoiding using stale DataNodes 
++   *         for writing targets, and false otherwise.
++   */
++  public boolean isAvoidingStaleDataNodesForWrite();
+ }
+     
+     
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+index a761fba..749c28f 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+@@ -5764,4 +5764,9 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+ 
+   }
+ 
++  @Override
++  public boolean isAvoidingStaleDataNodesForWrite() {
++    return this.blockManager.getDatanodeManager()
++        .isAvoidingStaleDataNodesForWrite();
++  }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml b/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+index 667ae70..e0e3d58 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+@@ -1011,12 +1011,28 @@
+   <name>dfs.namenode.check.stale.datanode</name>
+   <value>false</value>
+   <description>
+-  	Indicate whether or not to check "stale" datanodes whose 
+-  	heartbeat messages have not been received by the namenode 
+-  	for more than a specified time interval. If this configuration 
+-  	parameter is set as true, the stale datanodes will be moved to 
+-  	the end of the target node list for reading. The writing will 
+-  	also try to avoid stale nodes.
++    Indicate whether or not to check "stale" datanodes whose 
++    heartbeat messages have not been received by the namenode 
++    for more than a specified time interval. If this configuration 
++    parameter is set as true, the system will keep track 
++    of the number of stale datanodes. The stale datanodes will be 
++    moved to the end of the node list returned for reading. See
++    dfs.namenode.avoid.write.stale.datanode for details on how this 
++    affects writes. 
++  </description>
++</property>
++
++<property>
++  <name>dfs.namenode.avoid.write.stale.datanode</name>
++  <value>false</value>
++  <description>
++    Indicate whether or not to avoid writing to "stale" datanodes whose 
++    heartbeat messages have not been received by the namenode 
++    for more than a specified time interval. If this configuration 
++    parameter and dfs.namenode.check.stale.datanode are both set as true, 
++    the writing will avoid using stale datanodes unless a high number 
++    of datanodes are marked as stale. See 
++    dfs.namenode.write.stale.datanode.ratio for details.
+   </description>
+ </property>
+ 
+@@ -1024,10 +1040,24 @@
+   <name>dfs.namenode.stale.datanode.interval</name>
+   <value>30000</value>
+   <description>
+-  	Default time interval for marking a datanode as "stale", i.e., if 
+-  	the namenode has not received heartbeat msg from a datanode for 
+-  	more than this time interval, the datanode will be marked and treated 
+-  	as "stale" by default.
++    Default time interval for marking a datanode as "stale", i.e., if 
++    the namenode has not received heartbeat msg from a datanode for 
++    more than this time interval, the datanode will be marked and treated 
++    as "stale" by default. The stale interval cannot be too small since 
++    otherwise this may cause too frequent change of stale states. 
++    We thus set a minimum stale interval value (the default value is 3 times 
++    of heartbeat interval) and guarantee that the stale interval cannot be less
++    than the minimum value.
++  </description>
++</property>
++
++<property>
++  <name>dfs.namenode.write.stale.datanode.ratio</name>
++  <value>0.5f</value>
++  <description>
++    When the ratio of number stale datanodes to total datanodes marked
++    is greater than this ratio, stop avoiding writing to stale nodes so
++    as to prevent causing hotspots.
+   </description>
+ </property>
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestReplicationPolicy.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestReplicationPolicy.java
+index 855585a..1d193c1 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestReplicationPolicy.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestReplicationPolicy.java
+@@ -38,9 +38,12 @@ import org.apache.hadoop.hdfs.HdfsConfiguration;
+ import org.apache.hadoop.hdfs.MiniDFSCluster;
+ import org.apache.hadoop.hdfs.protocol.Block;
+ import org.apache.hadoop.hdfs.protocol.HdfsConstants;
++import org.apache.hadoop.hdfs.server.datanode.DataNode;
++import org.apache.hadoop.hdfs.server.datanode.DataNodeTestUtils;
+ import org.apache.hadoop.hdfs.server.namenode.NameNode;
+ import org.apache.hadoop.net.NetworkTopology;
+ import org.apache.hadoop.net.Node;
++import org.apache.hadoop.util.Time;
+ import org.junit.BeforeClass;
+ import org.junit.Rule;
+ import org.junit.Test;
+@@ -55,6 +58,9 @@ public class TestReplicationPolicy {
+   private static BlockPlacementPolicy replicator;
+   private static final String filename = "/dummyfile.txt";
+   private static DatanodeDescriptor dataNodes[];
++  // The interval for marking a datanode as stale,
++  private static long staleInterval = 
++      DFSConfigKeys.DFS_NAMENODE_STALE_DATANODE_INTERVAL_DEFAULT;
+ 
+   @Rule
+   public ExpectedException exception = ExpectedException.none();
+@@ -77,6 +83,8 @@ public class TestReplicationPolicy {
+         "test.build.data", "build/test/data"), "dfs/");
+     conf.set(DFSConfigKeys.DFS_NAMENODE_NAME_DIR_KEY,
+         new File(baseDir, "name").getPath());
++    // Enable the checking for stale datanodes in the beginning
++    conf.setBoolean(DFSConfigKeys.DFS_NAMENODE_CHECK_STALE_DATANODE_KEY, true);
+ 
+     DFSTestUtil.formatNameNode(conf);
+     namenode = new NameNode(conf);
+@@ -229,7 +237,7 @@ public class TestReplicationPolicy {
+     assertEquals(2, targets.length);
+     //make sure that the chosen node is in the target.
+     int i = 0;
+-    for(; i < targets.length && !dataNodes[2].equals(targets[i]); i++);
++    for (; i < targets.length && !dataNodes[2].equals(targets[i]); i++);
+     assertTrue(i < targets.length);
+   }
+ 
+@@ -369,6 +377,202 @@ public class TestReplicationPolicy {
+     assertTrue(cluster.isOnSameRack(targets[1], targets[2]));
+     assertFalse(cluster.isOnSameRack(targets[0], targets[1]));    
+   }
++
++  private boolean containsWithinRange(DatanodeDescriptor target,
++      DatanodeDescriptor[] nodes, int startIndex, int endIndex) {
++    assert startIndex >= 0 && startIndex < nodes.length;
++    assert endIndex >= startIndex && endIndex < nodes.length;
++    for (int i = startIndex; i <= endIndex; i++) {
++      if (nodes[i].equals(target)) {
++        return true;
++      }
++    }
++    return false;
++  }
++  
++  @Test
++  public void testChooseTargetWithStaleNodes() throws Exception {
++    // Enable avoidng writing to stale datanodes
++    namenode.getNamesystem().getBlockManager().getDatanodeManager()
++        .setAvoidStaleDataNodesForWrite(true);
++    // Set dataNodes[0] as stale
++    dataNodes[0].setLastUpdate(Time.now() - staleInterval - 1);
++
++    DatanodeDescriptor[] targets;
++    // We set the datanode[0] as stale, thus should choose datanode[1] since
++    // datanode[1] is on the same rack with datanode[0] (writer)
++    targets = replicator.chooseTarget(filename, 1, dataNodes[0],
++        new ArrayList<DatanodeDescriptor>(), BLOCK_SIZE);
++    assertEquals(targets.length, 1);
++    assertEquals(targets[0], dataNodes[1]);
++
++    HashMap<Node, Node> excludedNodes = new HashMap<Node, Node>();
++    excludedNodes.put(dataNodes[1], dataNodes[1]);
++    List<DatanodeDescriptor> chosenNodes = new ArrayList<DatanodeDescriptor>();
++    BlockPlacementPolicyDefault repl = (BlockPlacementPolicyDefault)replicator;
++    targets = chooseTarget(repl, 1, dataNodes[0], chosenNodes, excludedNodes,
++        BLOCK_SIZE);
++    assertEquals(targets.length, 1);
++    assertFalse(cluster.isOnSameRack(targets[0], dataNodes[0]));
++    
++    // reset
++    namenode.getNamesystem().getBlockManager().getDatanodeManager()
++        .setAvoidStaleDataNodesForWrite(false);
++    dataNodes[0].setLastUpdate(Time.now());
++  }
++
++  /**
++   * In this testcase, we set 3 nodes (dataNodes[0] ~ dataNodes[2]) as stale,
++   * and when the number of replicas is less or equal to 3, all the healthy
++   * datanodes should be returned by the chooseTarget method. When the number 
++   * of replicas is 4, a stale node should be included.
++   * 
++   * @throws Exception
++   */
++  @Test
++  public void testChooseTargetWithHalfStaleNodes() throws Exception {
++    // Enable stale datanodes checking
++    namenode.getNamesystem().getBlockManager().getDatanodeManager()
++        .setAvoidStaleDataNodesForWrite(true);
++    // Set dataNodes[0], dataNodes[1], and dataNodes[2] as stale
++    for (int i = 0; i < 3; i++) {
++      dataNodes[i].setLastUpdate(Time.now() - staleInterval - 1);
++    }
++
++    DatanodeDescriptor[] targets;
++    targets = replicator.chooseTarget(filename, 0, dataNodes[0],
++        new ArrayList<DatanodeDescriptor>(), BLOCK_SIZE);
++    assertEquals(targets.length, 0);
++
++    // We set the datanode[0] as stale, thus should choose datanode[1]
++    targets = replicator.chooseTarget(filename, 1, dataNodes[0],
++        new ArrayList<DatanodeDescriptor>(), BLOCK_SIZE);
++    assertEquals(targets.length, 1);
++    assertFalse(containsWithinRange(targets[0], dataNodes, 0, 2));
++
++    targets = replicator.chooseTarget(filename, 2, dataNodes[0],
++        new ArrayList<DatanodeDescriptor>(), BLOCK_SIZE);
++    assertEquals(targets.length, 2);
++    assertFalse(containsWithinRange(targets[0], dataNodes, 0, 2));
++    assertFalse(containsWithinRange(targets[1], dataNodes, 0, 2));
++
++    targets = replicator.chooseTarget(filename, 3, dataNodes[0],
++        new ArrayList<DatanodeDescriptor>(), BLOCK_SIZE);
++    assertEquals(targets.length, 3);
++    assertTrue(containsWithinRange(targets[0], dataNodes, 3, 5));
++    assertTrue(containsWithinRange(targets[1], dataNodes, 3, 5));
++    assertTrue(containsWithinRange(targets[2], dataNodes, 3, 5));
++
++    targets = replicator.chooseTarget(filename, 4, dataNodes[0],
++        new ArrayList<DatanodeDescriptor>(), BLOCK_SIZE);
++    assertEquals(targets.length, 4);
++    assertTrue(containsWithinRange(dataNodes[3], targets, 0, 3));
++    assertTrue(containsWithinRange(dataNodes[4], targets, 0, 3));
++    assertTrue(containsWithinRange(dataNodes[5], targets, 0, 3));
++
++    // reset
++    namenode.getNamesystem().getBlockManager().getDatanodeManager()
++        .setAvoidStaleDataNodesForWrite(false);
++    for (int i = 0; i < dataNodes.length; i++) {
++      dataNodes[i].setLastUpdate(Time.now());
++    }
++  }
++
++  @Test
++  public void testChooseTargetWithMoreThanHalfStaleNodes() throws Exception {
++    HdfsConfiguration conf = new HdfsConfiguration();
++    conf.setBoolean(DFSConfigKeys.DFS_NAMENODE_CHECK_STALE_DATANODE_KEY, true);
++    conf.setBoolean(
++        DFSConfigKeys.DFS_NAMENODE_AVOID_STALE_DATANODE_FOR_WRITE_KEY, true);
++    String[] hosts = new String[]{"host1", "host2", "host3", 
++                                  "host4", "host5", "host6"};
++    String[] racks = new String[]{"/d1/r1", "/d1/r1", "/d1/r2", 
++                                  "/d1/r2", "/d2/r3", "/d2/r3"};
++    MiniDFSCluster miniCluster = new MiniDFSCluster.Builder(conf).racks(racks)
++        .hosts(hosts).numDataNodes(hosts.length).build();
++    miniCluster.waitActive();
++    
++    try {
++      // Step 1. Make two datanodes as stale, check whether the 
++      // avoidStaleDataNodesForWrite calculation is correct.
++      // First stop the heartbeat of host1 and host2
++      for (int i = 0; i < 2; i++) {
++        DataNode dn = miniCluster.getDataNodes().get(i);
++        DataNodeTestUtils.setHeartbeatsDisabledForTests(dn, true);
++        miniCluster.getNameNode().getNamesystem().getBlockManager()
++            .getDatanodeManager().getDatanode(dn.getDatanodeId())
++            .setLastUpdate(Time.now() - staleInterval - 1);
++      }
++      // Instead of waiting, explicitly call heartbeatCheck to 
++      // let heartbeat manager to detect stale nodes
++      miniCluster.getNameNode().getNamesystem().getBlockManager()
++          .getDatanodeManager().getHeartbeatManager().heartbeatCheck();
++      int numStaleNodes = miniCluster.getNameNode().getNamesystem()
++          .getBlockManager().getDatanodeManager().getNumStaleNodes();
++      assertEquals(numStaleNodes, 2);
++      assertTrue(miniCluster.getNameNode().getNamesystem().getBlockManager()
++          .getDatanodeManager().isAvoidingStaleDataNodesForWrite());
++      // Call chooseTarget
++      DatanodeDescriptor staleNodeInfo = miniCluster.getNameNode()
++          .getNamesystem().getBlockManager().getDatanodeManager()
++          .getDatanode(miniCluster.getDataNodes().get(0).getDatanodeId());
++      BlockPlacementPolicy replicator = miniCluster.getNameNode()
++          .getNamesystem().getBlockManager().getBlockPlacementPolicy();
++      DatanodeDescriptor[] targets = replicator.chooseTarget(filename, 3,
++          staleNodeInfo, new ArrayList<DatanodeDescriptor>(), BLOCK_SIZE);
++      assertEquals(targets.length, 3);
++      assertFalse(cluster.isOnSameRack(targets[0], staleNodeInfo));
++      
++      // Step 2. Set more than half of the datanodes as stale
++      for (int i = 0; i < 4; i++) {
++        DataNode dn = miniCluster.getDataNodes().get(i);
++        DataNodeTestUtils.setHeartbeatsDisabledForTests(dn, true);
++        miniCluster.getNameNode().getNamesystem().getBlockManager()
++            .getDatanodeManager().getDatanode(dn.getDatanodeId())
++            .setLastUpdate(Time.now() - staleInterval - 1);
++      }
++      // Explicitly call heartbeatCheck
++      miniCluster.getNameNode().getNamesystem().getBlockManager()
++          .getDatanodeManager().getHeartbeatManager().heartbeatCheck();
++      numStaleNodes = miniCluster.getNameNode().getNamesystem()
++          .getBlockManager().getDatanodeManager().getNumStaleNodes();
++      assertEquals(numStaleNodes, 4);
++      // According to our strategy, stale datanodes will be included for writing
++      // to avoid hotspots
++      assertFalse(miniCluster.getNameNode().getNamesystem().getBlockManager()
++          .getDatanodeManager().isAvoidingStaleDataNodesForWrite());     
++      // Call chooseTarget
++      targets = replicator.chooseTarget(filename, 3,
++          staleNodeInfo, new ArrayList<DatanodeDescriptor>(), BLOCK_SIZE);
++      assertEquals(targets.length, 3);
++      assertTrue(cluster.isOnSameRack(targets[0], staleNodeInfo));
++      
++      // Step 3. Set 2 stale datanodes back to healthy nodes, 
++      // still have 2 stale nodes
++      for (int i = 2; i < 4; i++) {
++        DataNode dn = miniCluster.getDataNodes().get(i);
++        DataNodeTestUtils.setHeartbeatsDisabledForTests(dn, false);
++        miniCluster.getNameNode().getNamesystem().getBlockManager()
++            .getDatanodeManager().getDatanode(dn.getDatanodeId())
++            .setLastUpdate(Time.now());
++      }
++      // Explicitly call heartbeatCheck
++      miniCluster.getNameNode().getNamesystem().getBlockManager()
++          .getDatanodeManager().getHeartbeatManager().heartbeatCheck();
++      numStaleNodes = miniCluster.getNameNode().getNamesystem()
++          .getBlockManager().getDatanodeManager().getNumStaleNodes();
++      assertEquals(numStaleNodes, 2);
++      assertTrue(miniCluster.getNameNode().getNamesystem().getBlockManager()
++          .getDatanodeManager().isAvoidingStaleDataNodesForWrite());
++      // Call chooseTarget
++      targets = replicator.chooseTarget(filename, 3,
++          staleNodeInfo, new ArrayList<DatanodeDescriptor>(), BLOCK_SIZE);
++      assertEquals(targets.length, 3);
++      assertFalse(cluster.isOnSameRack(targets[0], staleNodeInfo));
++    } finally {
++      miniCluster.shutdown();
++    }
++  }
+   
+   /**
+    * This testcase tests re-replication, when dataNodes[0] is already chosen.
+@@ -490,8 +694,8 @@ public class TestReplicationPolicy {
+         .format(true).build();
+     try {
+       cluster.waitActive();
+-      final UnderReplicatedBlocks neededReplications = (UnderReplicatedBlocks) cluster
+-          .getNameNode().getNamesystem().getBlockManager().neededReplications;
++      final UnderReplicatedBlocks neededReplications = cluster.getNameNode()
++          .getNamesystem().getBlockManager().neededReplications;
+       for (int i = 0; i < 100; i++) {
+         // Adding the blocks directly to normal priority
+         neededReplications.add(new Block(random.nextLong()), 2, 0, 3);
+@@ -529,10 +733,10 @@ public class TestReplicationPolicy {
+       // Adding QUEUE_VERY_UNDER_REPLICATED block
+       underReplicatedBlocks.add(new Block(random.nextLong()), 2, 0, 7);
+ 
+-      // Adding QUEUE_UNDER_REPLICATED block
++      // Adding QUEUE_REPLICAS_BADLY_DISTRIBUTED block
+       underReplicatedBlocks.add(new Block(random.nextLong()), 6, 0, 6);
+ 
+-      // Adding QUEUE_REPLICAS_BADLY_DISTRIBUTED block
++      // Adding QUEUE_UNDER_REPLICATED block
+       underReplicatedBlocks.add(new Block(random.nextLong()), 5, 0, 6);
+ 
+       // Adding QUEUE_WITH_CORRUPT_BLOCKS block
+@@ -596,6 +800,57 @@ public class TestReplicationPolicy {
+   }
+   
+   /**
++   * Test for the chooseReplicaToDelete are processed based on 
++   * block locality and free space
++   */
++  @Test
++  public void testChooseReplicaToDelete() throws Exception {
++    List<DatanodeDescriptor> replicaNodeList = new 
++        ArrayList<DatanodeDescriptor>();
++    final Map<String, List<DatanodeDescriptor>> rackMap
++        = new HashMap<String, List<DatanodeDescriptor>>();
++    
++    dataNodes[0].setRemaining(4*1024*1024);
++    replicaNodeList.add(dataNodes[0]);
++    
++    dataNodes[1].setRemaining(3*1024*1024);
++    replicaNodeList.add(dataNodes[1]);
++    
++    dataNodes[2].setRemaining(2*1024*1024);
++    replicaNodeList.add(dataNodes[2]);
++    
++    dataNodes[5].setRemaining(1*1024*1024);
++    replicaNodeList.add(dataNodes[5]);
++    
++    // Refresh the last update time for all the datanodes
++    for (int i = 0; i < dataNodes.length; i++) {
++      dataNodes[i].setLastUpdate(Time.now());
++    }
++    
++    List<DatanodeDescriptor> first = new ArrayList<DatanodeDescriptor>();
++    List<DatanodeDescriptor> second = new ArrayList<DatanodeDescriptor>();
++    replicator.splitNodesWithRack(
++        replicaNodeList, rackMap, first, second);
++    // dataNodes[0] and dataNodes[1] are in first set as their rack has two 
++    // replica nodes, while datanodes[2] and dataNodes[5] are in second set.
++    assertEquals(2, first.size());
++    assertEquals(2, second.size());
++    DatanodeDescriptor chosenNode = replicator.chooseReplicaToDelete(
++        null, null, (short)3, first, second);
++    // Within first set, dataNodes[1] with less free space
++    assertEquals(chosenNode, dataNodes[1]);
++
++    replicator.adjustSetsWithChosenReplica(
++        rackMap, first, second, chosenNode);
++    assertEquals(0, first.size());
++    assertEquals(3, second.size());
++    // Within second set, dataNodes[5] with less free space
++    chosenNode = replicator.chooseReplicaToDelete(
++        null, null, (short)2, first, second);
++    assertEquals(chosenNode, dataNodes[5]);
++  }
++  
++  /**
+    * This testcase tests whether the default value returned by
+    * DFSUtil.getInvalidateWorkPctPerIteration() is positive, 
+    * and whether an IllegalArgumentException will be thrown 
+@@ -682,50 +937,4 @@ public class TestReplicationPolicy {
+     exception.expect(IllegalArgumentException.class);
+     blocksReplWorkMultiplier = DFSUtil.getReplWorkMultiplier(conf);
+   }
+-
+-  /**
+-   * Test for the chooseReplicaToDelete are processed based on 
+-   * block locality and free space
+-   */
+-  @Test
+-  public void testChooseReplicaToDelete() throws Exception {
+-    List<DatanodeDescriptor> replicaNodeList = new 
+-        ArrayList<DatanodeDescriptor>();
+-    final Map<String, List<DatanodeDescriptor>> rackMap
+-        = new HashMap<String, List<DatanodeDescriptor>>();
+-    
+-    dataNodes[0].setRemaining(4*1024*1024);
+-    replicaNodeList.add(dataNodes[0]);
+-    
+-    dataNodes[1].setRemaining(3*1024*1024);
+-    replicaNodeList.add(dataNodes[1]);
+-    
+-    dataNodes[2].setRemaining(2*1024*1024);
+-    replicaNodeList.add(dataNodes[2]);
+-    
+-    dataNodes[5].setRemaining(1*1024*1024);
+-    replicaNodeList.add(dataNodes[5]);
+-    
+-    List<DatanodeDescriptor> first = new ArrayList<DatanodeDescriptor>();
+-    List<DatanodeDescriptor> second = new ArrayList<DatanodeDescriptor>();
+-    replicator.splitNodesWithRack(
+-        replicaNodeList, rackMap, first, second);
+-    // dataNodes[0] and dataNodes[1] are in first set as their rack has two 
+-    // replica nodes, while datanodes[2] and dataNodes[5] are in second set.
+-    assertEquals(2, first.size());
+-    assertEquals(2, second.size());
+-    DatanodeDescriptor chosenNode = replicator.chooseReplicaToDelete(
+-        null, null, (short)3, first, second);
+-    // Within first set, dataNodes[1] with less free space
+-    assertEquals(chosenNode, dataNodes[1]);
+-
+-    replicator.adjustSetsWithChosenReplica(
+-        rackMap, first, second, chosenNode);
+-    assertEquals(0, first.size());
+-    assertEquals(3, second.size());
+-    // Within second set, dataNodes[5] with less free space
+-    chosenNode = replicator.chooseReplicaToDelete(
+-        null, null, (short)2, first, second);
+-    assertEquals(chosenNode, dataNodes[5]);
+-  }
+ }
+-- 
+1.7.0.4
+

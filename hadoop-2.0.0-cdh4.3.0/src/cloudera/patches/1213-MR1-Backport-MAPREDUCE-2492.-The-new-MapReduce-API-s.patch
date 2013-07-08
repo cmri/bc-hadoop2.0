@@ -1,0 +1,561 @@
+From dcfc849e70d39523a46933aef548157d391f10ab Mon Sep 17 00:00:00 2001
+From: Karthik Kambatla <kasha@cloudera.com>
+Date: Fri, 9 Nov 2012 16:10:56 -0800
+Subject: [PATCH 1213/1357] MR1: Backport MAPREDUCE-2492. The new MapReduce API should make available task's progress to the task.
+ Also, backport relevant/related parts of MAPREDUCE-318 and HADOOP-4687
+
+Reason: Bug fix - New API not updating the progress correctly
+Ref: CDH-8955
+Author: Amar Kamat
+---
+ .../hadoop/mrunit/mapreduce/mock/MockReporter.java |    5 ++
+ .../apache/hadoop/mrunit/mock/MockReporter.java    |    4 +
+ src/mapred/org/apache/hadoop/mapred/MapTask.java   |   21 +++++++
+ .../org/apache/hadoop/mapred/MapTaskStatus.java    |   62 +++++++++++++++++++-
+ src/mapred/org/apache/hadoop/mapred/Reporter.java  |   10 +++
+ src/mapred/org/apache/hadoop/mapred/Task.java      |    5 ++
+ .../hadoop/mapred/TaskAttemptContextImpl.java      |    5 ++
+ .../org/apache/hadoop/mapred/TaskStatus.java       |   35 ++++++++++--
+ .../apache/hadoop/mapreduce/StatusReporter.java    |    6 ++
+ .../hadoop/mapreduce/TaskAttemptContext.java       |    7 ++
+ .../mapreduce/lib/map/MultithreadedMapper.java     |    4 +
+ .../hadoop/mapreduce/lib/map/WrappedMapper.java    |    5 ++
+ .../mapreduce/lib/output/MultipleOutputs.java      |    5 ++
+ .../mapreduce/lib/reduce/WrappedReducer.java       |    5 ++
+ .../mapreduce/task/TaskAttemptContextImpl.java     |    8 +++
+ .../org/apache/hadoop/mapred/UtilsForTests.java    |   13 ++++-
+ .../apache/hadoop/mapreduce/MapReduceTestUtil.java |    4 +
+ .../apache/hadoop/mapreduce/TestTaskContext.java   |   53 ++++++++++++++++-
+ 18 files changed, 246 insertions(+), 11 deletions(-)
+
+diff --git a/src/contrib/mrunit/src/java/org/apache/hadoop/mrunit/mapreduce/mock/MockReporter.java b/src/contrib/mrunit/src/java/org/apache/hadoop/mrunit/mapreduce/mock/MockReporter.java
+index cc425fe..621344a 100644
+--- a/src/contrib/mrunit/src/java/org/apache/hadoop/mrunit/mapreduce/mock/MockReporter.java
++++ b/src/contrib/mrunit/src/java/org/apache/hadoop/mrunit/mapreduce/mock/MockReporter.java
+@@ -58,5 +58,10 @@ public class MockReporter extends StatusReporter {
+ 
+     return counter;
+   }
++  
++  @Override
++  public float getProgress() {
++    return 0;
++  }
+ }
+ 
+diff --git a/src/contrib/mrunit/src/java/org/apache/hadoop/mrunit/mock/MockReporter.java b/src/contrib/mrunit/src/java/org/apache/hadoop/mrunit/mock/MockReporter.java
+index 1fb9fa1..03bbf6c 100644
+--- a/src/contrib/mrunit/src/java/org/apache/hadoop/mrunit/mock/MockReporter.java
++++ b/src/contrib/mrunit/src/java/org/apache/hadoop/mrunit/mock/MockReporter.java
+@@ -92,5 +92,9 @@ public class MockReporter implements Reporter {
+ 
+     return counter;
+   }
++  
++  public float getProgress() {
++    return 0;
++  };
+ }
+ 
+diff --git a/src/mapred/org/apache/hadoop/mapred/MapTask.java b/src/mapred/org/apache/hadoop/mapred/MapTask.java
+index fe37ad4..17cb4e8 100644
+--- a/src/mapred/org/apache/hadoop/mapred/MapTask.java
++++ b/src/mapred/org/apache/hadoop/mapred/MapTask.java
+@@ -87,8 +87,12 @@ class MapTask extends Task {
+ 
+   private static final Log LOG = LogFactory.getLog(MapTask.class.getName());
+ 
++  private Progress mapPhase;
++  private Progress sortPhase;
++
+   {   // set phase for this task
+     setPhase(TaskStatus.Phase.MAP); 
++    getProgress().setStatus("map");
+   }
+ 
+   public MapTask() {
+@@ -300,6 +304,17 @@ class MapTask extends Task {
+     throws IOException, ClassNotFoundException, InterruptedException {
+     this.umbilical = umbilical;
+ 
++    // If there are no reducers then there won't be any sort. Hence the map 
++    // phase will govern the entire attempt's progress.
++    if (conf.getNumReduceTasks() == 0) {
++      mapPhase = getProgress().addPhase("map", 1.0f);
++    } else {
++      // If there are reducers then the entire attempt's progress will be 
++      // split between the map phase (67%) and the sort phase (33%).
++      mapPhase = getProgress().addPhase("map", 0.667f);
++      sortPhase  = getProgress().addPhase("sort", 0.333f);
++    }
++
+     // start thread that will handle communication with parent
+     TaskReporter reporter = new TaskReporter(getProgress(), umbilical,
+         jvmContext);
+@@ -391,6 +406,12 @@ class MapTask extends Task {
+ 
+     try {
+       runner.run(in, new OldOutputCollector(collector, conf), reporter);
++      mapPhase.complete();
++      // start the sort phase only if there are reducers
++      if (numReduceTasks > 0) {
++        setPhase(TaskStatus.Phase.SORT);
++      }
++      statusUpdate(umbilical);
+       collector.flush();
+     } finally {
+       //close
+diff --git a/src/mapred/org/apache/hadoop/mapred/MapTaskStatus.java b/src/mapred/org/apache/hadoop/mapred/MapTaskStatus.java
+index 8d5cf00..fc78da2 100644
+--- a/src/mapred/org/apache/hadoop/mapred/MapTaskStatus.java
++++ b/src/mapred/org/apache/hadoop/mapred/MapTaskStatus.java
+@@ -18,9 +18,16 @@
+ 
+ package org.apache.hadoop.mapred;
+ 
++import java.io.DataInput;
++import java.io.DataOutput;
++import java.io.IOException;
++
+ 
+ class MapTaskStatus extends TaskStatus {
+ 
++  private long mapFinishTime;
++  private long sortFinishTime;
++  
+   public MapTaskStatus() {}
+ 
+   public MapTaskStatus(TaskAttemptID taskid, float progress, int numSlots,
+@@ -35,6 +42,19 @@ class MapTaskStatus extends TaskStatus {
+     return true;
+   }
+ 
++  /**
++   * Sets finishTime. 
++   * @param finishTime finish time of task.
++   */
++  @Override
++  void setFinishTime(long finishTime) {
++    super.setFinishTime(finishTime);
++    if (mapFinishTime == 0) {
++      mapFinishTime = finishTime;
++    }
++    setSortFinishTime(finishTime);
++  }
++  
+   @Override
+   public long getShuffleFinishTime() {
+     throw new UnsupportedOperationException("getShuffleFinishTime() not supported for MapTask");
+@@ -46,12 +66,50 @@ class MapTaskStatus extends TaskStatus {
+   }
+ 
+   @Override
++  public long getMapFinishTime() {
++    return mapFinishTime;
++  }
++  
++  @Override
++  void setMapFinishTime(long mapFinishTime) {
++    this.mapFinishTime = mapFinishTime;
++  }
++
++  @Override
+   public long getSortFinishTime() {
+-    throw new UnsupportedOperationException("getSortFinishTime() not supported for MapTask");
++    return sortFinishTime;
+   }
+ 
+   @Override
+   void setSortFinishTime(long sortFinishTime) {
+-    throw new UnsupportedOperationException("setSortFinishTime() not supported for MapTask");
++    this.sortFinishTime = sortFinishTime;
++  }
++  
++  @Override
++  synchronized void statusUpdate(TaskStatus status) {
++    super.statusUpdate(status);
++    
++    if (status.getMapFinishTime() != 0) {
++      this.mapFinishTime = status.getMapFinishTime();
++    }
++  }
++  
++  @Override
++  public void readFields(DataInput in) throws IOException {
++    super.readFields(in);
++    mapFinishTime = in.readLong();
++  }
++  
++  @Override
++  public void write(DataOutput out) throws IOException {
++    super.write(out);
++    out.writeLong(mapFinishTime);
+   }
++
++  @Override
++  public void addFetchFailedMap(TaskAttemptID mapTaskId) {
++    throw new UnsupportedOperationException
++                ("addFetchFailedMap() not supported for MapTask");
++  }
++
+ }
+diff --git a/src/mapred/org/apache/hadoop/mapred/Reporter.java b/src/mapred/org/apache/hadoop/mapred/Reporter.java
+index 14f171d..9a3bc41 100644
+--- a/src/mapred/org/apache/hadoop/mapred/Reporter.java
++++ b/src/mapred/org/apache/hadoop/mapred/Reporter.java
+@@ -61,6 +61,10 @@ public interface Reporter extends Progressable {
+       public InputSplit getInputSplit() throws UnsupportedOperationException {
+         throw new UnsupportedOperationException("NULL reporter has no input");
+       }
++      @Override
++      public float getProgress() {
++        return 0;
++      }
+     };
+ 
+   /**
+@@ -117,4 +121,10 @@ public interface Reporter extends Progressable {
+    */
+   public abstract InputSplit getInputSplit() 
+     throws UnsupportedOperationException;
++  
++  /**
++   * Get the progress of the task. Progress is represented as a number between
++   * 0 and 1 (inclusive).
++   */
++  public float getProgress();
+ }
+diff --git a/src/mapred/org/apache/hadoop/mapred/Task.java b/src/mapred/org/apache/hadoop/mapred/Task.java
+index 875134f..05255ec 100644
+--- a/src/mapred/org/apache/hadoop/mapred/Task.java
++++ b/src/mapred/org/apache/hadoop/mapred/Task.java
+@@ -577,6 +577,11 @@ abstract public class Task implements Writable, Configurable {
+       // indicate that progress update needs to be sent
+       setProgressFlag();
+     }
++    
++    public float getProgress() {
++      return taskProgress.getProgress();
++    };
++    
+     public void progress() {
+       // indicate that progress update needs to be sent
+       setProgressFlag();
+diff --git a/src/mapred/org/apache/hadoop/mapred/TaskAttemptContextImpl.java b/src/mapred/org/apache/hadoop/mapred/TaskAttemptContextImpl.java
+index 2bd9093..9e2f55e 100644
+--- a/src/mapred/org/apache/hadoop/mapred/TaskAttemptContextImpl.java
++++ b/src/mapred/org/apache/hadoop/mapred/TaskAttemptContextImpl.java
+@@ -56,6 +56,11 @@ public class TaskAttemptContextImpl
+   public JobConf getJobConf() {
+     return (JobConf) getConfiguration();
+   }
++  
++  @Override
++  public float getProgress() {
++    return reporter.getProgress();
++  }
+ 
+   @Override
+   public Counter getCounter(Enum<?> counterName) {
+diff --git a/src/mapred/org/apache/hadoop/mapred/TaskStatus.java b/src/mapred/org/apache/hadoop/mapred/TaskStatus.java
+index f6e0e73..af3abe2 100644
+--- a/src/mapred/org/apache/hadoop/mapred/TaskStatus.java
++++ b/src/mapred/org/apache/hadoop/mapred/TaskStatus.java
+@@ -207,11 +207,32 @@ public abstract class TaskStatus implements Writable, Cloneable {
+   void setShuffleFinishTime(long shuffleFinishTime) {}
+ 
+   /**
+-   * Get sort finish time for the task,. If sort finish time was not set 
+-   * due to sort and reduce phase finishing in same heartebat interval, it is 
+-   * set to finish time, when finish time is set. 
+-   * @return 0 if sort finish time and finish time are not set, else returns sort
+-   * finish time if that is set, else it returns finish time. 
++   * Get map phase finish time for the task. If map finsh time was not set due
++   * to sort phase ending within same heartbeat interval, it is set to finish
++   * time of next phase i.e. sort phase when it is set.
++   * 
++   * @return 0 if mapFinishTime, sortFinishTime are not set. else it returns
++   *         approximate map finish time.
++   */
++  public long getMapFinishTime() {
++    return 0;
++  }
++
++  /**
++   * Set map phase finish time.
++   * 
++   * @param mapFinishTime
++   */
++  void setMapFinishTime(long mapFinishTime) {
++  }
++
++  /**
++   * Get sort finish time for the task,. If sort finish time was not set due to
++   * sort and reduce phase finishing in same heartebat interval, it is set to
++   * finish time, when finish time is set.
++   * 
++   * @return 0 if sort finish time and finish time are not set, else returns
++   *         sort finish time if that is set, else it returns finish time.
+    */
+   public long getSortFinishTime() {
+     return 0;
+@@ -266,7 +287,11 @@ public abstract class TaskStatus implements Writable, Cloneable {
+     if (oldPhase != phase){
+       // sort phase started
+       if (phase == TaskStatus.Phase.SORT){
++        if (oldPhase == TaskStatus.Phase.MAP) {
++          setMapFinishTime(System.currentTimeMillis());
++        } else {
+         setShuffleFinishTime(System.currentTimeMillis());
++        }
+       }else if (phase == TaskStatus.Phase.REDUCE){
+         setSortFinishTime(System.currentTimeMillis());
+       }
+diff --git a/src/mapred/org/apache/hadoop/mapreduce/StatusReporter.java b/src/mapred/org/apache/hadoop/mapreduce/StatusReporter.java
+index 0bc4525..fe28a37 100644
+--- a/src/mapred/org/apache/hadoop/mapreduce/StatusReporter.java
++++ b/src/mapred/org/apache/hadoop/mapreduce/StatusReporter.java
+@@ -21,5 +21,11 @@ public abstract class StatusReporter {
+   public abstract Counter getCounter(Enum<?> name);
+   public abstract Counter getCounter(String group, String name);
+   public abstract void progress();
++  /**
++   * Get the current progress.
++   * @return a number between 0.0 and 1.0 (inclusive) indicating the attempt's 
++   * progress.
++   */
++  public abstract float getProgress();
+   public abstract void setStatus(String status);
+ }
+diff --git a/src/mapred/org/apache/hadoop/mapreduce/TaskAttemptContext.java b/src/mapred/org/apache/hadoop/mapreduce/TaskAttemptContext.java
+index e2a7e45..14c481e 100644
+--- a/src/mapred/org/apache/hadoop/mapreduce/TaskAttemptContext.java
++++ b/src/mapred/org/apache/hadoop/mapreduce/TaskAttemptContext.java
+@@ -40,6 +40,13 @@ public interface TaskAttemptContext extends JobContext, Progressable {
+    * @return the current status message
+    */
+   public String getStatus();
++  
++  /**
++   * The current progress of the task attempt.
++   * @return a number between 0.0 and 1.0 (inclusive) indicating the attempt's
++   * progress.
++   */
++  public abstract float getProgress();
+ 
+   /**
+    * Get the {@link Counter} for the given <code>counterName</code>.
+diff --git a/src/mapred/org/apache/hadoop/mapreduce/lib/map/MultithreadedMapper.java b/src/mapred/org/apache/hadoop/mapreduce/lib/map/MultithreadedMapper.java
+index 47f138e..1b1715f 100644
+--- a/src/mapred/org/apache/hadoop/mapreduce/lib/map/MultithreadedMapper.java
++++ b/src/mapred/org/apache/hadoop/mapreduce/lib/map/MultithreadedMapper.java
+@@ -237,6 +237,10 @@ public class MultithreadedMapper<K1, V1, K2, V2>
+       outer.setStatus(status);
+     }
+     
++    @Override
++    public float getProgress() {
++      return outer.getProgress();
++    }
+   }
+ 
+   private class MapRunner extends Thread {
+diff --git a/src/mapred/org/apache/hadoop/mapreduce/lib/map/WrappedMapper.java b/src/mapred/org/apache/hadoop/mapreduce/lib/map/WrappedMapper.java
+index ab011e5..452226f 100644
+--- a/src/mapred/org/apache/hadoop/mapreduce/lib/map/WrappedMapper.java
++++ b/src/mapred/org/apache/hadoop/mapreduce/lib/map/WrappedMapper.java
+@@ -306,5 +306,10 @@ public class WrappedMapper<KEYIN, VALUEIN, KEYOUT, VALUEOUT>
+     public Credentials getCredentials() {
+       return mapContext.getCredentials();
+     }
++    
++    @Override
++    public float getProgress() {
++      return mapContext.getProgress();
++    }
+   }
+ }
+diff --git a/src/mapred/org/apache/hadoop/mapreduce/lib/output/MultipleOutputs.java b/src/mapred/org/apache/hadoop/mapreduce/lib/output/MultipleOutputs.java
+index df012f5..ea58af5 100644
+--- a/src/mapred/org/apache/hadoop/mapreduce/lib/output/MultipleOutputs.java
++++ b/src/mapred/org/apache/hadoop/mapreduce/lib/output/MultipleOutputs.java
+@@ -469,6 +469,11 @@ public class MultipleOutputs<KEYOUT, VALUEOUT> {
+     }
+ 
+     @Override
++    public float getProgress() {
++      return context.getProgress();
++    }
++    
++    @Override
+     public void setStatus(String status) {
+       context.setStatus(status);
+     }
+diff --git a/src/mapred/org/apache/hadoop/mapreduce/lib/reduce/WrappedReducer.java b/src/mapred/org/apache/hadoop/mapreduce/lib/reduce/WrappedReducer.java
+index b990b62..119b626 100644
+--- a/src/mapred/org/apache/hadoop/mapreduce/lib/reduce/WrappedReducer.java
++++ b/src/mapred/org/apache/hadoop/mapreduce/lib/reduce/WrappedReducer.java
+@@ -310,5 +310,10 @@ public class WrappedReducer<KEYIN, VALUEIN, KEYOUT, VALUEOUT>
+     public Credentials getCredentials() {
+       return reduceContext.getCredentials();
+     }
++    
++    @Override
++    public float getProgress() {
++      return reduceContext.getProgress();
++    }
+   }
+ }
+diff --git a/src/mapred/org/apache/hadoop/mapreduce/task/TaskAttemptContextImpl.java b/src/mapred/org/apache/hadoop/mapreduce/task/TaskAttemptContextImpl.java
+index 0aa5965..e683226 100644
+--- a/src/mapred/org/apache/hadoop/mapreduce/task/TaskAttemptContextImpl.java
++++ b/src/mapred/org/apache/hadoop/mapreduce/task/TaskAttemptContextImpl.java
+@@ -103,5 +103,13 @@ public class TaskAttemptContextImpl extends JobContextImpl
+     public Counter getCounter(String group, String name) {
+       return new Counters().findCounter(group, name);
+     }
++    public float getProgress() {
++      return 0f;
++    }
++  }
++  
++  @Override
++  public float getProgress() {
++    return reporter.getProgress();
+   }
+ }
+\ No newline at end of file
+diff --git a/src/test/org/apache/hadoop/mapred/UtilsForTests.java b/src/test/org/apache/hadoop/mapred/UtilsForTests.java
+index 4786cbc..22e26cb 100644
+--- a/src/test/org/apache/hadoop/mapred/UtilsForTests.java
++++ b/src/test/org/apache/hadoop/mapred/UtilsForTests.java
+@@ -619,6 +619,16 @@ public class UtilsForTests {
+   public static RunningJob runJob(JobConf conf, Path inDir, Path outDir, 
+                                   int numMaps, int numReds) throws IOException {
+ 
++    String input = "The quick brown fox\n" + "has many silly\n"
++                   + "red fox sox\n";
++    
++    // submit the job and wait for it to complete
++    return runJob(conf, inDir, outDir, numMaps, numReds, input);
++  }
++  
++  // Start a job with the specified input and return its RunningJob object
++  static RunningJob runJob(JobConf conf, Path inDir, Path outDir, int numMaps, 
++                           int numReds, String input) throws IOException {
+     FileSystem fs = FileSystem.get(conf);
+     if (fs.exists(outDir)) {
+       fs.delete(outDir, true);
+@@ -626,8 +636,7 @@ public class UtilsForTests {
+     if (!fs.exists(inDir)) {
+       fs.mkdirs(inDir);
+     }
+-    String input = "The quick brown fox\n" + "has many silly\n"
+-        + "red fox sox\n";
++    
+     for (int i = 0; i < numMaps; ++i) {
+       DataOutputStream file = fs.create(new Path(inDir, "part-" + i));
+       file.writeBytes(input);
+diff --git a/src/test/org/apache/hadoop/mapreduce/MapReduceTestUtil.java b/src/test/org/apache/hadoop/mapreduce/MapReduceTestUtil.java
+index aac5300..b49ff2b 100644
+--- a/src/test/org/apache/hadoop/mapreduce/MapReduceTestUtil.java
++++ b/src/test/org/apache/hadoop/mapreduce/MapReduceTestUtil.java
+@@ -386,6 +386,10 @@ public class MapReduceTestUtil {
+       }
+       public void progress() {
+       }
++      @Override
++      public float getProgress() {
++        return 0;
++      }
+       public Counter getCounter(Enum<?> name) {
+         return new Counters().findCounter(name);
+       }
+diff --git a/src/test/org/apache/hadoop/mapreduce/TestTaskContext.java b/src/test/org/apache/hadoop/mapreduce/TestTaskContext.java
+index ff52d54..6da3ded 100644
+--- a/src/test/org/apache/hadoop/mapreduce/TestTaskContext.java
++++ b/src/test/org/apache/hadoop/mapreduce/TestTaskContext.java
+@@ -18,17 +18,46 @@
+ package org.apache.hadoop.mapreduce;
+ 
+ import java.io.IOException;
+-
++import java.util.Iterator;
++ 
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.io.LongWritable;
+ import org.apache.hadoop.io.Text;
+ import org.apache.hadoop.mapred.HadoopTestCase;
+ import org.apache.hadoop.mapred.TaskReport;
++import org.apache.hadoop.mapreduce.MapReduceTestUtil.DataCopyMapper;
++import org.apache.hadoop.mapreduce.MapReduceTestUtil.DataCopyReducer;
++
++import org.junit.AfterClass;
++import org.junit.BeforeClass;
++import org.junit.Test;
+ 
+ /**
+- * Tests context api. 
++ * Tests context api and {@link StatusReporter#getProgress()} via 
++ * {@link TaskAttemptContext#getProgress()} API . 
+  */
+ public class TestTaskContext extends HadoopTestCase {
++  private static final Path rootTempDir =
++    new Path(System.getProperty("test.build.data", "/tmp"));
++  private static final Path testRootTempDir = 
++    new Path(rootTempDir, "TestTaskContext");
++  
++  private static FileSystem fs = null;
++
++  @BeforeClass
++  public static void setup() throws Exception {
++    fs = FileSystem.getLocal(new Configuration());
++    fs.delete(testRootTempDir, true);
++    fs.mkdirs(testRootTempDir);
++  }
++
++  @AfterClass
++  public static void cleanup() throws Exception {
++    fs.delete(testRootTempDir, true);
++  }
++
+   public TestTaskContext() throws IOException {
+     super(HadoopTestCase.CLUSTER_MR , HadoopTestCase.LOCAL_FS, 1, 1);
+   }
+@@ -51,11 +80,31 @@ public class TestTaskContext extends HadoopTestCase {
+    */
+   public void testContextStatus()
+       throws IOException, InterruptedException, ClassNotFoundException {
++    Path test = new Path(testRootTempDir, "testContextStatus");
++    
++    // test with 1 map and 0 reducers
++    // test with custom task status
+     int numMaps = 1;
+     Job job = MapReduceTestUtil.createJob(createJobConf(), new Path("in"),
+         new Path("out"), numMaps, 0);
+     job.setMapperClass(MyMapper.class);
+     job.waitForCompletion(true);
+     assertTrue("Job failed", job.isSuccessful());
++    
++    // test with 1 map and 1 reducer
++    // test with default task status
++    int numReduces = 1;
++    job = MapReduceTestUtil.createJob(createJobConf(), 
++            new Path(test, "in"), new Path(test, "out"), numMaps, numReduces);
++    job.setMapperClass(DataCopyMapper.class);
++    job.setReducerClass(DataCopyReducer.class);
++    job.setMapOutputKeyClass(Text.class);
++    job.setMapOutputValueClass(Text.class);
++    job.setOutputKeyClass(Text.class);
++    job.setOutputValueClass(Text.class);
++    
++    // run the job and wait for completion
++    job.waitForCompletion(true);
++    assertTrue("Job failed", job.isSuccessful());
+   }
+ }
+-- 
+1.7.0.4
+

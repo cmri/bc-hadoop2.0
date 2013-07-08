@@ -1,0 +1,187 @@
+From e08dedf8eec9f13b11904946f2c8906fcfcdcbfc Mon Sep 17 00:00:00 2001
+From: Todd Lipcon <todd@cloudera.com>
+Date: Mon, 14 May 2012 20:56:12 -0700
+Subject: [PATCH 0047/1357] Revert HDFS-3157 Error in deleting block is keep on coming from DN even after the block report and directory scanning has happened.
+
+This patch broke some tests and had potential for data loss. It is also reverted upstream.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/branch-2.0.0-alpha@1338309 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit e7d5ce23ddc27b489f34ca7493e999787a22b575)
+---
+ .../hdfs/server/blockmanagement/BlockManager.java  |    6 +-
+ .../blockmanagement/TestRBWBlockInvalidation.java  |  104 --------------------
+ .../hdfs/server/datanode/DataNodeTestUtils.java    |    5 -
+ .../datanode/fsdataset/impl/FsDatasetTestUtil.java |    6 -
+ 4 files changed, 2 insertions(+), 119 deletions(-)
+ delete mode 100644 hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestRBWBlockInvalidation.java
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+index 2054ed5..ca14965 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+@@ -1804,8 +1804,7 @@ assert storedBlock.findDatanode(dn) < 0 : "Block " + block
+       case COMPLETE:
+       case COMMITTED:
+         if (storedBlock.getGenerationStamp() != iblk.getGenerationStamp()) {
+-          return new BlockToMarkCorrupt(new BlockInfo(iblk, storedBlock
+-              .getINode().getReplication()),
++          return new BlockToMarkCorrupt(storedBlock,
+               "block is " + ucState + " and reported genstamp " +
+               iblk.getGenerationStamp() + " does not match " +
+               "genstamp in block map " + storedBlock.getGenerationStamp());
+@@ -1825,8 +1824,7 @@ assert storedBlock.findDatanode(dn) < 0 : "Block " + block
+       if (!storedBlock.isComplete()) {
+         return null; // not corrupt
+       } else if (storedBlock.getGenerationStamp() != iblk.getGenerationStamp()) {
+-        return new BlockToMarkCorrupt(new BlockInfo(iblk, storedBlock
+-            .getINode().getReplication()),
++        return new BlockToMarkCorrupt(storedBlock,
+             "reported " + reportedState + " replica with genstamp " +
+             iblk.getGenerationStamp() + " does not match COMPLETE block's " +
+             "genstamp in block map " + storedBlock.getGenerationStamp());
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestRBWBlockInvalidation.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestRBWBlockInvalidation.java
+deleted file mode 100644
+index e45dd6a..0000000
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestRBWBlockInvalidation.java
++++ /dev/null
+@@ -1,104 +0,0 @@
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package org.apache.hadoop.hdfs.server.blockmanagement;
+-
+-import java.io.File;
+-import java.io.IOException;
+-
+-import org.apache.hadoop.conf.Configuration;
+-import org.apache.hadoop.fs.FSDataOutputStream;
+-import org.apache.hadoop.fs.FileSystem;
+-import org.apache.hadoop.fs.Path;
+-import org.apache.hadoop.hdfs.DFSConfigKeys;
+-import org.apache.hadoop.hdfs.DFSTestUtil;
+-import org.apache.hadoop.hdfs.HdfsConfiguration;
+-import org.apache.hadoop.hdfs.MiniDFSCluster;
+-import org.apache.hadoop.hdfs.protocol.Block;
+-import org.apache.hadoop.hdfs.protocol.ExtendedBlock;
+-import org.apache.hadoop.hdfs.server.datanode.DataNode;
+-import org.apache.hadoop.hdfs.server.datanode.DataNodeTestUtils;
+-import org.apache.hadoop.hdfs.server.namenode.FSNamesystem;
+-
+-import org.junit.Test;
+-import static org.junit.Assert.assertEquals;
+-import static org.junit.Assert.assertTrue;
+-
+-/**
+- * Test when RBW block is removed. Invalidation of the corrupted block happens
+- * and then the under replicated block gets replicated to the datanode.
+- */
+-public class TestRBWBlockInvalidation {
+-  private static NumberReplicas countReplicas(final FSNamesystem namesystem,
+-      ExtendedBlock block) {
+-    return namesystem.getBlockManager().countNodes(block.getLocalBlock());
+-  }
+-
+-  /**
+-   * Test when a block's replica is removed from RBW folder in one of the
+-   * datanode, namenode should ask to invalidate that corrupted block and
+-   * schedule replication for one more replica for that under replicated block.
+-   */
+-  @Test
+-  public void testBlockInvalidationWhenRBWReplicaMissedInDN()
+-      throws IOException, InterruptedException {
+-    Configuration conf = new HdfsConfiguration();
+-    conf.setLong(DFSConfigKeys.DFS_BLOCKREPORT_INTERVAL_MSEC_KEY, 300);
+-    conf.setInt(DFSConfigKeys.DFS_NAMENODE_REPLICATION_INTERVAL_KEY, 1);
+-    conf.setLong(DFSConfigKeys.DFS_HEARTBEAT_INTERVAL_KEY, 1);
+-    MiniDFSCluster cluster = new MiniDFSCluster.Builder(conf).numDataNodes(3)
+-        .build();
+-    FSDataOutputStream out = null;
+-    try {
+-      final FSNamesystem namesystem = cluster.getNamesystem();
+-      FileSystem fs = cluster.getFileSystem();
+-      Path testPath = new Path(MiniDFSCluster.getBaseDirectory(), "foo1");
+-      out = fs.create(testPath, (short) 3);
+-      out.writeBytes("HDFS-3157: " + testPath);
+-      out.hsync();
+-      String bpid = namesystem.getBlockPoolId();
+-      ExtendedBlock blk = DFSTestUtil.getFirstBlock(fs, testPath);
+-      Block block = blk.getLocalBlock();
+-      // Deleting partial block and its meta information from the RBW folder
+-      // of first datanode.
+-      DataNode dn = cluster.getDataNodes().get(0);
+-      File blockFile = DataNodeTestUtils.getBlockFile(dn, bpid, block);
+-      File metaFile = DataNodeTestUtils.getMetaFile(dn, bpid, block);
+-      assertTrue("Could not delete the block file from the RBW folder",
+-          blockFile.delete());
+-      assertTrue("Could not delete the block meta file from the RBW folder",
+-          metaFile.delete());
+-      out.close();
+-      assertEquals("The corrupt replica could not be invalidated", 0,
+-          countReplicas(namesystem, blk).corruptReplicas());
+-      /*
+-       * Sleep for 3 seconds, for under replicated block to get replicated. As
+-       * one second will be taken by ReplicationMonitor and one more second for
+-       * invalidated block to get deleted from the datanode.
+-       */
+-      Thread.sleep(3000);
+-      blk = DFSTestUtil.getFirstBlock(fs, testPath);
+-      assertEquals("There should be three live replicas", 3,
+-          countReplicas(namesystem, blk).liveReplicas());
+-    } finally {
+-      if (out != null) {
+-        out.close();
+-      }
+-      cluster.shutdown();
+-    }
+-  }
+-}
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/DataNodeTestUtils.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/DataNodeTestUtils.java
+index 7baa47a..74be37d 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/DataNodeTestUtils.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/DataNodeTestUtils.java
+@@ -136,11 +136,6 @@ public class DataNodeTestUtils {
+       ) throws IOException {
+     return FsDatasetTestUtil.getBlockFile(dn.getFSDataset(), bpid, b);
+   }
+-  
+-  public static File getMetaFile(DataNode dn, String bpid, Block b)
+-      throws IOException {
+-    return FsDatasetTestUtil.getMetaFile(dn.getFSDataset(), bpid, b);
+-  }
+ 
+   public static boolean unlinkBlock(DataNode dn, ExtendedBlock bk, int numLinks
+       ) throws IOException {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetTestUtil.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetTestUtil.java
+index 05a2cec..211737f 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetTestUtil.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetTestUtil.java
+@@ -36,12 +36,6 @@ public class FsDatasetTestUtil {
+       ) throws IOException {
+     return ((FsDatasetImpl)fsd).getBlockFile(bpid, b);
+   }
+-  
+-  public static File getMetaFile(FsDatasetSpi<?> fsd, String bpid, Block b)
+-      throws IOException {
+-    return FsDatasetUtil.getMetaFile(getBlockFile(fsd, bpid, b), b
+-        .getGenerationStamp());
+-  }
+ 
+   public static boolean unlinkBlock(FsDatasetSpi<?> fsd,
+       ExtendedBlock block, int numLinks) throws IOException {
+-- 
+1.7.0.4
+

@@ -1,0 +1,472 @@
+From e4d4f5a5a2003f909cb48f8fc7fe4c247c0466c0 Mon Sep 17 00:00:00 2001
+From: Alejandro Abdelnur <tucu@apache.org>
+Date: Tue, 12 Jun 2012 20:45:57 +0000
+Subject: [PATCH 0269/1357] HADOOP-8458. Add management hook to AuthenticationHandler to enable delegation token operations support (tucu)
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1349514 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 4a70e982808c409fad67b1d9821d363651c2011e)
+---
+ .../server/AuthenticationFilter.java               |   70 ++++++-----
+ .../server/AuthenticationHandler.java              |   28 +++++
+ .../server/KerberosAuthenticationHandler.java      |   21 ++++
+ .../server/PseudoAuthenticationHandler.java        |   21 ++++
+ .../server/TestAuthenticationFilter.java           |  127 +++++++++++++++++--
+ 5 files changed, 220 insertions(+), 47 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-auth/src/main/java/org/apache/hadoop/security/authentication/server/AuthenticationFilter.java b/hadoop-common-project/hadoop-auth/src/main/java/org/apache/hadoop/security/authentication/server/AuthenticationFilter.java
+index 28a4d3d..b1795d1 100644
+--- a/hadoop-common-project/hadoop-auth/src/main/java/org/apache/hadoop/security/authentication/server/AuthenticationFilter.java
++++ b/hadoop-common-project/hadoop-auth/src/main/java/org/apache/hadoop/security/authentication/server/AuthenticationFilter.java
+@@ -341,45 +341,49 @@ public class AuthenticationFilter implements Filter {
+         LOG.warn("AuthenticationToken ignored: " + ex.getMessage());
+         token = null;
+       }
+-      if (token == null) {
+-        if (LOG.isDebugEnabled()) {
+-          LOG.debug("Request [{}] triggering authentication", getRequestURL(httpRequest));
+-        }
+-        token = authHandler.authenticate(httpRequest, httpResponse);
+-        if (token != null && token != AuthenticationToken.ANONYMOUS) {
+-          token.setExpires(System.currentTimeMillis() + getValidity() * 1000);
+-        }
+-        newToken = true;
+-      }
+-      if (token != null) {
+-        unauthorizedResponse = false;
+-        if (LOG.isDebugEnabled()) {
+-          LOG.debug("Request [{}] user [{}] authenticated", getRequestURL(httpRequest), token.getUserName());
++      if (authHandler.managementOperation(token, httpRequest, httpResponse)) {
++        if (token == null) {
++          if (LOG.isDebugEnabled()) {
++            LOG.debug("Request [{}] triggering authentication", getRequestURL(httpRequest));
++          }
++          token = authHandler.authenticate(httpRequest, httpResponse);
++          if (token != null && token != AuthenticationToken.ANONYMOUS) {
++            token.setExpires(System.currentTimeMillis() + getValidity() * 1000);
++          }
++          newToken = true;
+         }
+-        final AuthenticationToken authToken = token;
+-        httpRequest = new HttpServletRequestWrapper(httpRequest) {
+-
+-          @Override
+-          public String getAuthType() {
+-            return authToken.getType();
++        if (token != null) {
++          unauthorizedResponse = false;
++          if (LOG.isDebugEnabled()) {
++            LOG.debug("Request [{}] user [{}] authenticated", getRequestURL(httpRequest), token.getUserName());
+           }
++          final AuthenticationToken authToken = token;
++          httpRequest = new HttpServletRequestWrapper(httpRequest) {
+ 
+-          @Override
+-          public String getRemoteUser() {
+-            return authToken.getUserName();
+-          }
++            @Override
++            public String getAuthType() {
++              return authToken.getType();
++            }
+ 
+-          @Override
+-          public Principal getUserPrincipal() {
+-            return (authToken != AuthenticationToken.ANONYMOUS) ? authToken : null;
++            @Override
++            public String getRemoteUser() {
++              return authToken.getUserName();
++            }
++
++            @Override
++            public Principal getUserPrincipal() {
++              return (authToken != AuthenticationToken.ANONYMOUS) ? authToken : null;
++            }
++          };
++          if (newToken && token != AuthenticationToken.ANONYMOUS) {
++            String signedToken = signer.sign(token.toString());
++            Cookie cookie = createCookie(signedToken);
++            httpResponse.addCookie(cookie);
+           }
+-        };
+-        if (newToken && token != AuthenticationToken.ANONYMOUS) {
+-          String signedToken = signer.sign(token.toString());
+-          Cookie cookie = createCookie(signedToken);
+-          httpResponse.addCookie(cookie);
++          filterChain.doFilter(httpRequest, httpResponse);
+         }
+-        filterChain.doFilter(httpRequest, httpResponse);
++      } else {
++        unauthorizedResponse = false;
+       }
+     } catch (AuthenticationException ex) {
+       unauthorizedMsg = ex.toString();
+diff --git a/hadoop-common-project/hadoop-auth/src/main/java/org/apache/hadoop/security/authentication/server/AuthenticationHandler.java b/hadoop-common-project/hadoop-auth/src/main/java/org/apache/hadoop/security/authentication/server/AuthenticationHandler.java
+index 958680f..7cafe8b 100644
+--- a/hadoop-common-project/hadoop-auth/src/main/java/org/apache/hadoop/security/authentication/server/AuthenticationHandler.java
++++ b/hadoop-common-project/hadoop-auth/src/main/java/org/apache/hadoop/security/authentication/server/AuthenticationHandler.java
+@@ -59,6 +59,34 @@ public interface AuthenticationHandler {
+   public void destroy();
+ 
+   /**
++   * Performs an authentication management operation.
++   * <p/>
++   * This is useful for handling operations like get/renew/cancel
++   * delegation tokens which are being handled as operations of the
++   * service end-point.
++   * <p/>
++   * If the method returns <code>TRUE</code> the request will continue normal
++   * processing, this means the method has not produced any HTTP response.
++   * <p/>
++   * If the method returns <code>FALSE</code> the request will end, this means 
++   * the method has produced the corresponding HTTP response.
++   *
++   * @param token the authentication token if any, otherwise <code>NULL</code>.
++   * @param request the HTTP client request.
++   * @param response the HTTP client response.
++   * @return <code>TRUE</code> if the request should be processed as a regular
++   * request,
++   * <code>FALSE</code> otherwise.
++   *
++   * @throws IOException thrown if an IO error occurred.
++   * @throws AuthenticationException thrown if an Authentication error occurred.
++   */
++  public boolean managementOperation(AuthenticationToken token,
++                                     HttpServletRequest request,
++                                     HttpServletResponse response)
++    throws IOException, AuthenticationException;
++
++  /**
+    * Performs an authentication step for the given HTTP client request.
+    * <p/>
+    * This method is invoked by the {@link AuthenticationFilter} only if the HTTP client request is
+diff --git a/hadoop-common-project/hadoop-auth/src/main/java/org/apache/hadoop/security/authentication/server/KerberosAuthenticationHandler.java b/hadoop-common-project/hadoop-auth/src/main/java/org/apache/hadoop/security/authentication/server/KerberosAuthenticationHandler.java
+index 8cad2cc..07b64f4 100644
+--- a/hadoop-common-project/hadoop-auth/src/main/java/org/apache/hadoop/security/authentication/server/KerberosAuthenticationHandler.java
++++ b/hadoop-common-project/hadoop-auth/src/main/java/org/apache/hadoop/security/authentication/server/KerberosAuthenticationHandler.java
+@@ -233,6 +233,27 @@ public class KerberosAuthenticationHandler implements AuthenticationHandler {
+   }
+ 
+   /**
++   * This is an empty implementation, it always returns <code>TRUE</code>.
++   *
++   *
++   *
++   * @param token the authentication token if any, otherwise <code>NULL</code>.
++   * @param request the HTTP client request.
++   * @param response the HTTP client response.
++   *
++   * @return <code>TRUE</code>
++   * @throws IOException it is never thrown.
++   * @throws AuthenticationException it is never thrown.
++   */
++  @Override
++  public boolean managementOperation(AuthenticationToken token,
++                                     HttpServletRequest request,
++                                     HttpServletResponse response)
++    throws IOException, AuthenticationException {
++    return true;
++  }
++
++  /**
+    * It enforces the the Kerberos SPNEGO authentication sequence returning an {@link AuthenticationToken} only
+    * after the Kerberos SPNEGO sequence has completed successfully.
+    * <p/>
+diff --git a/hadoop-common-project/hadoop-auth/src/main/java/org/apache/hadoop/security/authentication/server/PseudoAuthenticationHandler.java b/hadoop-common-project/hadoop-auth/src/main/java/org/apache/hadoop/security/authentication/server/PseudoAuthenticationHandler.java
+index 336c36e..1a2f98c 100644
+--- a/hadoop-common-project/hadoop-auth/src/main/java/org/apache/hadoop/security/authentication/server/PseudoAuthenticationHandler.java
++++ b/hadoop-common-project/hadoop-auth/src/main/java/org/apache/hadoop/security/authentication/server/PseudoAuthenticationHandler.java
+@@ -94,6 +94,27 @@ public class PseudoAuthenticationHandler implements AuthenticationHandler {
+   }
+ 
+   /**
++   * This is an empty implementation, it always returns <code>TRUE</code>.
++   *
++   *
++   *
++   * @param token the authentication token if any, otherwise <code>NULL</code>.
++   * @param request the HTTP client request.
++   * @param response the HTTP client response.
++   *
++   * @return <code>TRUE</code>
++   * @throws IOException it is never thrown.
++   * @throws AuthenticationException it is never thrown.
++   */
++  @Override
++  public boolean managementOperation(AuthenticationToken token,
++                                     HttpServletRequest request,
++                                     HttpServletResponse response)
++    throws IOException, AuthenticationException {
++    return true;
++  }
++
++  /**
+    * Authenticates an HTTP client request.
+    * <p/>
+    * It extracts the {@link PseudoAuthenticator#USER_NAME} parameter from the query string and creates
+diff --git a/hadoop-common-project/hadoop-auth/src/test/java/org/apache/hadoop/security/authentication/server/TestAuthenticationFilter.java b/hadoop-common-project/hadoop-auth/src/test/java/org/apache/hadoop/security/authentication/server/TestAuthenticationFilter.java
+index 4f1bc11..746cf7b 100644
+--- a/hadoop-common-project/hadoop-auth/src/test/java/org/apache/hadoop/security/authentication/server/TestAuthenticationFilter.java
++++ b/hadoop-common-project/hadoop-auth/src/test/java/org/apache/hadoop/security/authentication/server/TestAuthenticationFilter.java
+@@ -71,6 +71,7 @@ public class TestAuthenticationFilter extends TestCase {
+ 
+   public static class DummyAuthenticationHandler implements AuthenticationHandler {
+     public static boolean init;
++    public static boolean managementOperationReturn;
+     public static boolean destroy;
+ 
+     public static final String TYPE = "dummy";
+@@ -83,6 +84,19 @@ public class TestAuthenticationFilter extends TestCase {
+     @Override
+     public void init(Properties config) throws ServletException {
+       init = true;
++      managementOperationReturn =
++        config.getProperty("management.operation.return", "true").equals("true");
++    }
++
++    @Override
++    public boolean managementOperation(AuthenticationToken token,
++                                       HttpServletRequest request,
++                                       HttpServletResponse response)
++      throws IOException, AuthenticationException {
++      if (!managementOperationReturn) {
++        response.setStatus(HttpServletResponse.SC_ACCEPTED);
++      }
++      return managementOperationReturn;
+     }
+ 
+     @Override
+@@ -170,10 +184,14 @@ public class TestAuthenticationFilter extends TestCase {
+     filter = new AuthenticationFilter();
+     try {
+       FilterConfig config = Mockito.mock(FilterConfig.class);
++      Mockito.when(config.getInitParameter("management.operation.return")).
++        thenReturn("true");
+       Mockito.when(config.getInitParameter(AuthenticationFilter.AUTH_TYPE)).thenReturn(
+         DummyAuthenticationHandler.class.getName());
+       Mockito.when(config.getInitParameterNames()).thenReturn(
+-        new Vector<String>(Arrays.asList(AuthenticationFilter.AUTH_TYPE)).elements());
++        new Vector<String>(
++          Arrays.asList(AuthenticationFilter.AUTH_TYPE,
++                        "management.operation.return")).elements());
+       filter.init(config);
+       assertTrue(DummyAuthenticationHandler.init);
+     } finally {
+@@ -201,10 +219,14 @@ public class TestAuthenticationFilter extends TestCase {
+     AuthenticationFilter filter = new AuthenticationFilter();
+     try {
+       FilterConfig config = Mockito.mock(FilterConfig.class);
++      Mockito.when(config.getInitParameter("management.operation.return")).
++        thenReturn("true");
+       Mockito.when(config.getInitParameter(AuthenticationFilter.AUTH_TYPE)).thenReturn(
+         DummyAuthenticationHandler.class.getName());
+       Mockito.when(config.getInitParameterNames()).thenReturn(
+-        new Vector<String>(Arrays.asList(AuthenticationFilter.AUTH_TYPE)).elements());
++        new Vector<String>(
++          Arrays.asList(AuthenticationFilter.AUTH_TYPE,
++                        "management.operation.return")).elements());
+       filter.init(config);
+ 
+       HttpServletRequest request = Mockito.mock(HttpServletRequest.class);
+@@ -221,12 +243,16 @@ public class TestAuthenticationFilter extends TestCase {
+     AuthenticationFilter filter = new AuthenticationFilter();
+     try {
+       FilterConfig config = Mockito.mock(FilterConfig.class);
++      Mockito.when(config.getInitParameter("management.operation.return")).
++        thenReturn("true");
+       Mockito.when(config.getInitParameter(AuthenticationFilter.AUTH_TYPE)).thenReturn(
+         DummyAuthenticationHandler.class.getName());
+       Mockito.when(config.getInitParameter(AuthenticationFilter.SIGNATURE_SECRET)).thenReturn("secret");
+       Mockito.when(config.getInitParameterNames()).thenReturn(
+-        new Vector<String>(Arrays.asList(AuthenticationFilter.AUTH_TYPE,
+-                                 AuthenticationFilter.SIGNATURE_SECRET)).elements());
++        new Vector<String>(
++          Arrays.asList(AuthenticationFilter.AUTH_TYPE,
++                        AuthenticationFilter.SIGNATURE_SECRET,
++                        "management.operation.return")).elements());
+       filter.init(config);
+ 
+       AuthenticationToken token = new AuthenticationToken("u", "p", DummyAuthenticationHandler.TYPE);
+@@ -250,12 +276,15 @@ public class TestAuthenticationFilter extends TestCase {
+     AuthenticationFilter filter = new AuthenticationFilter();
+     try {
+       FilterConfig config = Mockito.mock(FilterConfig.class);
++      Mockito.when(config.getInitParameter("management.operation.return")).thenReturn("true");
+       Mockito.when(config.getInitParameter(AuthenticationFilter.AUTH_TYPE)).thenReturn(
+         DummyAuthenticationHandler.class.getName());
+       Mockito.when(config.getInitParameter(AuthenticationFilter.SIGNATURE_SECRET)).thenReturn("secret");
+       Mockito.when(config.getInitParameterNames()).thenReturn(
+-        new Vector<String>(Arrays.asList(AuthenticationFilter.AUTH_TYPE,
+-                                 AuthenticationFilter.SIGNATURE_SECRET)).elements());
++        new Vector<String>(
++          Arrays.asList(AuthenticationFilter.AUTH_TYPE,
++                        AuthenticationFilter.SIGNATURE_SECRET,
++                        "management.operation.return")).elements());
+       filter.init(config);
+ 
+       AuthenticationToken token = new AuthenticationToken("u", "p", "invalidtype");
+@@ -284,12 +313,16 @@ public class TestAuthenticationFilter extends TestCase {
+     AuthenticationFilter filter = new AuthenticationFilter();
+     try {
+       FilterConfig config = Mockito.mock(FilterConfig.class);
++      Mockito.when(config.getInitParameter("management.operation.return")).
++        thenReturn("true");
+       Mockito.when(config.getInitParameter(AuthenticationFilter.AUTH_TYPE)).thenReturn(
+         DummyAuthenticationHandler.class.getName());
+       Mockito.when(config.getInitParameter(AuthenticationFilter.SIGNATURE_SECRET)).thenReturn("secret");
+       Mockito.when(config.getInitParameterNames()).thenReturn(
+-        new Vector<String>(Arrays.asList(AuthenticationFilter.AUTH_TYPE,
+-                                 AuthenticationFilter.SIGNATURE_SECRET)).elements());
++        new Vector<String>(
++          Arrays.asList(AuthenticationFilter.AUTH_TYPE,
++                        AuthenticationFilter.SIGNATURE_SECRET,
++                        "management.operation.return")).elements());
+       filter.init(config);
+ 
+       AuthenticationToken token = new AuthenticationToken("u", "p", "invalidtype");
+@@ -318,10 +351,14 @@ public class TestAuthenticationFilter extends TestCase {
+     AuthenticationFilter filter = new AuthenticationFilter();
+     try {
+       FilterConfig config = Mockito.mock(FilterConfig.class);
++      Mockito.when(config.getInitParameter("management.operation.return")).
++        thenReturn("true");
+       Mockito.when(config.getInitParameter(AuthenticationFilter.AUTH_TYPE)).thenReturn(
+         DummyAuthenticationHandler.class.getName());
+       Mockito.when(config.getInitParameterNames()).thenReturn(
+-        new Vector<String>(Arrays.asList(AuthenticationFilter.AUTH_TYPE)).elements());
++        new Vector<String>(
++          Arrays.asList(AuthenticationFilter.AUTH_TYPE,
++                        "management.operation.return")).elements());
+       filter.init(config);
+ 
+       HttpServletRequest request = Mockito.mock(HttpServletRequest.class);
+@@ -353,6 +390,8 @@ public class TestAuthenticationFilter extends TestCase {
+     AuthenticationFilter filter = new AuthenticationFilter();
+     try {
+       FilterConfig config = Mockito.mock(FilterConfig.class);
++      Mockito.when(config.getInitParameter("management.operation.return")).
++        thenReturn("true");
+       Mockito.when(config.getInitParameter(AuthenticationFilter.AUTH_TYPE)).thenReturn(
+         DummyAuthenticationHandler.class.getName());
+       Mockito.when(config.getInitParameter(AuthenticationFilter.AUTH_TOKEN_VALIDITY)).thenReturn("1000");
+@@ -360,7 +399,8 @@ public class TestAuthenticationFilter extends TestCase {
+       Mockito.when(config.getInitParameterNames()).thenReturn(
+         new Vector<String>(Arrays.asList(AuthenticationFilter.AUTH_TYPE,
+                                  AuthenticationFilter.AUTH_TOKEN_VALIDITY,
+-                                 AuthenticationFilter.SIGNATURE_SECRET)).elements());
++                                 AuthenticationFilter.SIGNATURE_SECRET,
++                                 "management.operation.return")).elements());
+ 
+       if (withDomainPath) {
+         Mockito.when(config.getInitParameter(AuthenticationFilter.COOKIE_DOMAIN)).thenReturn(".foo.com");
+@@ -370,7 +410,8 @@ public class TestAuthenticationFilter extends TestCase {
+                                    AuthenticationFilter.AUTH_TOKEN_VALIDITY,
+                                    AuthenticationFilter.SIGNATURE_SECRET,
+                                    AuthenticationFilter.COOKIE_DOMAIN,
+-                                   AuthenticationFilter.COOKIE_PATH)).elements());
++                                   AuthenticationFilter.COOKIE_PATH,
++                                   "management.operation.return")).elements());
+       }
+ 
+       filter.init(config);
+@@ -458,10 +499,14 @@ public class TestAuthenticationFilter extends TestCase {
+     AuthenticationFilter filter = new AuthenticationFilter();
+     try {
+       FilterConfig config = Mockito.mock(FilterConfig.class);
++      Mockito.when(config.getInitParameter("management.operation.return")).
++        thenReturn("true");
+       Mockito.when(config.getInitParameter(AuthenticationFilter.AUTH_TYPE)).thenReturn(
+         DummyAuthenticationHandler.class.getName());
+       Mockito.when(config.getInitParameterNames()).thenReturn(
+-        new Vector<String>(Arrays.asList(AuthenticationFilter.AUTH_TYPE)).elements());
++        new Vector<String>(
++          Arrays.asList(AuthenticationFilter.AUTH_TYPE,
++                        "management.operation.return")).elements());
+       filter.init(config);
+ 
+       HttpServletRequest request = Mockito.mock(HttpServletRequest.class);
+@@ -503,10 +548,14 @@ public class TestAuthenticationFilter extends TestCase {
+     AuthenticationFilter filter = new AuthenticationFilter();
+     try {
+       FilterConfig config = Mockito.mock(FilterConfig.class);
++      Mockito.when(config.getInitParameter("management.operation.return")).
++        thenReturn("true");
+       Mockito.when(config.getInitParameter(AuthenticationFilter.AUTH_TYPE)).thenReturn(
+         DummyAuthenticationHandler.class.getName());
+       Mockito.when(config.getInitParameterNames()).thenReturn(
+-        new Vector<String>(Arrays.asList(AuthenticationFilter.AUTH_TYPE)).elements());
++        new Vector<String>(
++          Arrays.asList(AuthenticationFilter.AUTH_TYPE,
++                        "management.operation.return")).elements());
+       filter.init(config);
+ 
+       HttpServletRequest request = Mockito.mock(HttpServletRequest.class);
+@@ -563,10 +612,14 @@ public class TestAuthenticationFilter extends TestCase {
+     AuthenticationFilter filter = new AuthenticationFilter();
+     try {
+       FilterConfig config = Mockito.mock(FilterConfig.class);
++      Mockito.when(config.getInitParameter("management.operation.return")).
++        thenReturn("true");
+       Mockito.when(config.getInitParameter(AuthenticationFilter.AUTH_TYPE)).thenReturn(
+         DummyAuthenticationHandler.class.getName());
+       Mockito.when(config.getInitParameterNames()).thenReturn(
+-        new Vector<String>(Arrays.asList(AuthenticationFilter.AUTH_TYPE)).elements());
++        new Vector<String>(
++          Arrays.asList(AuthenticationFilter.AUTH_TYPE,
++                        "management.operation.return")).elements());
+       filter.init(config);
+ 
+       HttpServletRequest request = Mockito.mock(HttpServletRequest.class);
+@@ -618,4 +671,50 @@ public class TestAuthenticationFilter extends TestCase {
+     }
+   }
+ 
++  public void testManagementOperation() throws Exception {
++    AuthenticationFilter filter = new AuthenticationFilter();
++    try {
++      FilterConfig config = Mockito.mock(FilterConfig.class);
++      Mockito.when(config.getInitParameter("management.operation.return")).
++        thenReturn("false");
++      Mockito.when(config.getInitParameter(AuthenticationFilter.AUTH_TYPE)).
++        thenReturn(DummyAuthenticationHandler.class.getName());
++      Mockito.when(config.getInitParameterNames()).thenReturn(
++        new Vector<String>(
++          Arrays.asList(AuthenticationFilter.AUTH_TYPE,
++                        "management.operation.return")).elements());
++      filter.init(config);
++
++      HttpServletRequest request = Mockito.mock(HttpServletRequest.class);
++      Mockito.when(request.getRequestURL()).
++        thenReturn(new StringBuffer("http://foo:8080/bar"));
++
++      HttpServletResponse response = Mockito.mock(HttpServletResponse.class);
++
++      FilterChain chain = Mockito.mock(FilterChain.class);
++
++      filter.doFilter(request, response, chain);
++      Mockito.verify(response).setStatus(HttpServletResponse.SC_ACCEPTED);
++      Mockito.verifyNoMoreInteractions(response);
++
++      Mockito.reset(request);
++      Mockito.reset(response);
++
++      AuthenticationToken token = new AuthenticationToken("u", "p", "t");
++      token.setExpires(System.currentTimeMillis() + 1000);
++      Signer signer = new Signer("secret".getBytes());
++      String tokenSigned = signer.sign(token.toString());
++      Cookie cookie = new Cookie(AuthenticatedURL.AUTH_COOKIE, tokenSigned);
++      Mockito.when(request.getCookies()).thenReturn(new Cookie[]{cookie});
++
++      filter.doFilter(request, response, chain);
++
++      Mockito.verify(response).setStatus(HttpServletResponse.SC_ACCEPTED);
++      Mockito.verifyNoMoreInteractions(response);
++
++    } finally {
++      filter.destroy();
++    }
++  }
++
+ }
+-- 
+1.7.0.4
+

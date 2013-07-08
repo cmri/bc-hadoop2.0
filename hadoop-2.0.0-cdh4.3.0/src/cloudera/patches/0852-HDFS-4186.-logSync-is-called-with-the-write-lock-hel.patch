@@ -1,0 +1,213 @@
+From 96ed3a056cb0fb0f62979d8af4f0b8f261c371f9 Mon Sep 17 00:00:00 2001
+From: Daryn Sharp <daryn@apache.org>
+Date: Thu, 15 Nov 2012 20:33:30 +0000
+Subject: [PATCH 0852/1357] HDFS-4186. logSync() is called with the write lock held while releasing lease (Kihwal Lee via daryn)
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1409988 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 7a47aa9a2488498a8f6e61014669001b9ac522b0)
+---
+ .../hadoop/hdfs/server/namenode/FSNamesystem.java  |   44 +++++++++++++++-----
+ .../hadoop/hdfs/server/namenode/LeaseManager.java  |   22 ++++++++--
+ .../hadoop/hdfs/server/namenode/TestEditLog.java   |    2 +-
+ 3 files changed, 51 insertions(+), 17 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+index 0418ddc..cc03a34 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+@@ -1745,16 +1745,24 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+       short replication, long blockSize) throws AccessControlException,
+       SafeModeException, FileAlreadyExistsException, UnresolvedLinkException,
+       FileNotFoundException, ParentNotDirectoryException, IOException {
++    boolean skipSync = false;
+     writeLock();
+     try {
+       checkOperation(OperationCategory.WRITE);
+ 
+       startFileInternal(src, permissions, holder, clientMachine, flag,
+           createParent, replication, blockSize);
++    } catch (StandbyException se) {
++      skipSync = true;
++      throw se;
+     } finally {
+       writeUnlock();
+-    }
+-    getEditLog().logSync();
++      // There might be transactions logged while trying to recover the lease.
++      // They need to be sync'ed even when an exception was thrown.
++      if (!skipSync) {
++        getEditLog().logSync();
++      }
++    } 
+ 
+     if (isAuditEnabled() && isExternalInvocation()) {
+       final HdfsFileStatus stat = dir.getFileInfo(src, false);
+@@ -1941,6 +1949,7 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+    */
+   boolean recoverLease(String src, String holder, String clientMachine)
+       throws IOException {
++    boolean skipSync = false;
+     writeLock();
+     try {
+       checkOperation(OperationCategory.WRITE);
+@@ -1966,8 +1975,16 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+       }
+   
+       recoverLeaseInternal(inode, src, holder, clientMachine, true);
++    } catch (StandbyException se) {
++      skipSync = true;
++      throw se;
+     } finally {
+       writeUnlock();
++      // There might be transactions logged while trying to recover the lease.
++      // They need to be sync'ed even when an exception was thrown.
++      if (!skipSync) {
++        getEditLog().logSync();
++      }
+     }
+     return false;
+   }
+@@ -2070,6 +2087,7 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+       throws AccessControlException, SafeModeException,
+       FileAlreadyExistsException, FileNotFoundException,
+       ParentNotDirectoryException, IOException {
++    boolean skipSync = false;
+     if (!supportAppends) {
+       throw new UnsupportedOperationException(
+           "Append is not enabled on this NameNode. Use the " +
+@@ -2083,10 +2101,17 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+       lb = startFileInternal(src, null, holder, clientMachine, 
+                         EnumSet.of(CreateFlag.APPEND), 
+                         false, blockManager.maxReplication, 0);
++    } catch (StandbyException se) {
++      skipSync = true;
++      throw se;
+     } finally {
+       writeUnlock();
++      // There might be transactions logged while trying to recover the lease.
++      // They need to be sync'ed even when an exception was thrown.
++      if (!skipSync) {
++        getEditLog().logSync();
++      }
+     }
+-    getEditLog().logSync();
+     if (lb != null) {
+       if (NameNode.stateChangeLog.isDebugEnabled()) {
+         NameNode.stateChangeLog.debug("DIR* NameSystem.appendFile: file "
+@@ -3028,7 +3053,8 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+    *         RecoveryInProgressException if lease recovery is in progress.<br>
+    *         IOException in case of an error.
+    * @return true  if file has been successfully finalized and closed or 
+-   *         false if block recovery has been initiated
++   *         false if block recovery has been initiated. Since the lease owner
++   *         has been changed and logged, caller should call logSync().
+    */
+   boolean internalReleaseLease(Lease lease, String src, 
+       String recoveryLeaseHolder) throws AlreadyBeingCreatedException, 
+@@ -3163,6 +3189,7 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+     assert hasWriteLock();
+     if(newHolder == null)
+       return lease;
++    // The following transaction is not synced. Make sure it's sync'ed later.
+     logReassignLease(lease.getHolder(), src, newHolder);
+     return reassignLeaseInternal(lease, src, newHolder, pendingFile);
+   }
+@@ -5314,13 +5341,8 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+   
+   private void logReassignLease(String leaseHolder, String src,
+       String newHolder) {
+-    writeLock();
+-    try {
+-      getEditLog().logReassignLease(leaseHolder, src, newHolder);
+-    } finally {
+-      writeUnlock();
+-    }
+-    getEditLog().logSync();
++    assert hasWriteLock();
++    getEditLog().logReassignLease(leaseHolder, src, newHolder);
+   }
+   
+   /**
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/LeaseManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/LeaseManager.java
+index b46dcce..d49311f 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/LeaseManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/LeaseManager.java
+@@ -401,17 +401,21 @@ public class LeaseManager {
+     @Override
+     public void run() {
+       for(; shouldRunMonitor && fsnamesystem.isRunning(); ) {
++        boolean needSync = false;
+         try {
+           fsnamesystem.writeLockInterruptibly();
+           try {
+             if (!fsnamesystem.isInSafeMode()) {
+-              checkLeases();
++              needSync = checkLeases();
+             }
+           } finally {
+             fsnamesystem.writeUnlock();
++            // lease reassignments should to be sync'ed.
++            if (needSync) {
++              fsnamesystem.getEditLog().logSync();
++            }
+           }
+   
+-  
+           Thread.sleep(HdfsServerConstants.NAMENODE_LEASE_RECHECK_INTERVAL);
+         } catch(InterruptedException ie) {
+           if (LOG.isDebugEnabled()) {
+@@ -422,13 +426,16 @@ public class LeaseManager {
+     }
+   }
+ 
+-  /** Check the leases beginning from the oldest. */
+-  private synchronized void checkLeases() {
++  /** Check the leases beginning from the oldest.
++   *  @return true is sync is needed.
++   */
++  private synchronized boolean checkLeases() {
++    boolean needSync = false;
+     assert fsnamesystem.hasWriteLock();
+     for(; sortedLeases.size() > 0; ) {
+       final Lease oldest = sortedLeases.first();
+       if (!oldest.expiredHardLimit()) {
+-        return;
++        return needSync;
+       }
+ 
+       LOG.info(oldest + " has expired hard limit");
+@@ -451,6 +458,10 @@ public class LeaseManager {
+               LOG.debug("Started block recovery " + p + " lease " + oldest);
+             }
+           }
++          // If a lease recovery happened, we need to sync later.
++          if (!needSync && !completed) {
++            needSync = true;
++          }
+         } catch (IOException e) {
+           LOG.error("Cannot release the path " + p + " in the lease "
+               + oldest, e);
+@@ -462,6 +473,7 @@ public class LeaseManager {
+         removeLease(oldest, p);
+       }
+     }
++    return needSync;
+   }
+ 
+   @Override
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestEditLog.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestEditLog.java
+index 23b0914..09bd44b 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestEditLog.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestEditLog.java
+@@ -449,7 +449,7 @@ public class TestEditLog {
+ 
+       // Now ask to sync edit from B, which should sync both edits.
+       doCallLogSync(threadB, editLog);
+-      assertEquals("logSync from second thread should bump txid up to 2",
++      assertEquals("logSync from second thread should bump txid up to 3",
+         3, editLog.getSyncTxId());
+ 
+       // Now ask to sync edit from A, which was already batched in - thus
+-- 
+1.7.0.4
+

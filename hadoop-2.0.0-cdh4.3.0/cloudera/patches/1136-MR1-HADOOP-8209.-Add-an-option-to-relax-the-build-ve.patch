@@ -1,0 +1,277 @@
+From 08534abb1b8315be82324991f6da70c8a65fd6eb Mon Sep 17 00:00:00 2001
+From: Eli Collins <eli@cloudera.com>
+Date: Thu, 12 Apr 2012 12:39:41 -0700
+Subject: [PATCH 1136/1357] MR1: HADOOP-8209. Add an option to relax the build version check.
+
+Changes the behavior of tasktrackers to only check for a version match (eg "0.20.2-cdh4b2") but ignore the other build fields
+(revision, user, and source checksum) when checking for compatibility with jobtrackers. In previous releases tasktrackers refused
+to connect to jobtrackers if their build version (version, revision, user, and source checksum) did not match. This behavior can
+be restored by disabling hadoop.relaxed.worker.version.check in mapred-site.xml.
+
+Author: Eli Collins
+Reason: Enable rolling upgrades of tasktrackers within an update
+Ref: CDH-5027
+---
+ src/mapred/mapred-default.xml                      |   14 +++
+ .../apache/hadoop/mapred/InterTrackerProtocol.java |   11 ++-
+ .../org/apache/hadoop/mapred/JobTracker.java       |    9 ++-
+ .../org/apache/hadoop/mapred/TaskTracker.java      |   47 +++++++++--
+ .../hadoop/mapred/TestTaskTrackerVersionCheck.java |   90 ++++++++++++++++++++
+ 5 files changed, 160 insertions(+), 11 deletions(-)
+ create mode 100644 src/test/org/apache/hadoop/mapred/TestTaskTrackerVersionCheck.java
+
+diff --git a/src/mapred/mapred-default.xml b/src/mapred/mapred-default.xml
+index 18ac940..71a93dc 100644
+--- a/src/mapred/mapred-default.xml
++++ b/src/mapred/mapred-default.xml
+@@ -1223,4 +1223,18 @@
+ 
+ <!--  end of node health script variables -->
+ 
++<property>
++  <name>hadoop.relaxed.worker.version.check</name>
++  <value>true</value>
++  <description>
++    This option changes the behavior of tasktrackers to only check for
++    a version match (eg "0.20.2-cdh4b2") but ignore the other build
++    fields (revision, user, and source checksum) when checking for
++    compatibility with jobtrackers. In previous releases tasktrackers
++    refused to connect to jobtrackers if their build version (version,
++    revision, user, and source checksum) did not match. This behavior
++    can be restored by disabling this option.
++  </description>
++</property>
++
+ </configuration>
+diff --git a/src/mapred/org/apache/hadoop/mapred/InterTrackerProtocol.java b/src/mapred/org/apache/hadoop/mapred/InterTrackerProtocol.java
+index b7a0fba..5961d7c 100644
+--- a/src/mapred/org/apache/hadoop/mapred/InterTrackerProtocol.java
++++ b/src/mapred/org/apache/hadoop/mapred/InterTrackerProtocol.java
+@@ -74,8 +74,9 @@ interface InterTrackerProtocol extends VersionedProtocol {
+    * Version 30: Adding disk failure to TaskTrackerStatus for MAPREDUCE-3015
+    * Version 31: Efficient serialization format for Framework counters
+    *             (MAPREDUCE-901)
++   * Version 32: Adding version methods for HADOOP-8209
+    */
+-  public static final long versionID = 31L;
++  public static final long versionID = 32L;
+ 
+   public final static int TRACKERS_OK = 0;
+   public final static int UNKNOWN_TASKTRACKER = 1;
+@@ -146,9 +147,13 @@ interface InterTrackerProtocol extends VersionedProtocol {
+    */
+   public String getSystemDir();
+   
+-  
+   /**
+-   * Returns the buildVersion of the JobTracker 
++   * Returns the VersionInfo build version of the JobTracker 
+    */
+   public String getBuildVersion() throws IOException;
++
++  /**
++   * Returns the VersionInfo version of the JobTracker
++   */
++  public String getVIVersion() throws IOException;
+ }
+diff --git a/src/mapred/org/apache/hadoop/mapred/JobTracker.java b/src/mapred/org/apache/hadoop/mapred/JobTracker.java
+index ce1cac1..bb40de2 100644
+--- a/src/mapred/org/apache/hadoop/mapred/JobTracker.java
++++ b/src/mapred/org/apache/hadoop/mapred/JobTracker.java
+@@ -3126,8 +3126,13 @@ public class JobTracker implements MRConstants, JTProtocols, JobTrackerMXBean {
+   ////////////////////////////////////////////////////
+   // InterTrackerProtocol
+   ////////////////////////////////////////////////////
+-  
+-  public String getBuildVersion() throws IOException{
++
++  // Just returns the VersionInfo version (unlike MXBean#getVersion)
++  public String getVIVersion() throws IOException {
++    return VersionInfo.getVersion();
++  }
++
++  public String getBuildVersion() throws IOException {
+     return VersionInfo.getBuildVersion();
+   }
+ 
+diff --git a/src/mapred/org/apache/hadoop/mapred/TaskTracker.java b/src/mapred/org/apache/hadoop/mapred/TaskTracker.java
+index 10290e3..cb875f4 100644
+--- a/src/mapred/org/apache/hadoop/mapred/TaskTracker.java
++++ b/src/mapred/org/apache/hadoop/mapred/TaskTracker.java
+@@ -448,6 +448,11 @@ public class TaskTracker implements MRConstants, TaskUmbilicalProtocol,
+    */
+   private long diskHealthCheckInterval;
+ 
++  /**
++   * Whether the TT performs a full or relaxed version check with the JT.
++   */
++  private boolean relaxedVersionCheck;
++
+   /*
+    * A list of commitTaskActions for whom commit response has been received 
+    */
+@@ -1592,6 +1597,8 @@ public class TaskTracker implements MRConstants, TaskUmbilicalProtocol,
+    */
+   public TaskTracker(JobConf conf) throws IOException, InterruptedException {
+     originalConf = conf;
++    relaxedVersionCheck = conf.getBoolean(
++        "hadoop.relaxed.worker.version.check", true);
+     FILE_CACHE_SIZE = conf.getInt("mapred.tasktracker.file.cache.size", 2000);
+     maxMapSlots = conf.getInt(
+                   "mapred.tasktracker.map.tasks.maximum", 2);
+@@ -1726,6 +1733,31 @@ public class TaskTracker implements MRConstants, TaskUmbilicalProtocol,
+   }
+ 
+   /**
++   * @return true if this tasktracker is permitted to connect to
++   *    the given jobtracker version
++   */
++  boolean isPermittedVersion(String jtBuildVersion, String jtVersion) {
++    boolean buildVersionMatch =
++      jtBuildVersion.equals(VersionInfo.getBuildVersion());
++    boolean versionMatch = jtVersion.equals(VersionInfo.getVersion());
++    if (buildVersionMatch && !versionMatch) {
++      throw new AssertionError("Invalid build. The build versions match" +
++          " but the JT version is " + jtVersion +
++          " and the TT version is " + VersionInfo.getVersion());
++    }
++    if (relaxedVersionCheck) {
++      if (!buildVersionMatch && versionMatch) {
++        LOG.info("Permitting tasktracker revision " + VersionInfo.getRevision() +
++            " to connect to jobtracker " + jtBuildVersion + " because " +
++            " hadoop.relaxed.worker.version.check is enabled");
++      }
++      return versionMatch;
++    } else {
++      return buildVersionMatch;
++    }
++  }
++
++  /**
+    * Main service loop.  Will stay in this loop forever.
+    */
+   State offerService() throws Exception {
+@@ -1748,15 +1780,18 @@ public class TaskTracker implements MRConstants, TaskUmbilicalProtocol,
+         }
+ 
+         // If the TaskTracker is just starting up:
+-        // 1. Verify the buildVersion
++        // 1. Verify the versions matches with the JobTracker
+         // 2. Get the system directory & filesystem
+         if(justInited) {
+-          String jobTrackerBV = jobClient.getBuildVersion();
+-          if(!VersionInfo.getBuildVersion().equals(jobTrackerBV)) {
++          String jtBuildVersion = jobClient.getBuildVersion();
++          String jtVersion = jobClient.getVIVersion();
++          if (!isPermittedVersion(jtBuildVersion, jtVersion)) {
+             String msg = "Shutting down. Incompatible buildVersion." +
+-            "\nJobTracker's: " + jobTrackerBV + 
+-            "\nTaskTracker's: "+ VersionInfo.getBuildVersion();
+-            LOG.error(msg);
++              "\nJobTracker's: " + jtBuildVersion +
++              "\nTaskTracker's: "+ VersionInfo.getBuildVersion() +
++              " and hadoop.relaxed.worker.version.check is " +
++              (relaxedVersionCheck ? "enabled" : "not enabled");
++            LOG.fatal(msg);
+             try {
+               jobClient.reportTaskTrackerError(taskTrackerName, null, msg);
+             } catch(Exception e ) {
+diff --git a/src/test/org/apache/hadoop/mapred/TestTaskTrackerVersionCheck.java b/src/test/org/apache/hadoop/mapred/TestTaskTrackerVersionCheck.java
+new file mode 100644
+index 0000000..37487d5
+--- /dev/null
++++ b/src/test/org/apache/hadoop/mapred/TestTaskTrackerVersionCheck.java
+@@ -0,0 +1,90 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.mapred;
++
++import java.io.IOException;
++
++import org.apache.hadoop.util.VersionInfo;
++
++import org.junit.Test;
++import static org.junit.Assert.*;
++
++/**
++ * Test the version check the TT performs when connecting to the JT
++ */
++public class TestTaskTrackerVersionCheck {
++
++  /**
++   * Test the strict TT version checking
++   */
++  @Test
++  public void testDefaultVersionCheck() throws IOException {
++    MiniMRCluster mr = null;
++    try {
++      JobConf jtConf = new JobConf();
++      jtConf.setBoolean(
++          "hadoop.relaxed.worker.version.check", false);
++      mr = new MiniMRCluster(1, "file:///", 1, null, null, jtConf);
++      TaskTracker tt = mr.getTaskTrackerRunner(0).getTaskTracker();
++      String currBuildVersion = VersionInfo.getBuildVersion();
++      String currVersion = VersionInfo.getVersion();
++
++      assertTrue(tt.isPermittedVersion(currBuildVersion, currVersion));
++      assertFalse("We disallow different versions",
++          tt.isPermittedVersion(currBuildVersion+"x", currVersion+"x"));
++      assertFalse("We disallow different full versions with same version",
++          tt.isPermittedVersion(currBuildVersion+"x", currVersion));      
++      try {
++        tt.isPermittedVersion(currBuildVersion, currVersion+"x");
++        fail("Matched full version with mismatched version");
++      } catch (AssertionError ae) {
++        // Expected. The versions should always match if the full
++        // versions match as the full version contains the version.
++      }
++    } finally {
++      if (mr != null) {
++        mr.shutdown();
++      }
++    }
++  }
++
++  /**
++   * Test the "relaxed" TT version checking
++   */
++  @Test
++  public void testRelaxedVersionCheck() throws IOException {
++    MiniMRCluster mr = null;
++    try {
++      JobConf jtConf = new JobConf();
++      mr = new MiniMRCluster(1, "file:///", 1, null, null, jtConf);
++      TaskTracker tt = mr.getTaskTrackerRunner(0).getTaskTracker();
++      String currFullVersion = VersionInfo.getBuildVersion();
++      String currVersion = VersionInfo.getVersion();
++
++      assertTrue(tt.isPermittedVersion(currFullVersion, currVersion));
++      assertFalse("We dissallow different versions",
++          tt.isPermittedVersion(currFullVersion+"x", currVersion+"x"));
++      assertTrue("We allow different full versions with same version",
++          tt.isPermittedVersion(currFullVersion+"x", currVersion));
++    } finally {
++      if (mr != null) {
++        mr.shutdown();
++      }
++    }
++  }
++}
+-- 
+1.7.0.4
+

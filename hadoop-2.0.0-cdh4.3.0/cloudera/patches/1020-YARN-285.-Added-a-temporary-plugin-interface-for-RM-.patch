@@ -1,0 +1,260 @@
+From b539c17511f08753067a98dc55eb6a3656c4ec8d Mon Sep 17 00:00:00 2001
+From: Vinod Kumar Vavilapalli <vinodkv@apache.org>
+Date: Sat, 22 Dec 2012 00:26:29 +0000
+Subject: [PATCH 1020/1357] YARN-285. Added a temporary plugin interface for RM to be able to redirect to JobHistory server for apps that it no longer tracks. Contributed by Derek Dagit.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1425210 13f79535-47bb-0310-9956-ffa450edef68
+---
+ .../apache/hadoop/yarn/conf/YarnConfiguration.java |    3 +
+ .../apache/hadoop/yarn/util/TrackingUriPlugin.java |   46 ++++++++++++++++++++
+ .../hadoop/yarn/server/webproxy/ProxyUriUtils.java |   26 +++++++++++
+ .../yarn/server/webproxy/WebAppProxyServlet.java   |   30 ++++++++++++-
+ .../yarn/server/webproxy/TestProxyUriUtils.java    |   37 ++++++++++++++++
+ 5 files changed, 140 insertions(+), 2 deletions(-)
+ create mode 100644 hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/util/TrackingUriPlugin.java
+
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/conf/YarnConfiguration.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/conf/YarnConfiguration.java
+index 45c936f..b4f79d4 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/conf/YarnConfiguration.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/conf/YarnConfiguration.java
+@@ -392,6 +392,9 @@ public class YarnConfiguration extends Configuration {
+ 
+   public static final String YARN_LOG_SERVER_URL =
+     YARN_PREFIX + "log.server.url";
++  
++  public static final String YARN_TRACKING_URL_GENERATOR = 
++      YARN_PREFIX + "tracking.url.generator";
+ 
+   /** Amount of memory in GB that can be allocated for containers.*/
+   public static final String NM_PMEM_MB = NM_PREFIX + "resource.memory-mb";
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/util/TrackingUriPlugin.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/util/TrackingUriPlugin.java
+new file mode 100644
+index 0000000..c3def07
+--- /dev/null
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/util/TrackingUriPlugin.java
+@@ -0,0 +1,46 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.yarn.util;
++
++import java.net.URI;
++import java.net.URISyntaxException;
++
++import org.apache.hadoop.classification.InterfaceAudience;
++import org.apache.hadoop.classification.InterfaceStability;
++import org.apache.hadoop.conf.Configured;
++import org.apache.hadoop.yarn.api.records.ApplicationId;
++
++/**
++ * Plugin to derive a tracking URL from a Yarn Application ID
++ *
++ */
++@InterfaceAudience.LimitedPrivate({"MapReduce"})
++@InterfaceStability.Unstable
++public abstract class TrackingUriPlugin extends Configured {
++
++  /**
++   * Given an application ID, return a tracking URI.
++   * @param id the ID for which a URI is returned
++   * @return the tracking URI
++   * @throws URISyntaxException
++   */
++  public abstract URI getTrackingUri(ApplicationId id)
++      throws URISyntaxException;
++
++}
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-web-proxy/src/main/java/org/apache/hadoop/yarn/server/webproxy/ProxyUriUtils.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-web-proxy/src/main/java/org/apache/hadoop/yarn/server/webproxy/ProxyUriUtils.java
+index 7545fc0..aee2cc8 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-web-proxy/src/main/java/org/apache/hadoop/yarn/server/webproxy/ProxyUriUtils.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-web-proxy/src/main/java/org/apache/hadoop/yarn/server/webproxy/ProxyUriUtils.java
+@@ -24,11 +24,13 @@ import java.io.UnsupportedEncodingException;
+ import java.net.URI;
+ import java.net.URISyntaxException;
+ import java.net.URLEncoder;
++import java.util.List;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.http.HttpConfig;
+ import org.apache.hadoop.yarn.api.records.ApplicationId;
++import org.apache.hadoop.yarn.util.TrackingUriPlugin;
+ 
+ public class ProxyUriUtils {
+   @SuppressWarnings("unused")
+@@ -143,4 +145,28 @@ public class ProxyUriUtils {
+     throws URISyntaxException {
+       return new URI(HttpConfig.getSchemePrefix() + noSchemeUrl);
+   }
++
++  /**
++   * Returns the first valid tracking link, if any, from the given id from the
++   * given list of plug-ins, if any.
++   * 
++   * @param id the id of the application for which the tracking link is desired
++   * @param trackingUriPlugins list of plugins from which to get the tracking link
++   * @return the desired link if possible, otherwise null
++   * @throws URISyntaxException
++   */
++  public static URI getUriFromTrackingPlugins(ApplicationId id,
++      List<TrackingUriPlugin> trackingUriPlugins)
++      throws URISyntaxException {
++    URI toRet = null;
++    for(TrackingUriPlugin plugin : trackingUriPlugins)
++    {
++      toRet = plugin.getTrackingUri(id);
++      if (toRet != null)
++      {
++        return toRet;
++      }
++    }
++    return null;
++  }
+ }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-web-proxy/src/main/java/org/apache/hadoop/yarn/server/webproxy/WebAppProxyServlet.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-web-proxy/src/main/java/org/apache/hadoop/yarn/server/webproxy/WebAppProxyServlet.java
+index 93f6d0d..3e43351 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-web-proxy/src/main/java/org/apache/hadoop/yarn/server/webproxy/WebAppProxyServlet.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-web-proxy/src/main/java/org/apache/hadoop/yarn/server/webproxy/WebAppProxyServlet.java
+@@ -30,6 +30,7 @@ import java.util.Arrays;
+ import java.util.EnumSet;
+ import java.util.Enumeration;
+ import java.util.HashSet;
++import java.util.List;
+ 
+ import javax.servlet.http.Cookie;
+ import javax.servlet.http.HttpServlet;
+@@ -48,8 +49,10 @@ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.io.IOUtils;
+ import org.apache.hadoop.yarn.api.records.ApplicationId;
+ import org.apache.hadoop.yarn.api.records.ApplicationReport;
++import org.apache.hadoop.yarn.conf.YarnConfiguration;
+ import org.apache.hadoop.yarn.util.Apps;
+ import org.apache.hadoop.yarn.util.StringHelper;
++import org.apache.hadoop.yarn.util.TrackingUriPlugin;
+ import org.apache.hadoop.yarn.webapp.MimeType;
+ import org.apache.hadoop.yarn.webapp.hamlet.Hamlet;
+ 
+@@ -61,8 +64,9 @@ public class WebAppProxyServlet extends HttpServlet {
+         "Accept-Language", "Accept-Charset"));
+   
+   public static final String PROXY_USER_COOKIE_NAME = "proxy-user";
+-  
+-  
++
++  private final List<TrackingUriPlugin> trackingUriPlugins;
++
+   private static class _ implements Hamlet._ {
+     //Empty
+   }
+@@ -78,6 +82,18 @@ public class WebAppProxyServlet extends HttpServlet {
+   }
+ 
+   /**
++   * Default constructor
++   */
++  public WebAppProxyServlet()
++  {
++    super();
++    YarnConfiguration conf = new YarnConfiguration();
++    this.trackingUriPlugins =
++        conf.getInstances(YarnConfiguration.YARN_TRACKING_URL_GENERATOR,
++            TrackingUriPlugin.class);
++  }
++
++  /**
+    * Output 404 with appropriate message.
+    * @param resp the http response.
+    * @param message the message to include on the page.
+@@ -253,6 +269,16 @@ public class WebAppProxyServlet extends HttpServlet {
+       if(applicationReport == null) {
+         LOG.warn(req.getRemoteUser()+" Attempting to access "+id+
+             " that was not found");
++
++        URI toFetch =
++            ProxyUriUtils
++                .getUriFromTrackingPlugins(id, this.trackingUriPlugins);
++        if (toFetch != null)
++        {
++          resp.sendRedirect(resp.encodeRedirectURL(toFetch.toString()));
++          return;
++        }
++
+         notFound(resp, "Application "+appId+" could not be found, " +
+         		"please try the history server");
+         return;
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-web-proxy/src/test/java/org/apache/hadoop/yarn/server/webproxy/TestProxyUriUtils.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-web-proxy/src/test/java/org/apache/hadoop/yarn/server/webproxy/TestProxyUriUtils.java
+index 16ee7be..ef3c4a7 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-web-proxy/src/test/java/org/apache/hadoop/yarn/server/webproxy/TestProxyUriUtils.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-web-proxy/src/test/java/org/apache/hadoop/yarn/server/webproxy/TestProxyUriUtils.java
+@@ -21,11 +21,16 @@ package org.apache.hadoop.yarn.server.webproxy;
+ import static org.junit.Assert.*;
+ 
+ import java.net.URI;
++import java.net.URISyntaxException;
++import java.util.List;
+ 
+ import org.apache.hadoop.yarn.api.records.ApplicationId;
+ import org.apache.hadoop.yarn.util.BuilderUtils;
++import org.apache.hadoop.yarn.util.TrackingUriPlugin;
+ import org.junit.Test;
+ 
++import com.google.common.collect.Lists;
++
+ public class TestProxyUriUtils {
+   @Test
+   public void testGetPathApplicationId() {
+@@ -83,4 +88,36 @@ public class TestProxyUriUtils {
+     URI result = ProxyUriUtils.getProxyUri(originalUri, proxyUri, id);
+     assertEquals(expected, result);
+   }
++
++  @Test
++  public void testGetProxyUriFromPluginsReturnsNullIfNoPlugins()
++      throws URISyntaxException {
++    ApplicationId id = BuilderUtils.newApplicationId(6384623l, 5);
++    List<TrackingUriPlugin> list =
++        Lists.newArrayListWithExpectedSize(0);
++    assertNull(ProxyUriUtils.getUriFromTrackingPlugins(id, list));
++  }
++
++  @Test
++  public void testGetProxyUriFromPluginsReturnsValidUriWhenAble()
++      throws URISyntaxException {
++    ApplicationId id = BuilderUtils.newApplicationId(6384623l, 5);
++    List<TrackingUriPlugin> list =
++        Lists.newArrayListWithExpectedSize(2);
++    // Insert a plugin that returns null.
++    list.add(new TrackingUriPlugin() {
++      public URI getTrackingUri(ApplicationId id) throws URISyntaxException {
++        return null;
++      }
++    });
++    // Insert a plugin that returns a valid URI.
++    list.add(new TrackingUriPlugin() {
++      public URI getTrackingUri(ApplicationId id) throws URISyntaxException {
++        return new URI("http://history.server.net/");
++      }
++    });
++    URI result = ProxyUriUtils.getUriFromTrackingPlugins(id, list);
++    assertNotNull(result);
++    
++  }
+ }
+-- 
+1.7.0.4
+

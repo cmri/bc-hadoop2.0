@@ -1,0 +1,183 @@
+From 859c1e23219652b86fbaf753d2684f85eab23634 Mon Sep 17 00:00:00 2001
+From: Todd Lipcon <todd@apache.org>
+Date: Fri, 7 Dec 2012 08:17:38 +0000
+Subject: [PATCH 0634/1357] HDFS-4282. TestEditLog.testFuzzSequences FAILED in all pre-commit test. Contributed by Todd Lipcon.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/branch-2@1418212 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit a780374935f13bd7e597aba3b5562a3315edffbf)
+---
+ .../java/org/apache/hadoop/io/SequenceFile.java    |    4 +-
+ .../src/main/java/org/apache/hadoop/io/UTF8.java   |   34 ++++++++++++++++++--
+ .../test/java/org/apache/hadoop/io/TestUTF8.java   |   27 +++++++++++++--
+ .../hdfs/server/namenode/FSImageSerialization.java |    2 +-
+ 4 files changed, 57 insertions(+), 10 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/SequenceFile.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/SequenceFile.java
+index 8213a1b..2ed1121 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/SequenceFile.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/SequenceFile.java
+@@ -1813,10 +1813,10 @@ public class SequenceFile {
+         UTF8 className = new UTF8();
+ 
+         className.readFields(in);
+-        keyClassName = className.toString(); // key class name
++        keyClassName = className.toStringChecked(); // key class name
+ 
+         className.readFields(in);
+-        valClassName = className.toString(); // val class name
++        valClassName = className.toStringChecked(); // val class name
+       } else {
+         keyClassName = Text.readString(in);
+         valClassName = Text.readString(in);
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/UTF8.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/UTF8.java
+index 4a98465..dc965cf 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/UTF8.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/UTF8.java
+@@ -21,6 +21,7 @@ package org.apache.hadoop.io;
+ import java.io.IOException;
+ import java.io.DataInput;
+ import java.io.DataOutput;
++import java.io.UTFDataFormatException;
+ 
+ import org.apache.hadoop.util.StringUtils;
+ 
+@@ -153,6 +154,21 @@ public class UTF8 implements WritableComparable<UTF8> {
+     }
+     return buffer.toString();
+   }
++  
++  /**
++   * Convert to a string, checking for valid UTF8.
++   * @return the converted string
++   * @throws UTFDataFormatException if the underlying bytes contain invalid
++   * UTF8 data.
++   */
++  public String toStringChecked() throws IOException {
++    StringBuilder buffer = new StringBuilder(length);
++    synchronized (IBUF) {
++      IBUF.reset(bytes, length);
++      readChars(IBUF, buffer, length);
++    }
++    return buffer.toString();
++  }
+ 
+   /** Returns true iff <code>o</code> is a UTF8 with the same contents.  */
+   @Override
+@@ -236,7 +252,7 @@ public class UTF8 implements WritableComparable<UTF8> {
+   }
+ 
+   private static void readChars(DataInput in, StringBuilder buffer, int nBytes)
+-    throws IOException {
++    throws UTFDataFormatException, IOException {
+     DataOutputBuffer obuf = OBUF_FACTORY.get();
+     obuf.reset();
+     obuf.write(in, nBytes);
+@@ -248,15 +264,27 @@ public class UTF8 implements WritableComparable<UTF8> {
+         // 0b0xxxxxxx: 1-byte sequence
+         buffer.append((char)(b & 0x7F));
+       } else if ((b & 0xE0) == 0xC0) {
++        if (i >= nBytes) {
++          throw new UTFDataFormatException("Truncated UTF8 at " +
++              StringUtils.byteToHexString(bytes, i - 1, 1));
++        }
+         // 0b110xxxxx: 2-byte sequence
+         buffer.append((char)(((b & 0x1F) << 6)
+             | (bytes[i++] & 0x3F)));
+       } else if ((b & 0xF0) == 0xE0) {
+         // 0b1110xxxx: 3-byte sequence
++        if (i + 1 >= nBytes) {
++          throw new UTFDataFormatException("Truncated UTF8 at " +
++              StringUtils.byteToHexString(bytes, i - 1, 2));
++        }
+         buffer.append((char)(((b & 0x0F) << 12)
+             | ((bytes[i++] & 0x3F) << 6)
+             |  (bytes[i++] & 0x3F)));
+       } else if ((b & 0xF8) == 0xF0) {
++        if (i + 2 >= nBytes) {
++          throw new UTFDataFormatException("Truncated UTF8 at " +
++              StringUtils.byteToHexString(bytes, i - 1, 3));
++        }
+         // 0b11110xxx: 4-byte sequence
+         int codepoint =
+             ((b & 0x07) << 18)
+@@ -272,8 +300,8 @@ public class UTF8 implements WritableComparable<UTF8> {
+         // Only show the next 6 bytes max in the error code - in case the
+         // buffer is large, this will prevent an exceedingly large message.
+         int endForError = Math.min(i + 5, nBytes);
+-        throw new IOException("Invalid UTF8 at " +
+-          StringUtils.byteToHexString(bytes, i - 1, endForError));
++        throw new UTFDataFormatException("Invalid UTF8 at " +
++            StringUtils.byteToHexString(bytes, i - 1, endForError));
+       }
+     }
+   }
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/TestUTF8.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/TestUTF8.java
+index 902f215..b387224 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/TestUTF8.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/TestUTF8.java
+@@ -20,6 +20,7 @@ package org.apache.hadoop.io;
+ 
+ import junit.framework.TestCase;
+ import java.io.IOException;
++import java.io.UTFDataFormatException;
+ import java.util.Random;
+ 
+ import org.apache.hadoop.test.GenericTestUtils;
+@@ -126,9 +127,9 @@ public class TestUTF8 extends TestCase {
+     try {
+       UTF8.fromBytes(invalid);
+       fail("did not throw an exception");
+-    } catch (IOException ioe) {
++    } catch (UTFDataFormatException utfde) {
+       GenericTestUtils.assertExceptionContains(
+-          "Invalid UTF8 at ffff01020304", ioe);
++          "Invalid UTF8 at ffff01020304", utfde);
+     }
+   }
+ 
+@@ -142,9 +143,27 @@ public class TestUTF8 extends TestCase {
+     try {
+       UTF8.fromBytes(invalid);
+       fail("did not throw an exception");
+-    } catch (IOException ioe) {
++    } catch (UTFDataFormatException utfde) {
+       GenericTestUtils.assertExceptionContains(
+-          "Invalid UTF8 at f88880808004", ioe);
++          "Invalid UTF8 at f88880808004", utfde);
++    }
++  }
++  
++  /**
++   * Test that decoding invalid UTF8 due to truncation yields the correct
++   * exception type.
++   */
++  public void testInvalidUTF8Truncated() throws Exception {
++    // Truncated CAT FACE character -- this is a 4-byte sequence, but we
++    // only have the first three bytes.
++    byte[] truncated = new byte[] {
++        (byte)0xF0, (byte)0x9F, (byte)0x90 };
++    try {
++      UTF8.fromBytes(truncated);
++      fail("did not throw an exception");
++    } catch (UTFDataFormatException utfde) {
++      GenericTestUtils.assertExceptionContains(
++          "Truncated UTF8 at f09f90", utfde);
+     }
+   }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImageSerialization.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImageSerialization.java
+index 897e02c..dccc8f8 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImageSerialization.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImageSerialization.java
+@@ -198,7 +198,7 @@ public class FSImageSerialization {
+   public static String readString(DataInputStream in) throws IOException {
+     DeprecatedUTF8 ustr = TL_DATA.get().U_STR;
+     ustr.readFields(in);
+-    return ustr.toString();
++    return ustr.toStringChecked();
+   }
+ 
+   static String readString_EmptyAsNull(DataInputStream in) throws IOException {
+-- 
+1.7.0.4
+

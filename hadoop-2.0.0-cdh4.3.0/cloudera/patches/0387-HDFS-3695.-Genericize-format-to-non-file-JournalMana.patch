@@ -1,0 +1,660 @@
+From d5d0d868a21872407df4e342ebd508c4c0516aa1 Mon Sep 17 00:00:00 2001
+From: Todd Lipcon <todd@cloudera.com>
+Date: Wed, 15 Aug 2012 17:34:09 -0700
+Subject: [PATCH 0387/1357] HDFS-3695. Genericize format() to non-file JournalManagers. Contributed by Todd Lipcon.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1371513 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit ad77008c6b833dd539cf579da90b4f4dfe2a3e2e)
+
+Conflicts:
+
+	hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+(cherry picked from commit e625253152ae8719bb2acf9ca034f5b4f587831c)
+---
+ .../bkjournal/BookKeeperJournalManager.java        |   17 ++++
+ .../apache/hadoop/hdfs/server/common/Storage.java  |   91 +++++++++++++++++++-
+ .../hdfs/server/namenode/BackupJournalManager.java |   15 +++
+ .../hadoop/hdfs/server/namenode/FSEditLog.java     |   34 +++++++
+ .../hadoop/hdfs/server/namenode/FSImage.java       |   25 ++++++
+ .../hdfs/server/namenode/FileJournalManager.java   |   17 ++++
+ .../hdfs/server/namenode/JournalManager.java       |   11 ++-
+ .../hadoop/hdfs/server/namenode/JournalSet.java    |   15 +++
+ .../hadoop/hdfs/server/namenode/NNStorage.java     |    2 -
+ .../hadoop/hdfs/server/namenode/NameNode.java      |   83 +++++-------------
+ .../hdfs/server/namenode/ha/BootstrapStandby.java  |   15 ++--
+ .../server/namenode/TestGenericJournalConf.java    |   16 ++++
+ 12 files changed, 268 insertions(+), 73 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/bkjournal/src/main/java/org/apache/hadoop/contrib/bkjournal/BookKeeperJournalManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/bkjournal/src/main/java/org/apache/hadoop/contrib/bkjournal/BookKeeperJournalManager.java
+index 6d83c96..8636fb7 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/bkjournal/src/main/java/org/apache/hadoop/contrib/bkjournal/BookKeeperJournalManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/bkjournal/src/main/java/org/apache/hadoop/contrib/bkjournal/BookKeeperJournalManager.java
+@@ -271,6 +271,23 @@ public class BookKeeperJournalManager implements JournalManager {
+     }
+   }
+ 
++  @Override
++  public void format(NamespaceInfo ns) {
++    // Currently, BKJM automatically formats itself when first accessed.
++    // TODO: change over to explicit formatting so that the admin can
++    // clear out the BK storage when reformatting a cluster.
++    LOG.info("Not formatting " + this + " - BKJM does not currently " +
++        "support reformatting. If it has not been used before, it will" +
++        "be formatted automatically upon first use.");
++  }
++  
++  @Override
++  public boolean hasSomeData() throws IOException {
++    // Don't confirm format on BKJM, since format() is currently a
++    // no-op anyway
++    return false;
++  }
++
+   /**
+    * Start a new log segment in a BookKeeper ledger.
+    * First ensure that we have the write lock for this journal.
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/common/Storage.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/common/Storage.java
+index 70692d1..6150c1a 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/common/Storage.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/common/Storage.java
+@@ -39,6 +39,7 @@ import org.apache.hadoop.hdfs.protocol.LayoutVersion.Feature;
+ import org.apache.hadoop.hdfs.server.common.HdfsServerConstants.NodeType;
+ import org.apache.hadoop.hdfs.server.common.HdfsServerConstants.StartupOption;
+ import org.apache.hadoop.fs.FileUtil;
++import org.apache.hadoop.util.ToolRunner;
+ import org.apache.hadoop.util.VersionInfo;
+ 
+ import com.google.common.base.Preconditions;
+@@ -221,7 +222,7 @@ public abstract class Storage extends StorageInfo {
+    * One of the storage directories.
+    */
+   @InterfaceAudience.Private
+-  public static class StorageDirectory {
++  public static class StorageDirectory implements FormatConfirmable {
+     final File root;              // root directory
+     final boolean useLock;        // flag to enable storage lock
+     final StorageDirType dirType; // storage dir type
+@@ -576,6 +577,32 @@ public abstract class Storage extends StorageInfo {
+         throw new IOException("Unexpected FS state: " + curState);
+       }
+     }
++    
++    /**
++     * @return true if the storage directory should prompt the user prior
++     * to formatting (i.e if the directory appears to contain some data)
++     * @throws IOException if the SD cannot be accessed due to an IO error
++     */
++    @Override
++    public boolean hasSomeData() throws IOException {
++      // Its alright for a dir not to exist, or to exist (properly accessible)
++      // and be completely empty.
++      if (!root.exists()) return false;
++      
++      if (!root.isDirectory()) {
++        // a file where you expect a directory should not cause silent
++        // formatting
++        return true;
++      }
++      
++      if (FileUtil.listFiles(root).length == 0) {
++        // Empty dir can format without prompt.
++        return false;
++      }
++      
++      return true;
++    }
++
+ 
+     /**
+      * Lock storage to provide exclusive access.
+@@ -779,6 +806,68 @@ public abstract class Storage extends StorageInfo {
+   }
+   
+   /**
++   * Iterate over each of the {@link FormatConfirmable} objects,
++   * potentially checking with the user whether it should be formatted.
++   * 
++   * If running in interactive mode, will prompt the user for each
++   * directory to allow them to format anyway. Otherwise, returns
++   * false, unless 'force' is specified.
++   * 
++   * @param force format regardless of whether dirs exist
++   * @param interactive prompt the user when a dir exists
++   * @return true if formatting should proceed
++   * @throws IOException if some storage cannot be accessed
++   */
++  public static boolean confirmFormat(
++      Iterable<? extends FormatConfirmable> items,
++      boolean force, boolean interactive) throws IOException {
++    for (FormatConfirmable item : items) {
++      if (!item.hasSomeData())
++        continue;
++      if (force) { // Don't confirm, always format.
++        System.err.println(
++            "Data exists in " + item + ". Formatting anyway.");
++        continue;
++      }
++      if (!interactive) { // Don't ask - always don't format
++        System.err.println(
++            "Running in non-interactive mode, and data appears to exist in " +
++            item + ". Not formatting.");
++        return false;
++      }
++      if (!ToolRunner.confirmPrompt("Re-format filesystem in " + item + " ?")) {
++        System.err.println("Format aborted in " + item);
++        return false;
++      }
++    }
++    
++    return true;
++  }
++  
++  /**
++   * Interface for classes which need to have the user confirm their
++   * formatting during NameNode -format and other similar operations.
++   * 
++   * This is currently a storage directory or journal manager.
++   */
++  @InterfaceAudience.Private
++  public interface FormatConfirmable {
++    /**
++     * @return true if the storage seems to have some valid data in it,
++     * and the user should be required to confirm the format. Otherwise,
++     * false.
++     * @throws IOException if the storage cannot be accessed at all.
++     */
++    public boolean hasSomeData() throws IOException;
++    
++    /**
++     * @return a string representation of the formattable item, suitable
++     * for display to the user inside a prompt
++     */
++    public String toString();
++  }
++  
++  /**
+    * Get common storage fields.
+    * Should be overloaded if additional fields need to be get.
+    * 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/BackupJournalManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/BackupJournalManager.java
+index e15ad67..8d7720e 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/BackupJournalManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/BackupJournalManager.java
+@@ -21,6 +21,7 @@ import java.io.IOException;
+ import java.util.Collection;
+ 
+ import org.apache.hadoop.hdfs.server.protocol.NamenodeRegistration;
++import org.apache.hadoop.hdfs.server.protocol.NamespaceInfo;
+ 
+ /**
+  * A JournalManager implementation that uses RPCs to log transactions
+@@ -38,6 +39,20 @@ class BackupJournalManager implements JournalManager {
+   }
+ 
+   @Override
++  public void format(NamespaceInfo nsInfo) {
++    // format() should only get called at startup, before any BNs
++    // can register with the NN.
++    throw new UnsupportedOperationException(
++        "BackupNode journal should never get formatted");
++  }
++  
++  @Override
++  public boolean hasSomeData() {
++    throw new UnsupportedOperationException();
++  }
++
++  
++  @Override
+   public EditLogOutputStream startLogSegment(long txId) throws IOException {
+     EditLogBackupOutputStream stm = new EditLogBackupOutputStream(bnReg, nnReg);
+     stm.startLogSegment(txId);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLog.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLog.java
+index a92b327..aeeec5d 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLog.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLog.java
+@@ -40,6 +40,7 @@ import org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenIdentifie
+ import static org.apache.hadoop.util.ExitUtil.terminate;
+ 
+ import org.apache.hadoop.hdfs.server.common.HdfsServerConstants.NamenodeRole;
++import org.apache.hadoop.hdfs.server.common.Storage.FormatConfirmable;
+ import org.apache.hadoop.hdfs.server.common.Storage.StorageDirectory;
+ import org.apache.hadoop.hdfs.server.namenode.FSEditLogOp.*;
+ import org.apache.hadoop.hdfs.server.namenode.JournalSet.JournalAndStream;
+@@ -313,6 +314,39 @@ public class FSEditLog  {
+     state = State.CLOSED;
+   }
+ 
++
++  /**
++   * Format all configured journals which are not file-based.
++   * 
++   * File-based journals are skipped, since they are formatted by the
++   * Storage format code.
++   */
++  void formatNonFileJournals(NamespaceInfo nsInfo) throws IOException {
++    Preconditions.checkState(state == State.BETWEEN_LOG_SEGMENTS,
++        "Bad state: %s", state);
++    
++    for (JournalManager jm : journalSet.getJournalManagers()) {
++      if (!(jm instanceof FileJournalManager)) {
++        jm.format(nsInfo);
++      }
++    }
++  }
++  
++  List<FormatConfirmable> getFormatConfirmables() {
++    Preconditions.checkState(state == State.BETWEEN_LOG_SEGMENTS,
++        "Bad state: %s", state);
++
++    List<FormatConfirmable> ret = Lists.newArrayList();
++    for (final JournalManager jm : journalSet.getJournalManagers()) {
++      // The FJMs are confirmed separately since they are also
++      // StorageDirectories
++      if (!(jm instanceof FileJournalManager)) {
++        ret.add(jm);
++      }
++    }
++    return ret;
++  }
++
+   /**
+    * Write an operation to the edit log. Do not sync to persistent
+    * store yet.
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java
+index 97287e8..864c0f3 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java
+@@ -40,10 +40,12 @@ import org.apache.hadoop.hdfs.protocol.LayoutVersion;
+ import org.apache.hadoop.hdfs.protocol.LayoutVersion.Feature;
+ import org.apache.hadoop.hdfs.server.common.InconsistentFSStateException;
+ import org.apache.hadoop.hdfs.server.common.Storage;
++import org.apache.hadoop.hdfs.server.common.Storage.FormatConfirmable;
+ import org.apache.hadoop.hdfs.server.common.Storage.StorageDirectory;
+ import org.apache.hadoop.hdfs.server.common.Storage.StorageState;
+ import org.apache.hadoop.hdfs.server.common.Util;
+ import static org.apache.hadoop.util.Time.now;
++
+ import org.apache.hadoop.hdfs.server.common.HdfsServerConstants.NamenodeRole;
+ import org.apache.hadoop.hdfs.server.common.HdfsServerConstants.StartupOption;
+ 
+@@ -139,11 +141,34 @@ public class FSImage implements Closeable {
+         fileCount + " files");
+     NamespaceInfo ns = NNStorage.newNamespaceInfo();
+     ns.clusterID = clusterId;
++    
+     storage.format(ns);
++    editLog.formatNonFileJournals(ns);
+     saveFSImageInAllDirs(fsn, 0);
+   }
+   
+   /**
++   * Check whether the storage directories and non-file journals exist.
++   * If running in interactive mode, will prompt the user for each
++   * directory to allow them to format anyway. Otherwise, returns
++   * false, unless 'force' is specified.
++   * 
++   * @param force format regardless of whether dirs exist
++   * @param interactive prompt the user when a dir exists
++   * @return true if formatting should proceed
++   * @throws IOException if some storage cannot be accessed
++   */
++  boolean confirmFormat(boolean force, boolean interactive) throws IOException {
++    List<FormatConfirmable> confirms = Lists.newArrayList();
++    for (StorageDirectory sd : storage.dirIterable(null)) {
++      confirms.add(sd);
++    }
++    
++    confirms.addAll(editLog.getFormatConfirmables());
++    return Storage.confirmFormat(confirms, force, interactive);
++  }
++  
++  /**
+    * Analyze storage directories.
+    * Recover from previous transitions if required. 
+    * Perform fs state transition if necessary depending on the namespace info.
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FileJournalManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FileJournalManager.java
+index bac1f7f..4484f86 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FileJournalManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FileJournalManager.java
+@@ -37,6 +37,7 @@ import org.apache.hadoop.hdfs.server.common.StorageErrorReporter;
+ import org.apache.hadoop.hdfs.server.namenode.NNStorageRetentionManager.StoragePurger;
+ import org.apache.hadoop.hdfs.server.namenode.FSEditLogLoader.EditLogValidation;
+ import org.apache.hadoop.hdfs.server.namenode.NNStorage.NameNodeFile;
++import org.apache.hadoop.hdfs.server.protocol.NamespaceInfo;
+ import org.apache.hadoop.hdfs.server.protocol.RemoteEditLog;
+ 
+ import com.google.common.annotations.VisibleForTesting;
+@@ -81,6 +82,22 @@ public class FileJournalManager implements JournalManager {
+   public void close() throws IOException {}
+   
+   @Override
++  public void format(NamespaceInfo ns) {
++    // Formatting file journals is done by the StorageDirectory
++    // format code, since they may share their directory with
++    // checkpoints, etc.
++    throw new UnsupportedOperationException();
++  }
++  
++  @Override
++  public boolean hasSomeData() {
++    // Formatting file journals is done by the StorageDirectory
++    // format code, since they may share their directory with
++    // checkpoints, etc.
++    throw new UnsupportedOperationException();
++  }
++
++  @Override
+   synchronized public EditLogOutputStream startLogSegment(long txid) 
+       throws IOException {
+     try {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/JournalManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/JournalManager.java
+index 58c611f..6fe5aad 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/JournalManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/JournalManager.java
+@@ -23,6 +23,8 @@ import java.util.Collection;
+ 
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.classification.InterfaceStability;
++import org.apache.hadoop.hdfs.server.common.Storage.FormatConfirmable;
++import org.apache.hadoop.hdfs.server.protocol.NamespaceInfo;
+ 
+ /**
+  * A JournalManager is responsible for managing a single place of storing
+@@ -33,7 +35,14 @@ import org.apache.hadoop.classification.InterfaceStability;
+  */
+ @InterfaceAudience.Private
+ @InterfaceStability.Evolving
+-public interface JournalManager extends Closeable {
++public interface JournalManager extends Closeable, FormatConfirmable {
++
++  /**
++   * Format the underlying storage, removing any previously
++   * stored data.
++   */
++  void format(NamespaceInfo ns);
++
+   /**
+    * Begin writing to a new segment of the log stream, which starts at
+    * the given transaction ID.
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/JournalSet.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/JournalSet.java
+index 2e0f0d8..e29e9f1 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/JournalSet.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/JournalSet.java
+@@ -34,6 +34,7 @@ import org.apache.hadoop.classification.InterfaceAudience;
+ 
+ import static org.apache.hadoop.util.ExitUtil.terminate;
+ 
++import org.apache.hadoop.hdfs.server.protocol.NamespaceInfo;
+ import org.apache.hadoop.hdfs.server.protocol.RemoteEditLog;
+ import org.apache.hadoop.hdfs.server.protocol.RemoteEditLogManifest;
+ 
+@@ -173,6 +174,20 @@ public class JournalSet implements JournalManager {
+   }
+   
+   @Override
++  public void format(NamespaceInfo nsInfo) {
++    // The iteration is done by FSEditLog itself
++    throw new UnsupportedOperationException();
++  }
++
++  @Override
++  public boolean hasSomeData() throws IOException {
++    // This is called individually on the underlying journals,
++    // not on the JournalSet.
++    throw new UnsupportedOperationException();
++  }
++
++  
++  @Override
+   public EditLogOutputStream startLogSegment(final long txId) throws IOException {
+     mapJournalsAndReportErrors(new JournalClosure() {
+       @Override
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NNStorage.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NNStorage.java
+index 4d57582..2a49987 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NNStorage.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NNStorage.java
+@@ -28,7 +28,6 @@ import java.util.Collection;
+ import java.util.HashMap;
+ import java.util.Iterator;
+ import java.util.List;
+-import java.util.Map;
+ import java.util.Properties;
+ import java.util.UUID;
+ import java.util.concurrent.CopyOnWriteArrayList;
+@@ -58,7 +57,6 @@ import org.apache.hadoop.util.Time;
+ import com.google.common.base.Preconditions;
+ import com.google.common.annotations.VisibleForTesting;
+ import com.google.common.collect.Lists;
+-import com.google.common.collect.Maps;
+ 
+ /**
+  * NNStorage is responsible for management of the StorageDirectories used by
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNode.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNode.java
+index a2e7b81..6f30c1c 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNode.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNode.java
+@@ -67,6 +67,7 @@ import org.apache.hadoop.hdfs.server.protocol.JournalProtocol;
+ import org.apache.hadoop.hdfs.server.protocol.NamenodeProtocol;
+ import org.apache.hadoop.hdfs.server.protocol.NamenodeProtocols;
+ import org.apache.hadoop.hdfs.server.protocol.NamenodeRegistration;
++import org.apache.hadoop.hdfs.server.protocol.NamespaceInfo;
+ import org.apache.hadoop.hdfs.util.AtomicFileOutputStream;
+ import org.apache.hadoop.io.IOUtils;
+ import org.apache.hadoop.ipc.Server;
+@@ -706,9 +707,6 @@ public class NameNode {
+     dirsToPrompt.addAll(sharedDirs);
+     List<URI> editDirsToFormat = 
+                  FSNamesystem.getNamespaceEditsDirs(conf);
+-    if (!confirmFormat(dirsToPrompt, force, isInteractive)) {
+-      return true; // aborted
+-    }
+ 
+     // if clusterID is not provided - see if you can find the current one
+     String clusterId = StartupOption.FORMAT.getClusterId();
+@@ -720,62 +718,16 @@ public class NameNode {
+     
+     FSImage fsImage = new FSImage(conf, nameDirsToFormat, editDirsToFormat);
+     FSNamesystem fsn = new FSNamesystem(conf, fsImage);
++    fsImage.getEditLog().initJournalsForWrite();
++    
++    if (!fsImage.confirmFormat(force, isInteractive)) {
++      return true; // aborted
++    }
++    
+     fsImage.format(fsn, clusterId);
+     return false;
+   }
+ 
+-  /**
+-   * Check whether the given storage directories already exist.
+-   * If running in interactive mode, will prompt the user for each
+-   * directory to allow them to format anyway. Otherwise, returns
+-   * false, unless 'force' is specified.
+-   * 
+-   * @param dirsToFormat the dirs to check
+-   * @param force format regardless of whether dirs exist
+-   * @param interactive prompt the user when a dir exists
+-   * @return true if formatting should proceed
+-   * @throws IOException
+-   */
+-  public static boolean confirmFormat(Collection<URI> dirsToFormat,
+-      boolean force, boolean interactive)
+-      throws IOException {
+-    for(Iterator<URI> it = dirsToFormat.iterator(); it.hasNext();) {
+-      URI dirUri = it.next();
+-      if (!dirUri.getScheme().equals(NNStorage.LOCAL_URI_SCHEME)) {
+-        System.err.println("Skipping format for directory \"" + dirUri
+-            + "\". Can only format local directories with scheme \""
+-            + NNStorage.LOCAL_URI_SCHEME + "\".");
+-        continue;
+-      }
+-      // To validate only file based schemes are formatted
+-      assert dirUri.getScheme().equals(NNStorage.LOCAL_URI_SCHEME) :
+-        "formatting is not supported for " + dirUri;
+-
+-      File curDir = new File(dirUri.getPath());
+-      // Its alright for a dir not to exist, or to exist (properly accessible)
+-      // and be completely empty.
+-      if (!curDir.exists() ||
+-          (curDir.isDirectory() && FileUtil.listFiles(curDir).length == 0))
+-        continue;
+-      if (force) { // Don't confirm, always format.
+-        System.err.println(
+-            "Storage directory exists in " + curDir + ". Formatting anyway.");
+-        continue;
+-      }
+-      if (!interactive) { // Don't ask - always don't format
+-        System.err.println(
+-            "Running in non-interactive mode, and image appears to exist in " +
+-            curDir + ". Not formatting.");
+-        return false;
+-      }
+-      if (!confirmPrompt("Re-format filesystem in " + curDir + " ?")) {
+-        System.err.println("Format aborted in " + curDir);
+-        return false;
+-      }
+-    }
+-    return true;
+-  }
+-
+   public static void checkAllowFormat(Configuration conf) throws IOException {
+     if (!conf.getBoolean(DFS_NAMENODE_SUPPORT_ALLOW_FORMAT_KEY, 
+         DFS_NAMENODE_SUPPORT_ALLOW_FORMAT_DEFAULT)) {
+@@ -819,17 +771,26 @@ public class NameNode {
+           FSNamesystem.getNamespaceEditsDirs(conf, false));
+       
+       existingStorage = fsns.getFSImage().getStorage();
++      NamespaceInfo nsInfo = existingStorage.getNamespaceInfo();
+       
+-      Collection<URI> sharedEditsDirs = FSNamesystem.getSharedEditsDirs(conf);
+-      if (!confirmFormat(sharedEditsDirs, force, interactive)) {
+-        return true; // aborted
+-      }
+-      NNStorage newSharedStorage = new NNStorage(conf,
++      List<URI> sharedEditsDirs = FSNamesystem.getSharedEditsDirs(conf);
++      
++      FSImage sharedEditsImage = new FSImage(conf,
+           Lists.<URI>newArrayList(),
+           sharedEditsDirs);
++      sharedEditsImage.getEditLog().initJournalsForWrite();
+       
+-      newSharedStorage.format(existingStorage.getNamespaceInfo());
++      if (!sharedEditsImage.confirmFormat(force, interactive)) {
++        return true; // abort
++      }
+       
++      NNStorage newSharedStorage = sharedEditsImage.getStorage();
++      // Call Storage.format instead of FSImage.format here, since we don't
++      // actually want to save a checkpoint - just prime the dirs with
++      // the existing namespace info
++      newSharedStorage.format(nsInfo);
++      sharedEditsImage.getEditLog().formatNonFileJournals(nsInfo);
++
+       // Need to make sure the edit log segments are in good shape to initialize
+       // the shared edits dir.
+       fsns.getFSImage().getEditLog().close();
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/BootstrapStandby.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/BootstrapStandby.java
+index 0ee7f00..b9f11cf 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/BootstrapStandby.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/BootstrapStandby.java
+@@ -37,6 +37,7 @@ import org.apache.hadoop.hdfs.DFSUtil;
+ import org.apache.hadoop.hdfs.HAUtil;
+ import org.apache.hadoop.hdfs.NameNodeProxies;
+ import org.apache.hadoop.hdfs.protocol.HdfsConstants;
++import org.apache.hadoop.hdfs.server.common.Storage;
+ import org.apache.hadoop.hdfs.server.namenode.EditLogInputStream;
+ import org.apache.hadoop.hdfs.server.namenode.FSImage;
+ import org.apache.hadoop.hdfs.server.namenode.FSNamesystem;
+@@ -55,7 +56,6 @@ import org.apache.hadoop.util.ToolRunner;
+ 
+ import com.google.common.base.Joiner;
+ import com.google.common.base.Preconditions;
+-import com.google.common.collect.Sets;
+ 
+ /**
+  * Tool which allows the standby node's storage directories to be bootstrapped
+@@ -171,19 +171,18 @@ public class BootstrapStandby implements Tool, Configurable {
+         "           Layout version: " + nsInfo.getLayoutVersion() + "\n" +
+         "=====================================================");
+ 
++    long imageTxId = proxy.getMostRecentCheckpointTxId();
++    long curTxId = proxy.getTransactionID();
++    
++    NNStorage storage = new NNStorage(conf, dirsToFormat, editUrisToFormat);
++    
+     // Check with the user before blowing away data.
+-    if (!NameNode.confirmFormat(
+-            Sets.union(Sets.newHashSet(dirsToFormat),
+-                Sets.newHashSet(editUrisToFormat)),
++    if (!Storage.confirmFormat(storage.dirIterable(null),
+             force, interactive)) {
+       return ERR_CODE_ALREADY_FORMATTED;
+     }
+     
+-    long imageTxId = proxy.getMostRecentCheckpointTxId();
+-    long curTxId = proxy.getTransactionID();
+-    
+     // Format the storage (writes VERSION file)
+-    NNStorage storage = new NNStorage(conf, dirsToFormat, editUrisToFormat);
+     storage.format(nsInfo);
+ 
+     // Load the newly formatted image, using all of the directories (including shared
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestGenericJournalConf.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestGenericJournalConf.java
+index c05c5f3..6096946 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestGenericJournalConf.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestGenericJournalConf.java
+@@ -27,6 +27,7 @@ import java.util.Collection;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hdfs.DFSConfigKeys;
+ import org.apache.hadoop.hdfs.MiniDFSCluster;
++import org.apache.hadoop.hdfs.server.common.Storage.FormatConfirmable;
+ import org.apache.hadoop.hdfs.server.protocol.NamespaceInfo;
+ import org.junit.Test;
+ 
+@@ -123,6 +124,8 @@ public class TestGenericJournalConf {
+       cluster = new MiniDFSCluster.Builder(conf).numDataNodes(0).build();
+       cluster.waitActive();
+       
++      assertTrue(DummyJournalManager.shouldPromptCalled);
++      assertTrue(DummyJournalManager.formatCalled);
+       assertNotNull(DummyJournalManager.conf);
+       assertEquals(new URI(DUMMY_URI), DummyJournalManager.uri);
+       assertNotNull(DummyJournalManager.nsInfo);
+@@ -139,6 +142,8 @@ public class TestGenericJournalConf {
+     static Configuration conf = null;
+     static URI uri = null;
+     static NamespaceInfo nsInfo = null;
++    static boolean formatCalled = false;
++    static boolean shouldPromptCalled = false;
+     
+     public DummyJournalManager(Configuration conf, URI u,
+         NamespaceInfo nsInfo) {
+@@ -149,6 +154,11 @@ public class TestGenericJournalConf {
+     }
+     
+     @Override
++    public void format(NamespaceInfo nsInfo) {
++      formatCalled = true;
++    }
++    
++    @Override
+     public EditLogOutputStream startLogSegment(long txId) throws IOException {
+       return mock(EditLogOutputStream.class);
+     }
+@@ -176,6 +186,12 @@ public class TestGenericJournalConf {
+ 
+     @Override
+     public void close() throws IOException {}
++
++    @Override
++    public boolean hasSomeData() throws IOException {
++      shouldPromptCalled = true;
++      return false;
++    }
+   }
+ 
+   public static class BadConstructorJournalManager extends DummyJournalManager {
+-- 
+1.7.0.4
+

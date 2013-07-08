@@ -1,0 +1,474 @@
+From 9ede69bae783559d68f16ec78d504a1ae46541d5 Mon Sep 17 00:00:00 2001
+From: Suresh Srinivas <suresh@apache.org>
+Date: Wed, 13 Mar 2013 16:45:31 +0000
+Subject: [PATCH 0989/1357] HDFS-4595. When short circuit read is fails, DFSClient does not fallback to regular reads. Contributed by Suresh Srinivas.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1456047 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 25c23bd8da96f6fed3eaa3a97d38f1759587d7b9)
+
+Conflicts:
+
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/BlockReaderLocal.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClient.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSInputStream.java
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestShortCircuitLocalRead.java
+---
+ .../org/apache/hadoop/hdfs/BlockReaderFactory.java |   10 +-
+ .../apache/hadoop/hdfs/BlockReaderLocalLegacy.java |   52 ++++++---
+ .../java/org/apache/hadoop/hdfs/DFSClient.java     |    3 +-
+ .../org/apache/hadoop/hdfs/DFSInputStream.java     |    4 +-
+ .../apache/hadoop/hdfs/DistributedFileSystem.java  |    5 +-
+ .../hadoop/hdfs/TestShortCircuitLocalRead.java     |  126 +++++++++++++++++---
+ 6 files changed, 158 insertions(+), 42 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/BlockReaderFactory.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/BlockReaderFactory.java
+index 6a22b23..37017b6 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/BlockReaderFactory.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/BlockReaderFactory.java
+@@ -40,6 +40,7 @@ import org.apache.hadoop.io.IOUtils;
+ import org.apache.hadoop.ipc.RemoteException;
+ import org.apache.hadoop.net.unix.DomainSocket;
+ import org.apache.hadoop.security.AccessControlException;
++import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.security.token.SecretManager.InvalidToken;
+ import org.apache.hadoop.security.token.Token;
+ 
+@@ -242,12 +243,13 @@ public class BlockReaderFactory {
+    * This block reader implements the path-based style of local reads
+    * first introduced in HDFS-2246.
+    */
+-  static BlockReader getLegacyBlockReaderLocal(Configuration conf,
+-      String src, ExtendedBlock blk, Token<BlockTokenIdentifier> accessToken,
+-      DatanodeInfo chosenNode, int socketTimeout, long offsetIntoBlock,
++  static BlockReader getLegacyBlockReaderLocal(UserGroupInformation ugi,
++      Configuration conf, String src, ExtendedBlock blk,
++      Token<BlockTokenIdentifier> accessToken, DatanodeInfo chosenNode,
++      int socketTimeout, long offsetIntoBlock,
+       boolean connectToDnViaHostname) throws InvalidToken, IOException {
+     try {
+-      return BlockReaderLocalLegacy.newBlockReader(conf, src, blk, accessToken,
++      return BlockReaderLocalLegacy.newBlockReader(ugi, conf, src, blk, accessToken,
+           chosenNode, socketTimeout, offsetIntoBlock, blk.getNumBytes()
+               - offsetIntoBlock, connectToDnViaHostname);
+     } catch (RemoteException re) {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/BlockReaderLocalLegacy.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/BlockReaderLocalLegacy.java
+index 9c3e093..47af149 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/BlockReaderLocalLegacy.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/BlockReaderLocalLegacy.java
+@@ -23,6 +23,7 @@ import java.io.FileInputStream;
+ import java.io.IOException;
+ import java.net.Socket;
+ import java.nio.ByteBuffer;
++import java.security.PrivilegedExceptionAction;
+ import java.util.Collections;
+ import java.util.HashMap;
+ import java.util.LinkedHashMap;
+@@ -31,6 +32,7 @@ import java.util.Map;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.hdfs.protocol.BlockLocalPathInfo;
+ import org.apache.hadoop.hdfs.protocol.ClientDatanodeProtocol;
+ import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
+@@ -41,6 +43,7 @@ import org.apache.hadoop.hdfs.server.datanode.BlockMetadataHeader;
+ import org.apache.hadoop.hdfs.util.DirectBufferPool;
+ import org.apache.hadoop.ipc.RPC;
+ import org.apache.hadoop.io.IOUtils;
++import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.security.token.Token;
+ import org.apache.hadoop.util.DataChecksum;
+ 
+@@ -92,11 +95,21 @@ class BlockReaderLocalLegacy implements BlockReader {
+     }
+ 
+     private synchronized ClientDatanodeProtocol getDatanodeProxy(
+-        DatanodeInfo node, Configuration conf, int socketTimeout,
+-        boolean connectToDnViaHostname) throws IOException {
++        UserGroupInformation ugi, final DatanodeInfo node,
++        final Configuration conf, final int socketTimeout,
++        final boolean connectToDnViaHostname) throws IOException {
+       if (proxy == null) {
+-        proxy = DFSUtil.createClientDatanodeProtocolProxy(node, conf,
+-            socketTimeout, connectToDnViaHostname);
++        try {
++          proxy = ugi.doAs(new PrivilegedExceptionAction<ClientDatanodeProtocol>() {
++            @Override
++            public ClientDatanodeProtocol run() throws Exception {
++              return DFSUtil.createClientDatanodeProtocolProxy(node, conf,
++                  socketTimeout, connectToDnViaHostname);
++            }
++          });
++        } catch (InterruptedException e) {
++          LOG.warn("encountered exception ", e);
++        }
+       }
+       return proxy;
+     }
+@@ -160,17 +173,18 @@ class BlockReaderLocalLegacy implements BlockReader {
+   /**
+    * The only way this object can be instantiated.
+    */
+-  static BlockReaderLocalLegacy newBlockReader(Configuration conf, String file,
+-      ExtendedBlock blk, Token<BlockTokenIdentifier> token, DatanodeInfo node,
+-      int socketTimeout, long startOffset, long length,
+-      boolean connectToDnViaHostname) throws IOException {
++  static BlockReaderLocalLegacy newBlockReader(UserGroupInformation ugi,
++      Configuration conf, String file, ExtendedBlock blk,
++      Token<BlockTokenIdentifier> token, DatanodeInfo node, int socketTimeout,
++      long startOffset, long length, boolean connectToDnViaHostname)
++      throws IOException {
+ 
+     LocalDatanodeInfo localDatanodeInfo = getLocalDatanodeInfo(node
+         .getIpcPort());
+     // check the cache first
+     BlockLocalPathInfo pathinfo = localDatanodeInfo.getBlockLocalPathInfo(blk);
+     if (pathinfo == null) {
+-      pathinfo = getBlockPathInfo(blk, node, conf, socketTimeout, token,
++      pathinfo = getBlockPathInfo(ugi, blk, node, conf, socketTimeout, token,
+           connectToDnViaHostname);
+     }
+ 
+@@ -247,13 +261,13 @@ class BlockReaderLocalLegacy implements BlockReader {
+     return ldInfo;
+   }
+   
+-  private static BlockLocalPathInfo getBlockPathInfo(ExtendedBlock blk,
+-      DatanodeInfo node, Configuration conf, int timeout,
++  private static BlockLocalPathInfo getBlockPathInfo(UserGroupInformation ugi,
++      ExtendedBlock blk, DatanodeInfo node, Configuration conf, int timeout,
+       Token<BlockTokenIdentifier> token, boolean connectToDnViaHostname)
+-          throws IOException {
++      throws IOException {
+     LocalDatanodeInfo localDatanodeInfo = getLocalDatanodeInfo(node.getIpcPort());
+     BlockLocalPathInfo pathinfo = null;
+-    ClientDatanodeProtocol proxy = localDatanodeInfo.getDatanodeProxy(node,
++    ClientDatanodeProtocol proxy = localDatanodeInfo.getDatanodeProxy(ugi, node,
+         conf, timeout, connectToDnViaHostname);
+     try {
+       // make RPC to local datanode to find local pathnames of blocks
+@@ -282,9 +296,11 @@ class BlockReaderLocalLegacy implements BlockReader {
+         DFSConfigKeys.DFS_CLIENT_READ_SHORTCIRCUIT_BUFFER_SIZE_DEFAULT);
+ 
+     if (bufferSizeBytes < bytesPerChecksum) {
+-      throw new IllegalArgumentException("Configured BlockReaderLocalLegacy buffer size (" + bufferSizeBytes + ") " +
+-          "is not large enough to hold a single chunk (" + bytesPerChecksum +  "). Please configure " +
+-          DFSConfigKeys.DFS_CLIENT_READ_SHORTCIRCUIT_BUFFER_SIZE_KEY + " appropriately");
++      throw new IllegalArgumentException("Configured BlockReaderLocalLegacy " +
++          "buffer size (" + bufferSizeBytes + ") is not large enough to hold " +
++          "a single chunk (" + bytesPerChecksum +  "). Please configure " +
++          DFSConfigKeys.DFS_CLIENT_READ_SHORTCIRCUIT_BUFFER_SIZE_KEY +
++          " appropriately");
+     }
+ 
+     // Round down to nearest chunk size
+@@ -295,8 +311,8 @@ class BlockReaderLocalLegacy implements BlockReader {
+       ExtendedBlock block, Token<BlockTokenIdentifier> token, long startOffset,
+       long length, BlockLocalPathInfo pathinfo, FileInputStream dataIn)
+       throws IOException {
+-    this(conf, hdfsfile, block, token, startOffset, length, pathinfo,
+-        DataChecksum.newDataChecksum(DataChecksum.CHECKSUM_NULL, 0), false,
++    this(conf, hdfsfile, block, token, startOffset, length, pathinfo,
++        DataChecksum.newDataChecksum(DataChecksum.CHECKSUM_NULL, 4), false,
+         dataIn, startOffset, null);
+   }
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClient.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClient.java
+index f1cfe02..aaee4ff 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClient.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClient.java
+@@ -447,6 +447,7 @@ public class DFSClient implements java.io.Closeable {
+           "null URI");
+       NameNodeProxies.ProxyAndInfo<ClientProtocol> proxyInfo =
+         NameNodeProxies.createProxy(conf, nameNodeUri, ClientProtocol.class);
++      
+       this.dtService = proxyInfo.getDelegationTokenService();
+       this.namenode = proxyInfo.getProxy();
+     }
+@@ -1624,7 +1625,7 @@ public class DFSClient implements java.io.Closeable {
+    * @param socketFactory to create sockets to connect to DNs
+    * @param socketTimeout timeout to use when connecting and waiting for a response
+    * @param encryptionKey the key needed to communicate with DNs in this cluster
+-   * @param connectToDnViaHostname {@see #connectToDnViaHostname()}
++   * @param connectToDnViaHostname {@link #connectToDnViaHostname()}
+    * @return The checksum 
+    */
+   static MD5MD5CRC32FileChecksum getFileChecksum(String src,
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSInputStream.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSInputStream.java
+index 0cb6013..63aad2f 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSInputStream.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSInputStream.java
+@@ -925,8 +925,8 @@ public class DFSInputStream extends FSInputStream implements ByteBufferReadable
+         DFSClient.isLocalAddress(dnAddr) &&
+         (!shortCircuitForbidden())) {
+       try {
+-        return BlockReaderFactory.getLegacyBlockReaderLocal(dfsClient.conf,
+-            clientName, block, blockToken, chosenNode,
++        return BlockReaderFactory.getLegacyBlockReaderLocal(dfsClient.ugi,
++            dfsClient.conf, clientName, block, blockToken, chosenNode,
+             dfsClient.hdfsTimeout, startOffset,dfsClient.connectToDnViaHostname());
+       } catch (IOException e) {
+         DFSClient.LOG.warn("error creating legacy BlockReaderLocal.  " +
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DistributedFileSystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DistributedFileSystem.java
+index 03753b0..77ffa9e 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DistributedFileSystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DistributedFileSystem.java
+@@ -69,6 +69,8 @@ import org.apache.hadoop.security.token.SecretManager.InvalidToken;
+ import org.apache.hadoop.security.token.Token;
+ import org.apache.hadoop.util.Progressable;
+ 
++import com.google.common.annotations.VisibleForTesting;
++
+ 
+ /****************************************************************
+  * Implementation of the abstract FileSystem for the DFS system.
+@@ -567,9 +569,8 @@ public class DistributedFileSystem extends FileSystem {
+     return "DFS[" + dfs + "]";
+   }
+ 
+-  /** @deprecated DFSClient should not be accessed directly. */
+   @InterfaceAudience.Private
+-  @Deprecated
++  @VisibleForTesting
+   public DFSClient getClient() {
+     return dfs;
+   }        
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestShortCircuitLocalRead.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestShortCircuitLocalRead.java
+index 60a931f..98d8a51 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestShortCircuitLocalRead.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestShortCircuitLocalRead.java
+@@ -23,7 +23,9 @@ import java.io.EOFException;
+ import java.io.File;
+ import java.io.IOException;
+ import java.io.RandomAccessFile;
++import java.net.URI;
+ import java.nio.ByteBuffer;
++import java.security.PrivilegedExceptionAction;
+ import java.util.concurrent.TimeoutException;
+ 
+ import org.apache.hadoop.conf.Configuration;
+@@ -31,8 +33,9 @@ import org.apache.hadoop.fs.FSDataInputStream;
+ import org.apache.hadoop.fs.FSDataOutputStream;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+-import org.apache.hadoop.hdfs.DFSClient.DFSDataInputStream;
++import org.apache.hadoop.hdfs.client.HdfsDataInputStream;
+ import org.apache.hadoop.hdfs.protocol.ClientDatanodeProtocol;
++import org.apache.hadoop.hdfs.protocol.DatanodeID;
+ import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
+ import org.apache.hadoop.hdfs.protocol.ExtendedBlock;
+ import org.apache.hadoop.hdfs.protocol.LocatedBlocks;
+@@ -42,6 +45,7 @@ import org.apache.hadoop.hdfs.server.datanode.SimulatedFSDataset;
+ import org.apache.hadoop.io.IOUtils;
+ import org.apache.hadoop.net.unix.DomainSocket;
+ import org.apache.hadoop.net.unix.TemporarySocketDirectory;
++import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.security.token.Token;
+ import org.apache.hadoop.util.StringUtils;
+ import org.apache.hadoop.util.Time;
+@@ -109,8 +113,19 @@ public class TestShortCircuitLocalRead {
+     }
+   }
+ 
+-  static void checkFileContent(FileSystem fs, Path name, byte[] expected,
+-      int readOffset) throws IOException {
++  private static String getCurrentUser() throws IOException {
++    return UserGroupInformation.getCurrentUser().getShortUserName();
++  }
++
++  /** Check file content, reading as user {@code readingUser} */
++  static void checkFileContent(URI uri, Path name, byte[] expected,
++      int readOffset, String readingUser, Configuration conf,
++      boolean legacyShortCircuitFails) throws IOException {
++    DistributedFileSystem fs = getFileSystem(readingUser, uri, conf);
++    if (legacyShortCircuitFails) {
++      assertTrue(fs.getClient().useLegacyBlockReaderLocal());
++    }
++
+     FSDataInputStream stm = fs.open(name);
+     byte[] actual = new byte[expected.length-readOffset];
+     stm.readFully(readOffset, actual);
+@@ -135,6 +150,9 @@ public class TestShortCircuitLocalRead {
+       nread += nbytes;
+     }
+     checkData(actual, readOffset, expected, "Read 3");
++    if (legacyShortCircuitFails) {
++      assertTrue(!fs.getClient().useLegacyBlockReaderLocal());
++    }
+     stm.close();
+   }
+ 
+@@ -149,9 +167,14 @@ public class TestShortCircuitLocalRead {
+   /**
+    * Verifies that reading a file with the direct read(ByteBuffer) api gives the expected set of bytes.
+    */
+-  static void checkFileContentDirect(FileSystem fs, Path name, byte[] expected,
+-      int readOffset) throws IOException {
+-    DFSDataInputStream stm = (DFSDataInputStream)fs.open(name);
++  static void checkFileContentDirect(URI uri, Path name, byte[] expected,
++      int readOffset, String readingUser, Configuration conf,
++      boolean legacyShortCircuitFails) throws IOException {
++    DistributedFileSystem fs = getFileSystem(readingUser, uri, conf);
++    if (legacyShortCircuitFails) {
++      assertTrue(fs.getClient().useLegacyBlockReaderLocal());
++    }
++    HdfsDataInputStream stm = (HdfsDataInputStream)fs.open(name);
+ 
+     ByteBuffer actual = ByteBuffer.allocateDirect(expected.length - readOffset);
+ 
+@@ -180,15 +203,32 @@ public class TestShortCircuitLocalRead {
+       nread += nbytes;
+     }
+     checkData(arrayFromByteBuffer(actual), readOffset, expected, "Read 3");
++    if (legacyShortCircuitFails) {
++      assertTrue(!fs.getClient().useLegacyBlockReaderLocal());
++    }
+     stm.close();
+   }
+ 
++  public void doTestShortCircuitReadLegacy(boolean ignoreChecksum, int size,
++      int readOffset, String shortCircuitUser, String readingUser,
++      boolean legacyShortCircuitFails) throws IOException {
++    doTestShortCircuitReadImpl(ignoreChecksum, size, readOffset,
++        shortCircuitUser, readingUser, legacyShortCircuitFails);
++  }
++
++  public void doTestShortCircuitRead(boolean ignoreChecksum, int size,
++      int readOffset) throws IOException {
++    doTestShortCircuitReadImpl(ignoreChecksum, size, readOffset,
++        null, getCurrentUser(), false);
++  }
++
+   /**
+    * Test that file data can be read by reading the block file
+    * directly from the local store.
+    */
+-  public void doTestShortCircuitRead(boolean ignoreChecksum, int size,
+-      int readOffset) throws IOException {
++  public void doTestShortCircuitReadImpl(boolean ignoreChecksum, int size,
++      int readOffset, String shortCircuitUser, String readingUser,
++      boolean legacyShortCircuitFails) throws IOException {
+     Configuration conf = new Configuration();
+     conf.setBoolean(DFSConfigKeys.DFS_CLIENT_READ_SHORTCIRCUIT_KEY, true);
+     conf.setBoolean(DFSConfigKeys.DFS_CLIENT_READ_SHORTCIRCUIT_SKIP_CHECKSUM_KEY,
+@@ -196,6 +236,14 @@ public class TestShortCircuitLocalRead {
+     conf.set(DFSConfigKeys.DFS_DOMAIN_SOCKET_PATH_KEY,
+         new File(sockDir.getDir(),
+           "TestShortCircuitLocalRead._PORT.sock").getAbsolutePath());
++
++    if (shortCircuitUser != null) {
++      conf.set(DFSConfigKeys.DFS_BLOCK_LOCAL_PATH_ACCESS_USER_KEY,
++          shortCircuitUser);
++      conf.setBoolean(DFSConfigKeys.
++          DFS_CLIENT_USE_LEGACY_BLOCKREADERLOCAL, true);
++    }
++
+     if (simulatedStorage) {
+       SimulatedFSDataset.setFactory(conf);
+     }
+@@ -208,16 +256,19 @@ public class TestShortCircuitLocalRead {
+       assertTrue("/ should be a directory", fs.getFileStatus(path)
+           .isDirectory() == true);
+       
+-      byte[] fileData = AppendTestUtil.randomBytes(seed, size);
+       // create a new file in home directory. Do not close it.
+-      Path file1 = new Path("filelocal.dat");
++      byte[] fileData = AppendTestUtil.randomBytes(seed, size);
++      Path file1 = fs.makeQualified(new Path("filelocal.dat"));
+       FSDataOutputStream stm = createFile(fs, file1, 1);
+ 
+       // write to file
+       stm.write(fileData);
+       stm.close();
+-      checkFileContent(fs, file1, fileData, readOffset);
+-      checkFileContentDirect(fs, file1, fileData, readOffset);
++      URI uri = cluster.getURI();
++      checkFileContent(uri, file1, fileData, readOffset, readingUser, conf,
++          legacyShortCircuitFails);
++      checkFileContentDirect(uri, file1, fileData, readOffset, readingUser,
++          conf, legacyShortCircuitFails);
+     } finally {
+       fs.close();
+       cluster.shutdown();
+@@ -241,7 +292,24 @@ public class TestShortCircuitLocalRead {
+     doTestShortCircuitRead(true, 13, 0);
+     doTestShortCircuitRead(true, 13, 5);
+   }
+-  
++
++  @Test(timeout=10000)
++  public void testLocalReadLegacy() throws Exception {
++    doTestShortCircuitReadLegacy(true, 13, 0, getCurrentUser(),
++        getCurrentUser(), false);
++  }
++
++  /**
++   * Try a short circuit from a reader that is not allowed to
++   * to use short circuit. The test ensures reader falls back to non
++   * shortcircuit reads when shortcircuit is disallowed.
++   */
++  @Test(timeout=10000)
++  public void testLocalReadFallback() throws Exception {
++    doTestShortCircuitReadLegacy(true, 13, 0, getCurrentUser(),
++        "notallowed", true);
++  }
++
+   @Test
+   public void testReadFromAnOffset() throws IOException {
+     doTestShortCircuitRead(false, 3*blockSize+100, 777);
+@@ -254,6 +322,33 @@ public class TestShortCircuitLocalRead {
+     doTestShortCircuitRead(true, 10*blockSize+100, 777);
+   }
+ 
++  private ClientDatanodeProtocol getProxy(UserGroupInformation ugi,
++      final DatanodeID dnInfo, final Configuration conf) throws IOException,
++      InterruptedException {
++    return ugi.doAs(new PrivilegedExceptionAction<ClientDatanodeProtocol>() {
++      @Override
++      public ClientDatanodeProtocol run() throws Exception {
++        return DFSUtil.createClientDatanodeProtocolProxy(dnInfo, conf, 60000,
++            false);
++      }
++    });
++  }
++  
++  private static DistributedFileSystem getFileSystem(String user, final URI uri,
++      final Configuration conf) throws IOException {
++    try {
++      UserGroupInformation ugi = UserGroupInformation.createRemoteUser(user);
++      return ugi.doAs(new PrivilegedExceptionAction<DistributedFileSystem>() {
++        @Override
++        public DistributedFileSystem run() throws Exception {
++          return (DistributedFileSystem)FileSystem.get(uri, conf);
++        }
++      });
++    } catch (InterruptedException e) {
++      throw new RuntimeException(e); //TODO : change all functions to throw Exception
++    }
++  }
++
+   @Test
+   public void testDeprecatedGetBlockLocalPathInfoRpc()
+       throws IOException, InterruptedException {
+@@ -435,7 +530,7 @@ public class TestShortCircuitLocalRead {
+     int threadCount = Integer.valueOf(args[2]);
+ 
+     // Setup create a file
+-    Configuration conf = new Configuration();
++    final Configuration conf = new Configuration();
+     conf.setBoolean(DFSConfigKeys.DFS_CLIENT_READ_SHORTCIRCUIT_KEY, shortcircuit);
+     conf.set(DFSConfigKeys.DFS_DOMAIN_SOCKET_PATH_KEY,
+         "/tmp/TestShortCircuitLocalRead._PORT");
+@@ -463,7 +558,8 @@ public class TestShortCircuitLocalRead {
+         public void run() {
+           for (int i = 0; i < iteration; i++) {
+             try {
+-              checkFileContent(fs, file1, dataToWrite, 0);
++              checkFileContent(fs.getUri(), file1, dataToWrite, 0,
++                  getCurrentUser(), conf, false);
+             } catch (IOException e) {
+               e.printStackTrace();
+             }
+-- 
+1.7.0.4
+

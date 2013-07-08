@@ -1,0 +1,134 @@
+From e895e59168311b28b60e31d47b4d8b24deb23e12 Mon Sep 17 00:00:00 2001
+From: Suresh Srinivas <suresh@apache.org>
+Date: Tue, 30 Oct 2012 05:48:58 +0000
+Subject: [PATCH 0982/1357] HDFS-4127. Log message is not correct in case of short of replica. Contributed by Junping Du.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1403616 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 7847ddf53bb8624b8cc9d87538c49b53a0972ecd)
+---
+ .../BlockPlacementPolicyDefault.java               |    5 +-
+ .../blockmanagement/TestReplicationPolicy.java     |   71 +++++++++++++++++++-
+ 2 files changed, 73 insertions(+), 3 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyDefault.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyDefault.java
+index a6a2f50..dd8f118 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyDefault.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyDefault.java
+@@ -190,7 +190,7 @@ public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
+     if (numOfReplicas == 0 || clusterMap.getNumOfLeaves()==0) {
+       return writer;
+     }
+-    int totalReplicasExpected = numOfReplicas;
++    int totalReplicasExpected = numOfReplicas + results.size();
+       
+     int numOfResults = results.size();
+     boolean newBlock = (numOfResults==0);
+@@ -236,7 +236,8 @@ public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
+           maxNodesPerRack, results, avoidStaleNodes);
+     } catch (NotEnoughReplicasException e) {
+       LOG.warn("Not able to place enough replicas, still in need of "
+-               + numOfReplicas + " to reach " + totalReplicasExpected + "\n"
++               + (totalReplicasExpected - results.size()) + " to reach "
++               + totalReplicasExpected + "\n"
+                + e.getMessage());
+       if (avoidStaleNodes) {
+         // ecxludedNodes now has - initial excludedNodes, any nodes that were
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestReplicationPolicy.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestReplicationPolicy.java
+index 1d193c1..5f3600c 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestReplicationPolicy.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestReplicationPolicy.java
+@@ -19,6 +19,7 @@ package org.apache.hadoop.hdfs.server.blockmanagement;
+ 
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertNotNull;
+ import static org.junit.Assert.assertTrue;
+ 
+ import java.io.File;
+@@ -44,6 +45,10 @@ import org.apache.hadoop.hdfs.server.namenode.NameNode;
+ import org.apache.hadoop.net.NetworkTopology;
+ import org.apache.hadoop.net.Node;
+ import org.apache.hadoop.util.Time;
++import org.apache.log4j.AppenderSkeleton;
++import org.apache.log4j.Level;
++import org.apache.log4j.Logger;
++import org.apache.log4j.spi.LoggingEvent;
+ import org.junit.BeforeClass;
+ import org.junit.Rule;
+ import org.junit.Test;
+@@ -375,7 +380,71 @@ public class TestReplicationPolicy {
+                                       3, writerDesc, BLOCK_SIZE);
+     assertEquals(targets.length, 3);
+     assertTrue(cluster.isOnSameRack(targets[1], targets[2]));
+-    assertFalse(cluster.isOnSameRack(targets[0], targets[1]));    
++    assertFalse(cluster.isOnSameRack(targets[0], targets[1]));
++  }
++  
++  /**
++   * In this testcase, it tries to choose more targets than available nodes and
++   * check the result. 
++   * @throws Exception
++   */
++  @Test
++  public void testChooseTargetWithMoreThanAvaiableNodes() throws Exception {
++    // make data node 0 & 1 to be not qualified to choose: not enough disk space
++    for(int i=0; i<2; i++) {
++      dataNodes[i].updateHeartbeat(
++          2*HdfsConstants.MIN_BLOCKS_FOR_WRITE*BLOCK_SIZE, 0L,
++          (HdfsConstants.MIN_BLOCKS_FOR_WRITE-1)*BLOCK_SIZE, 0L, 0, 0);
++    }
++    
++    final TestAppender appender = new TestAppender();
++    final Logger logger = Logger.getRootLogger();
++    logger.addAppender(appender);
++    
++    // try to choose NUM_OF_DATANODES which is more than actually available
++    // nodes.
++    DatanodeDescriptor[] targets = replicator.chooseTarget(filename, 
++        NUM_OF_DATANODES, dataNodes[0], new ArrayList<DatanodeDescriptor>(),
++        BLOCK_SIZE);
++    assertEquals(targets.length, NUM_OF_DATANODES - 2);
++
++    final List<LoggingEvent> log = appender.getLog();
++    assertNotNull(log);
++    assertFalse(log.size() == 0);
++    final LoggingEvent lastLogEntry = log.get(log.size() - 1);
++    
++    assertEquals(lastLogEntry.getLevel(), Level.WARN);
++    // Suppose to place replicas on each node but two data nodes are not
++    // available for placing replica, so here we expect a short of 2
++    assertTrue(((String)lastLogEntry.getMessage()).contains("in need of 2"));
++    
++    for(int i=0; i<2; i++) {
++      dataNodes[i].updateHeartbeat(
++          2*HdfsConstants.MIN_BLOCKS_FOR_WRITE*BLOCK_SIZE, 0L,
++          HdfsConstants.MIN_BLOCKS_FOR_WRITE*BLOCK_SIZE, 0L, 0, 0);
++    }
++  }
++  
++  class TestAppender extends AppenderSkeleton {
++    private final List<LoggingEvent> log = new ArrayList<LoggingEvent>();
++
++    @Override
++    public boolean requiresLayout() {
++      return false;
++    }
++
++    @Override
++    protected void append(final LoggingEvent loggingEvent) {
++      log.add(loggingEvent);
++    }
++
++    @Override
++    public void close() {
++    }
++
++    public List<LoggingEvent> getLog() {
++      return new ArrayList<LoggingEvent>(log);
++    }
+   }
+ 
+   private boolean containsWithinRange(DatanodeDescriptor target,
+-- 
+1.7.0.4
+

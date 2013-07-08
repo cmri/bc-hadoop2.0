@@ -1,0 +1,291 @@
+From 2783d74d9ea43fce0f73749b2bc395fe2de38745 Mon Sep 17 00:00:00 2001
+From: Aaron Twining Myers <atm@apache.org>
+Date: Tue, 26 Feb 2013 00:52:38 +0000
+Subject: [PATCH 0939/1357] HDFS-4235. When outputting XML, OfflineEditsViewer can't handle some edits containing non-ASCII strings. Contributed by Colin Patrick McCabe.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/branch-2@1449985 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit c6a5442c353bd781d24db2ac19df17fd62755c25)
+---
+ .../offlineEditsViewer/OfflineEditsXmlLoader.java  |    3 +-
+ .../java/org/apache/hadoop/hdfs/util/XMLUtils.java |  138 +++++++++++++++++++-
+ .../server/namenode/OfflineEditsViewerHelper.java  |    2 +-
+ .../org/apache/hadoop/hdfs/util/TestXMLUtils.java  |   70 ++++++++++
+ 4 files changed, 210 insertions(+), 3 deletions(-)
+ create mode 100644 hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/util/TestXMLUtils.java
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/tools/offlineEditsViewer/OfflineEditsXmlLoader.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/tools/offlineEditsViewer/OfflineEditsXmlLoader.java
+index 0f53415..f444dbd 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/tools/offlineEditsViewer/OfflineEditsXmlLoader.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/tools/offlineEditsViewer/OfflineEditsXmlLoader.java
+@@ -25,6 +25,7 @@ import java.util.Stack;
+ 
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.classification.InterfaceStability;
++import org.apache.hadoop.hdfs.util.XMLUtils;
+ import org.apache.hadoop.hdfs.util.XMLUtils.InvalidXmlException;
+ import org.apache.hadoop.hdfs.server.namenode.FSEditLogOp;
+ import org.apache.hadoop.hdfs.server.namenode.FSEditLogOpCodes;
+@@ -172,7 +173,7 @@ class OfflineEditsXmlLoader
+   
+   @Override
+   public void endElement (String uri, String name, String qName) {
+-    String str = cbuf.toString().trim();
++    String str = XMLUtils.unmangleXmlString(cbuf.toString()).trim();
+     cbuf = new StringBuffer();
+     switch (state) {
+     case EXPECT_EDITS_TAG:
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/util/XMLUtils.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/util/XMLUtils.java
+index a023b87..d036b1e 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/util/XMLUtils.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/util/XMLUtils.java
+@@ -47,6 +47,140 @@ public class XMLUtils {
+   }
+   
+   /**
++   * Exception that reflects a string that cannot be unmangled.
++   */
++  public static class UnmanglingError extends RuntimeException {
++    private static final long serialVersionUID = 1L;
++    
++    public UnmanglingError(String str, Exception e) {
++      super(str, e);
++    }
++    
++    public UnmanglingError(String str) {
++      super(str);
++    }
++  }
++  
++
++  /**
++   * Given a code point, determine if it should be mangled before being
++   * represented in an XML document.
++   * 
++   * Any code point that isn't valid in XML must be mangled.
++   * See http://en.wikipedia.org/wiki/Valid_characters_in_XML for a
++   * quick reference, or the w3 standard for the authoritative reference.
++   * 
++   * @param cp      The code point
++   * @return        True if the code point should be mangled
++   */
++  private static boolean codePointMustBeMangled(int cp) {
++    if (cp < 0x20) {
++      return ((cp != 0x9) && (cp != 0xa) && (cp != 0xd));
++    } else if ((0xd7ff < cp) && (cp < 0xe000)) {
++      return true;
++    } else if ((cp == 0xfffe) || (cp == 0xffff)) {
++      return true;
++    } else if (cp == 0x5c) {
++      // we mangle backslash to simplify decoding... it's
++      // easier if backslashes always begin mangled sequences. 
++      return true;
++    }
++    return false;
++  }
++
++  private static int NUM_SLASH_POSITIONS = 4;
++
++  private static String mangleCodePoint(int cp) {
++    return String.format("\\%0" + NUM_SLASH_POSITIONS + "x;", cp);
++  }
++
++  /**
++   * Mangle a string so that it can be represented in an XML document.
++   * 
++   * There are three kinds of code points in XML:
++   * - Those that can be represented normally,
++   * - Those that have to be escaped (for example, & must be represented 
++   *     as &amp;)
++   * - Those that cannot be represented at all in XML.
++   *
++   * The built-in SAX functions will handle the first two types for us just
++   * fine.  However, sometimes we come across a code point of the third type.
++   * In this case, we have to mangle the string in order to represent it at
++   * all.  We also mangle backslash to avoid confusing a backslash in the
++   * string with part our escape sequence.
++   * 
++   * The encoding used here is as follows: an illegal code point is
++   * represented as '\ABCD;', where ABCD is the hexadecimal value of 
++   * the code point.
++   *
++   * @param str     The input string.
++   *
++   * @return        The mangled string.
++   */
++  public static String mangleXmlString(String str) {
++    final StringBuilder bld = new StringBuilder();
++    final int length = str.length();
++    for (int offset = 0; offset < length; ) {
++       final int cp = str.codePointAt(offset);
++       final int len = Character.charCount(cp);
++       if (codePointMustBeMangled(cp)) {
++         bld.append(mangleCodePoint(cp));
++       } else {
++         for (int i = 0; i < len; i++) {
++           bld.append(str.charAt(offset + i));
++         }
++       }
++       offset += len;
++    }
++    return bld.toString();
++  }
++
++  /**
++   * Demangle a string from an XML document.
++   * See {@link #mangleXmlString(String)} for a description of the mangling
++   * format.
++   *
++   * @param str    The string to be demangled.
++   * 
++   * @return       The unmangled string
++   * @throws       UnmanglingError if the input is malformed.
++   */
++  public static String unmangleXmlString(String str)
++        throws UnmanglingError {
++    int slashPosition = -1;
++    String escapedCp = "";
++    StringBuilder bld = new StringBuilder();
++    for (int i = 0; i < str.length(); i++) {
++      char ch = str.charAt(i);
++      if ((slashPosition >= 0) && (slashPosition < NUM_SLASH_POSITIONS)) {
++        escapedCp += ch;
++        ++slashPosition;
++      } else if (slashPosition == NUM_SLASH_POSITIONS) {
++        if (ch != ';') {
++          throw new UnmanglingError("unterminated code point escape: " +
++              "expected semicolon at end.");
++        }
++        try {
++          bld.appendCodePoint(Integer.parseInt(escapedCp, 16));
++        } catch (NumberFormatException e) {
++          throw new UnmanglingError("error parsing unmangling escape code", e);
++        }
++        escapedCp = "";
++        slashPosition = -1;
++      } else if (ch == '\\') {
++        slashPosition = 0;
++      } else {
++        bld.append(ch);
++      }
++    }
++    if (slashPosition != -1) {
++      throw new UnmanglingError("unterminated code point escape: string " +
++          "broke off in the middle");
++    }
++    return bld.toString();
++  }
++  
++  /**
+    * Add a SAX tag with a string inside.
+    *
+    * @param contentHandler     the SAX content handler
+@@ -56,7 +190,7 @@ public class XMLUtils {
+   public static void addSaxString(ContentHandler contentHandler,
+       String tag, String val) throws SAXException {
+     contentHandler.startElement("", "", tag, new AttributesImpl());
+-    char c[] = val.toString().toCharArray();
++    char c[] = mangleXmlString(val).toCharArray();
+     contentHandler.characters(c, 0, c.length);
+     contentHandler.endElement("", "", tag);
+   }
+@@ -67,6 +201,8 @@ public class XMLUtils {
+    */
+   static public class Stanza {
+     private TreeMap<String, LinkedList <Stanza > > subtrees;
++
++    /** The unmangled value of this stanza. */
+     private String value;
+     
+     public Stanza() {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/OfflineEditsViewerHelper.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/OfflineEditsViewerHelper.java
+index 40de793..989e5ae 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/OfflineEditsViewerHelper.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/OfflineEditsViewerHelper.java
+@@ -144,7 +144,7 @@ public class OfflineEditsViewerHelper {
+       (DistributedFileSystem)cluster.getFileSystem();
+     FileContext fc = FileContext.getFileContext(cluster.getURI(0), config);
+     // OP_ADD 0, OP_SET_GENSTAMP 10
+-    Path pathFileCreate = new Path("/file_create");
++    Path pathFileCreate = new Path("/file_create_u\1F431");
+     FSDataOutputStream s = dfs.create(pathFileCreate);
+     // OP_CLOSE 9
+     s.close();
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/util/TestXMLUtils.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/util/TestXMLUtils.java
+new file mode 100644
+index 0000000..520107c
+--- /dev/null
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/util/TestXMLUtils.java
+@@ -0,0 +1,70 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hdfs.util;
++
++import junit.framework.Assert;
++
++import org.apache.hadoop.hdfs.util.XMLUtils.UnmanglingError;
++import org.junit.Test;
++
++public class TestXMLUtils {
++  private static void testRoundTrip(String str, String expectedMangled) {
++    String mangled = XMLUtils.mangleXmlString(str);
++    Assert.assertEquals(mangled, expectedMangled);
++    String unmangled = XMLUtils.unmangleXmlString(mangled);
++    Assert.assertEquals(unmangled, str);
++  }
++
++  @Test
++  public void testMangleEmptyString() throws Exception {
++    testRoundTrip("", "");
++  }
++
++  @Test
++  public void testMangleVanillaString() throws Exception {
++    testRoundTrip("abcdef", "abcdef");
++  }
++
++  @Test
++  public void testMangleStringWithBackSlash() throws Exception {
++    testRoundTrip("a\\bcdef", "a\\005c;bcdef");
++    testRoundTrip("\\\\", "\\005c;\\005c;");
++  }  
++
++  @Test
++  public void testMangleStringWithForbiddenCodePoint() throws Exception {
++    testRoundTrip("a\u0001bcdef", "a\\0001;bcdef");
++    testRoundTrip("a\u0002\ud800bcdef", "a\\0002;\\d800;bcdef");
++  }
++
++  @Test
++  public void testInvalidSequence() throws Exception {
++    try {
++      XMLUtils.unmangleXmlString("\\000g;foo");
++      Assert.fail("expected an unmangling error");
++    } catch (UnmanglingError e) {
++      // pass through
++    }
++    try {
++      XMLUtils.unmangleXmlString("\\0");
++      Assert.fail("expected an unmangling error");
++    } catch (UnmanglingError e) {
++      // pass through
++    }
++  }
++}
+-- 
+1.7.0.4
+

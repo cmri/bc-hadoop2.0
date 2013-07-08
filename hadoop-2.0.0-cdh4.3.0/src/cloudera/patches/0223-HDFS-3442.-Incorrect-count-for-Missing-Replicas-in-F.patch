@@ -1,0 +1,208 @@
+From d5fc63aab391755dfb07dd52e1f65e94c16a9fff Mon Sep 17 00:00:00 2001
+From: Aaron Twining Myers <atm@apache.org>
+Date: Sat, 2 Jun 2012 00:42:09 +0000
+Subject: [PATCH 0223/1357] HDFS-3442. Incorrect count for Missing Replicas in FSCK report. Contributed by Andrew Wang.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/branch-2@1345410 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit da1e6cded0a0c971c9dce46ff9a93e6401871443)
+---
+ .../hadoop/hdfs/server/namenode/NamenodeFsck.java  |   50 ++++++++------
+ .../hadoop/hdfs/server/namenode/TestFsck.java      |   74 +++++++++++++++++++-
+ 2 files changed, 100 insertions(+), 24 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeFsck.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeFsck.java
+index 8943ea8..2628b20 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeFsck.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeFsck.java
+@@ -57,6 +57,8 @@ import org.apache.hadoop.security.AccessControlException;
+ import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.util.Time;
+ 
++import com.google.common.annotations.VisibleForTesting;
++
+ /**
+  * This class provides rudimentary checking of DFS volumes for errors and
+  * sub-optimal conditions.
+@@ -261,7 +263,8 @@ public class NamenodeFsck {
+     out.println();
+   }
+   
+-  private void check(String parent, HdfsFileStatus file, Result res) throws IOException {
++  @VisibleForTesting
++  void check(String parent, HdfsFileStatus file, Result res) throws IOException {
+     String path = file.getFullName(parent);
+     boolean isOpen = false;
+ 
+@@ -330,6 +333,7 @@ public class NamenodeFsck {
+       DatanodeInfo[] locs = lBlk.getLocations();
+       res.totalReplicas += locs.length;
+       short targetFileReplication = file.getReplication();
++      res.numExpectedReplicas += targetFileReplication;
+       if (locs.length > targetFileReplication) {
+         res.excessiveReplicas += (locs.length - targetFileReplication);
+         res.numOverReplicatedBlocks += 1;
+@@ -646,29 +650,31 @@ public class NamenodeFsck {
+   /**
+    * FsckResult of checking, plus overall DFS statistics.
+    */
+-  private static class Result {
+-    private List<String> missingIds = new ArrayList<String>();
+-    private long missingSize = 0L;
+-    private long corruptFiles = 0L;
+-    private long corruptBlocks = 0L;
+-    private long excessiveReplicas = 0L;
+-    private long missingReplicas = 0L;
+-    private long numOverReplicatedBlocks = 0L;
+-    private long numUnderReplicatedBlocks = 0L;
+-    private long numMisReplicatedBlocks = 0L;  // blocks that do not satisfy block placement policy
+-    private long numMinReplicatedBlocks = 0L;  // minimally replicatedblocks
+-    private long totalBlocks = 0L;
+-    private long totalOpenFilesBlocks = 0L;
+-    private long totalFiles = 0L;
+-    private long totalOpenFiles = 0L;
+-    private long totalDirs = 0L;
+-    private long totalSize = 0L;
+-    private long totalOpenFilesSize = 0L;
+-    private long totalReplicas = 0L;
++  @VisibleForTesting
++  static class Result {
++    List<String> missingIds = new ArrayList<String>();
++    long missingSize = 0L;
++    long corruptFiles = 0L;
++    long corruptBlocks = 0L;
++    long excessiveReplicas = 0L;
++    long missingReplicas = 0L;
++    long numOverReplicatedBlocks = 0L;
++    long numUnderReplicatedBlocks = 0L;
++    long numMisReplicatedBlocks = 0L;  // blocks that do not satisfy block placement policy
++    long numMinReplicatedBlocks = 0L;  // minimally replicatedblocks
++    long totalBlocks = 0L;
++    long numExpectedReplicas = 0L;
++    long totalOpenFilesBlocks = 0L;
++    long totalFiles = 0L;
++    long totalOpenFiles = 0L;
++    long totalDirs = 0L;
++    long totalSize = 0L;
++    long totalOpenFilesSize = 0L;
++    long totalReplicas = 0L;
+ 
+     final short replication;
+     
+-    private Result(Configuration conf) {
++    Result(Configuration conf) {
+       this.replication = (short)conf.getInt(DFSConfigKeys.DFS_REPLICATION_KEY, 
+                                             DFSConfigKeys.DFS_REPLICATION_DEFAULT);
+     }
+@@ -764,7 +770,7 @@ public class NamenodeFsck {
+               missingReplicas);
+       if (totalReplicas > 0) {
+         res.append(" (").append(
+-            ((float) (missingReplicas * 100) / (float) totalReplicas)).append(
++            ((float) (missingReplicas * 100) / (float) numExpectedReplicas)).append(
+             " %)");
+       }
+       return res.toString();
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFsck.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFsck.java
+index b865bfa..3806d40 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFsck.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFsck.java
+@@ -57,10 +57,10 @@ import org.apache.hadoop.hdfs.DistributedFileSystem;
+ import org.apache.hadoop.hdfs.HdfsConfiguration;
+ import org.apache.hadoop.hdfs.MiniDFSCluster;
+ import org.apache.hadoop.hdfs.protocol.CorruptFileBlocks;
+-import org.apache.hadoop.hdfs.protocol.DirectoryListing;
+ import org.apache.hadoop.hdfs.protocol.ExtendedBlock;
+ import org.apache.hadoop.hdfs.protocol.HdfsFileStatus;
+ import org.apache.hadoop.hdfs.protocol.LocatedBlocks;
++import org.apache.hadoop.hdfs.server.namenode.NamenodeFsck.Result;
+ import org.apache.hadoop.hdfs.server.protocol.NamenodeProtocols;
+ import org.apache.hadoop.hdfs.tools.DFSck;
+ import org.apache.hadoop.io.IOUtils;
+@@ -102,8 +102,9 @@ public class TestFsck {
+     PrintStream out = new PrintStream(bStream, true);
+     ((Log4JLogger)FSPermissionChecker.LOG).getLogger().setLevel(Level.ALL);
+     int errCode = ToolRunner.run(new DFSck(conf, out), path);
+-    if (checkErrorCode)
++    if (checkErrorCode) {
+       assertEquals(expectedErrCode, errCode);
++    }
+     ((Log4JLogger)FSPermissionChecker.LOG).getLogger().setLevel(Level.INFO);
+     FSImage.LOG.error("OUTPUT = " + bStream.toString());
+     return bStream.toString();
+@@ -786,4 +787,73 @@ public class TestFsck {
+       }
+     }
+   }
++  
++  /**
++   * Tests that the # of missing block replicas and expected replicas is correct
++   * @throws IOException
++   */
++  @Test
++  public void testFsckMissingReplicas() throws IOException {
++    // Desired replication factor
++    // Set this higher than NUM_REPLICAS so it's under-replicated
++    final short REPL_FACTOR = 2;
++    // Number of replicas to actually start
++    final short NUM_REPLICAS = 1;
++    // Number of blocks to write
++    final short NUM_BLOCKS = 3;
++    // Set a small-ish blocksize
++    final long blockSize = 512;
++    
++    Configuration conf = new Configuration();
++    conf.setLong(DFSConfigKeys.DFS_BLOCK_SIZE_KEY, blockSize);
++    
++    MiniDFSCluster cluster = null;
++    DistributedFileSystem dfs = null;
++    
++    try {
++      // Startup a minicluster
++      cluster = 
++          new MiniDFSCluster.Builder(conf).numDataNodes(NUM_REPLICAS).build();
++      assertNotNull("Failed Cluster Creation", cluster);
++      cluster.waitClusterUp();
++      dfs = (DistributedFileSystem) cluster.getFileSystem();
++      assertNotNull("Failed to get FileSystem", dfs);
++      
++      // Create a file that will be intentionally under-replicated
++      final String pathString = new String("/testfile");
++      final Path path = new Path(pathString);
++      long fileLen = blockSize * NUM_BLOCKS;
++      DFSTestUtil.createFile(dfs, path, fileLen, REPL_FACTOR, 1);
++      
++      // Create an under-replicated file
++      NameNode namenode = cluster.getNameNode();
++      NetworkTopology nettop = cluster.getNamesystem().getBlockManager()
++          .getDatanodeManager().getNetworkTopology();
++      Map<String,String[]> pmap = new HashMap<String, String[]>();
++      Writer result = new StringWriter();
++      PrintWriter out = new PrintWriter(result, true);
++      InetAddress remoteAddress = InetAddress.getLocalHost();
++      NamenodeFsck fsck = new NamenodeFsck(conf, namenode, nettop, pmap, out, 
++          NUM_REPLICAS, (short)1, remoteAddress);
++      
++      // Run the fsck and check the Result
++      final HdfsFileStatus file = 
++          namenode.getRpcServer().getFileInfo(pathString);
++      assertNotNull(file);
++      Result res = new Result(conf);
++      fsck.check(pathString, file, res);
++      // Also print the output from the fsck, for ex post facto sanity checks
++      System.out.println(result.toString());
++      assertEquals(res.missingReplicas, 
++          (NUM_BLOCKS*REPL_FACTOR) - (NUM_BLOCKS*NUM_REPLICAS));
++      assertEquals(res.numExpectedReplicas, NUM_BLOCKS*REPL_FACTOR);
++    } finally {
++      if(dfs != null) {
++        dfs.close();
++      }
++      if(cluster != null) {
++        cluster.shutdown();
++      }
++    }
++  }
+ }
+-- 
+1.7.0.4
+

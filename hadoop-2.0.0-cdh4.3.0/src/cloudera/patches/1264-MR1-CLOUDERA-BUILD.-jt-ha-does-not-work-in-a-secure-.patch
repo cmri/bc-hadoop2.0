@@ -1,0 +1,456 @@
+From 49370bb92ca3f1716b16a0b1f42bb70a9850ad98 Mon Sep 17 00:00:00 2001
+From: Alejandro Abdelnur <tucu@cloudera.com>
+Date: Thu, 24 Jan 2013 10:27:23 -0800
+Subject: [PATCH 1264/1357] MR1: CLOUDERA-BUILD. jt ha does not work in a secure cluster.
+
+  Reason: bug
+  Author: Alejandro Abdelnur
+  Ref: CDH-9873
+---
+ .../apache/hadoop/mapred/JobTrackerHADaemon.java   |  134 +++++++++++++++++++-
+ .../hadoop/mapred/JobTrackerHAServiceProtocol.java |   67 ++--------
+ .../mapred/TestHAStateTransitionFailure.java       |   42 +++----
+ .../mapred/TestJobTrackerHAServiceProtocol.java    |    2 +-
+ .../hadoop/mapred/TestJobTrackerHealthCheck.java   |    2 -
+ 5 files changed, 157 insertions(+), 90 deletions(-)
+
+diff --git a/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/JobTrackerHADaemon.java b/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/JobTrackerHADaemon.java
+index 710c951..343fab8 100644
+--- a/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/JobTrackerHADaemon.java
++++ b/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/JobTrackerHADaemon.java
+@@ -18,15 +18,16 @@
+ 
+ package org.apache.hadoop.mapred;
+ 
++import com.google.common.annotations.VisibleForTesting;
+ import com.google.protobuf.BlockingService;
+ 
+ import java.io.IOException;
+ import java.net.InetSocketAddress;
++import java.util.concurrent.CountDownLatch;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+-import org.apache.hadoop.ha.HAServiceProtocol;
+ import org.apache.hadoop.ha.HAServiceStatus;
+ import org.apache.hadoop.ha.proto.HAServiceProtocolProtos.HAServiceProtocolService;
+ import org.apache.hadoop.ha.protocolPB.HAServiceProtocolPB;
+@@ -34,10 +35,14 @@ import org.apache.hadoop.ha.protocolPB.HAServiceProtocolServerSideTranslatorPB;
+ import org.apache.hadoop.ipc.ProtobufRpcEngine;
+ import org.apache.hadoop.ipc.RPC;
+ import org.apache.hadoop.ipc.WritableRpcEngine;
+-import org.apache.hadoop.net.NetUtils;
+ import org.apache.hadoop.security.AccessControlException;
++import org.apache.hadoop.security.SecurityUtil;
++import org.apache.hadoop.security.UserGroupInformation;
++import org.apache.hadoop.util.ExitUtil;
+ import org.apache.hadoop.util.StringUtils;
+ 
++import static org.apache.hadoop.util.ExitUtil.terminate;
++
+ public class JobTrackerHADaemon {
+   
+   static{
+@@ -49,6 +54,7 @@ public class JobTrackerHADaemon {
+     LogFactory.getLog(JobTrackerHADaemon.class);
+   
+   private Configuration conf;
++  private JobTrackerRunner jtRunner;
+   private JobTrackerHAServiceProtocol proto;
+   private RPC.Server rpcServer;
+   
+@@ -61,13 +67,26 @@ public class JobTrackerHADaemon {
+   }
+ 
+   public void start() throws IOException {
+-    
++
++    //Using a thread outside of all login context to start/stop the JT
++    //otherwise the credentials of the UGI making the RPC call to activate
++    //get in the way breaking things.
++    jtRunner = new JobTrackerRunner();
++    jtRunner.start();
++
+     Configuration jtConf = new Configuration(conf);
+     String logicalName = HAUtil.getLogicalName(jtConf);
+     String jtId = HAUtil.getJobTrackerId(jtConf);
+     HAUtil.setGenericConf(jtConf, logicalName, jtId, HAUtil.JOB_TRACKER_SPECIFIC_KEYS);
++
++    // Login HA daemon, if auth is not kerberos login() is a NOP
++    InetSocketAddress addr = HAUtil.getJtHaRpcAddress(conf, jtId);
++    String localMachine = addr.getHostName();
++    UserGroupInformation.setConfiguration(conf);
++    SecurityUtil.login(conf, JobTracker.JT_KEYTAB_FILE, JobTracker.JT_USER_NAME, localMachine);
++        
+     
+-    this.proto = new JobTrackerHAServiceProtocol(jtConf);
++    this.proto = new JobTrackerHAServiceProtocol(jtConf, jtRunner);
+     
+     RPC.setProtocolEngine(conf, HAServiceProtocolPB.class,
+         ProtobufRpcEngine.class);
+@@ -97,7 +116,7 @@ public class JobTrackerHADaemon {
+   }
+   
+   public JobTracker getJobTracker() {
+-    return proto.getJobTracker();
++    return jtRunner.jt;
+   }
+   
+   public JobTrackerHAServiceProtocol getJobTrackerHAServiceProtocol() {
+@@ -141,4 +160,109 @@ public class JobTrackerHADaemon {
+     }
+   }
+   
++  public static class JobTrackerRunner extends Thread {
++    private JobTracker jt;
++    private JobConf conf;
++    private volatile CountDownLatch startLatch;
++    private volatile CountDownLatch startedLatch;
++    private volatile boolean jtClosing;
++    private Thread jtThread;
++    
++    public JobTrackerRunner() {
++      super(JobTrackerRunner.class.getSimpleName());
++      setDaemon(true);
++      startLatch = new CountDownLatch(1);
++      startedLatch = new CountDownLatch(1);
++    }
++
++    public void run() {
++      while (true) {
++        try {
++          startLatch.await();
++          jt = JobTracker.startTracker(conf);
++          jtThread = new Thread(
++            new Runnable() {
++              @Override
++              public void run() {
++                try {
++                  jt.offerService();
++                } catch (Throwable t) {
++                  if (jtClosing) {
++                    LOG.info("Exception while closing jobtracker", t);
++                  } else {
++                    doImmediateShutdown(t);
++                  }
++                }
++              }
++            }, JobTrackerRunner.class.getSimpleName() + "-JT");
++          jtThread.start();
++          startedLatch.countDown();
++          jtThread.join();
++        } catch (Throwable t) {
++          doImmediateShutdown(t);
++        } finally {
++          startedLatch.countDown();
++          startLatch = new CountDownLatch(1);
++          startedLatch = new CountDownLatch(1);
++        }
++      }
++    }
++
++    /**
++     * Shutdown the JT immediately in an ungraceful way. Used when it would be
++     * unsafe for the JT to continue operating, e.g. during a failed HA state
++     * transition.
++     *
++     * @param t exception which warrants the shutdown. Printed to the JT log
++     *          before exit.
++     * @throws org.apache.hadoop.util.ExitUtil.ExitException thrown only for testing.
++     */
++    private synchronized void doImmediateShutdown(Throwable t)
++      throws ExitUtil.ExitException {
++      String message = "Error encountered requiring JT shutdown. " +
++        "Shutting down immediately.";
++      try {
++        LOG.fatal(message, t);
++      } catch (Throwable ignored) {
++        // This is unlikely to happen, but there's nothing we can do if it does.
++      }
++      terminate(1, t);
++    }
++
++    public void startJobTracker(JobConf conf) throws InterruptedException {
++      if (jt == null) {
++        this.conf = conf;
++        startLatch.countDown();
++        startedLatch.await();
++      }
++    }
++    
++    public void stopJobTracker() {
++      try {
++        if (jt != null) {
++          jtClosing = true;
++          jt.close();
++        }
++        if (jtThread != null) {
++          jtThread.join();
++        }
++      } catch (Throwable t) {
++        doImmediateShutdown(t);
++      }
++      jt = null;
++      jtClosing = false;
++      jtThread = null;
++    }
++
++    public boolean jtThreadIsNotAlive() {
++      return jtThread == null || !jtThread.isAlive();
++    }
++
++    @VisibleForTesting
++    Thread getJobTrackerThread() {
++      return jtThread;
++    }
++
++
++  }
+ }
+diff --git a/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/JobTrackerHAServiceProtocol.java b/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/JobTrackerHAServiceProtocol.java
+index 352d5bb..bda2c4c 100644
+--- a/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/JobTrackerHAServiceProtocol.java
++++ b/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/JobTrackerHAServiceProtocol.java
+@@ -53,17 +53,16 @@ public class JobTrackerHAServiceProtocol implements HAServiceProtocol {
+   public static final String SYSTEM_DIR_SEQUENCE_PREFIX = "seq-";
+   
+   private Configuration conf;
++  private JobTrackerHADaemon.JobTrackerRunner jtRunner;
+   private HAServiceState haState = HAServiceState.STANDBY;
+   private FileSystem fs;
+-  private JobTracker jt;
+-  private volatile boolean jtClosing;
+   private Path currentSysDir;
+-  private Thread jtThread;
+   private ScheduledExecutorService sysDirMonitorExecutor;
+   private JobTrackerHAHttpRedirector httpRedirector;
+   
+-  public JobTrackerHAServiceProtocol(Configuration conf) {
++  public JobTrackerHAServiceProtocol(Configuration conf, JobTrackerHADaemon.JobTrackerRunner jtRunner) {
+     this.conf = conf;
++    this.jtRunner = jtRunner;
+     this.httpRedirector = new JobTrackerHAHttpRedirector(conf);
+     try {
+       this.fs = createFileSystem(conf);
+@@ -84,31 +83,12 @@ public class JobTrackerHAServiceProtocol implements HAServiceProtocol {
+       }
+     );
+   }
+-  
+-  public JobTracker getJobTracker() {
+-    return jt;
+-  }
+-  
++
+   @VisibleForTesting
+   Thread getJobTrackerThread() {
+-    return jtThread;
++    return jtRunner.getJobTrackerThread();
+   }
+-  
+-  private class JobTrackerRunner implements Runnable {
+-    @Override
+-    public void run() {
+-      try {
+-        jt.offerService();
+-      } catch (Throwable t) {
+-        if (jtClosing) {
+-          LOG.info("Exception while closing jobtracker", t);
+-        } else {
+-          doImmediateShutdown(t);
+-        }
+-      }
+-    }
+-  }
+-  
++
+   private class SystemDirectoryMonitor implements Runnable {
+     @Override
+     public void run() {
+@@ -137,15 +117,11 @@ public class JobTrackerHAServiceProtocol implements HAServiceProtocol {
+ 
+   @Override
+   public void monitorHealth() throws HealthCheckFailedException {
+-    if (haState == HAServiceState.ACTIVE && jtThreadIsNotAlive()) {
++    if (haState == HAServiceState.ACTIVE && jtRunner.jtThreadIsNotAlive()) {
+       throw new HealthCheckFailedException("The JobTracker thread is not running");
+     }
+   }
+ 
+-  private boolean jtThreadIsNotAlive() {
+-    return jtThread == null || !jtThread.isAlive();
+-  }
+-
+   @Override
+   public void transitionToActive(StateChangeRequestInfo reqInfo)
+       throws ServiceFailedException, AccessControlException, IOException {
+@@ -160,14 +136,11 @@ public class JobTrackerHAServiceProtocol implements HAServiceProtocol {
+       currentSysDir = rollSystemDirectory(jtConf);
+       // Update the conf for the JT so the address is resolved
+       HAUtil.setJtRpcAddress(jtConf);
+-      jtClosing = false;
+-      jt = JobTracker.startTracker(jtConf);
++      
++      jtRunner.startJobTracker(jtConf);
+     } catch (Throwable t) {
+       doImmediateShutdown(t);
+     }
+-    jtThread = new Thread(new JobTrackerRunner(),
+-        JobTrackerRunner.class.getSimpleName());
+-    jtThread.start();
+     long activeCheckMillis = conf.getLong(HAUtil.MR_HA_ACTIVE_CHECK_MILLIS,
+         HAUtil.MR_HA_ACTIVE_CHECK_MILLIS_DEFAULT);
+     sysDirMonitorExecutor = Executors.newSingleThreadScheduledExecutor();
+@@ -256,22 +229,13 @@ public class JobTrackerHAServiceProtocol implements HAServiceProtocol {
+       if (sysDirMonitorExecutor != null) {
+         sysDirMonitorExecutor.shutdownNow();
+       }
+-      if (jt != null) {
+-        jtClosing = true;
+-        jt.close();
+-      }
+-      if (jtThread != null) {
+-        jtThread.join();
+-      }
++      jtRunner.stopJobTracker();
+       httpRedirector.start();
+     } catch (Throwable t) {
+       doImmediateShutdown(t);
+     }
+     sysDirMonitorExecutor = null;
+     currentSysDir = null;
+-    jt = null;
+-    jtClosing = false;
+-    jtThread = null;
+     haState = HAServiceState.STANDBY;
+     LOG.info("Transitioned to standby");
+   }
+@@ -282,22 +246,13 @@ public class JobTrackerHAServiceProtocol implements HAServiceProtocol {
+       if (sysDirMonitorExecutor != null) {
+         sysDirMonitorExecutor.shutdownNow();
+       }
+-      if (jt != null) {
+-        jtClosing = true;
+-        jt.close();
+-      }
+-      if (jtThread != null) {
+-        jtThread.join();
+-      }
++      jtRunner.stopJobTracker();
+       httpRedirector.stop();
+     } catch (Throwable t) {
+       doImmediateShutdown(t);
+     }
+     sysDirMonitorExecutor = null;
+     currentSysDir = null;
+-    jt = null;
+-    jtClosing = false;
+-    jtThread = null;
+     haState = HAServiceState.STANDBY;
+     LOG.info("Stopped");
+   }
+diff --git a/hadoop-mapreduce1-project/src/test/org/apache/hadoop/mapred/TestHAStateTransitionFailure.java b/hadoop-mapreduce1-project/src/test/org/apache/hadoop/mapred/TestHAStateTransitionFailure.java
+index 35b7f22..886afbf 100644
+--- a/hadoop-mapreduce1-project/src/test/org/apache/hadoop/mapred/TestHAStateTransitionFailure.java
++++ b/hadoop-mapreduce1-project/src/test/org/apache/hadoop/mapred/TestHAStateTransitionFailure.java
+@@ -18,26 +18,18 @@
+ package org.apache.hadoop.mapred;
+ 
+ import static org.apache.hadoop.test.GenericTestUtils.assertExceptionContains;
+-import static org.junit.Assert.assertEquals;
+-import static org.junit.Assert.fail;
+-
+-import java.io.IOException;
++import static org.junit.Assert.assertTrue;
+ 
+ import java.security.PrivilegedExceptionAction;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+-import org.apache.hadoop.examples.SleepJob;
+-import org.apache.hadoop.ha.HAServiceProtocol;
+-import org.apache.hadoop.ha.TestNodeFencer;
+ import org.apache.hadoop.hdfs.MiniDFSCluster;
+-import org.apache.hadoop.fs.CommonConfigurationKeys;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.permission.FsPermission;
+-import org.apache.hadoop.security.AccessControlException;
+ import org.apache.hadoop.security.UserGroupInformation;
+-import org.apache.hadoop.util.ExitUtil.ExitException;
++import org.apache.hadoop.util.ExitUtil;
+ import org.junit.Test;
+ 
+ /**
+@@ -67,27 +59,25 @@ public class TestHAStateTransitionFailure {
+       // that starts the JT. This will cause the JT to fail to transition to
+       // the active state.
+       FileSystem fs = dfs.getFileSystem();
+-      Path mapredSysDir = new Path(conf.get("mapred.system.dir"));
++      Path mapredSysDir = new Path(conf.get("mapred.system.dir"), "seq-000000000000");
+       fs.mkdirs(mapredSysDir, new FsPermission((short) 700));
+       fs.setOwner(mapredSysDir, "mr", "mrgroup");
+ 
+       cluster = new MiniMRHACluster(fs.getConf());
+       final MiniMRHACluster finalCluster = cluster;
+-      try {
+-        UserGroupInformation ugi = UserGroupInformation.createUserForTesting(
+-            "notmr", new String[]{"notmrgroup"});
+-        ugi.doAs(new PrivilegedExceptionAction<Object>() {
+-          @Override
+-          public Object run() throws Exception {
+-            finalCluster.getJobTrackerHaDaemon(0).makeActive();
+-            return null;
+-          }
+-        });
+-        cluster.getJobTrackerHaDaemon(0).makeActive();
+-        fail("Transitioned to active but should not have been able to.");
+-      } catch (ExitException ee) {
+-        assertExceptionContains("Permission denied", ee);
+-      }
++      UserGroupInformation ugi = UserGroupInformation.createUserForTesting(
++          "notmr", new String[]{"notmrgroup"});
++      ugi.doAs(new PrivilegedExceptionAction<Object>() {
++        @Override
++        public Object run() throws Exception {
++          finalCluster.getJobTrackerHaDaemon(0).makeActive();
++          return null;
++        }
++      });
++      cluster.getJobTrackerHaDaemon(0).makeActive();
++      Thread.sleep(1000);
++      assertTrue("Should have called terminate", ExitUtil.terminateCalled());
++      assertExceptionContains("is not owned by", ExitUtil.getFirstExitException());
+     } finally {
+       if (cluster != null) {
+         cluster.shutdown();
+diff --git a/hadoop-mapreduce1-project/src/test/org/apache/hadoop/mapred/TestJobTrackerHAServiceProtocol.java b/hadoop-mapreduce1-project/src/test/org/apache/hadoop/mapred/TestJobTrackerHAServiceProtocol.java
+index bc951f2..b167cee 100644
+--- a/hadoop-mapreduce1-project/src/test/org/apache/hadoop/mapred/TestJobTrackerHAServiceProtocol.java
++++ b/hadoop-mapreduce1-project/src/test/org/apache/hadoop/mapred/TestJobTrackerHAServiceProtocol.java
+@@ -49,7 +49,7 @@ public class TestJobTrackerHAServiceProtocol {
+ 
+   @Test
+   public void testRollSystemDirectory() throws IOException {
+-    JobTrackerHAServiceProtocol jt = new JobTrackerHAServiceProtocol(conf);
++    JobTrackerHAServiceProtocol jt = new JobTrackerHAServiceProtocol(conf, null);
+ 
+     JobConf jobConf = new JobConf(conf);
+     Path sysDir = jt.rollSystemDirectory(jobConf);
+diff --git a/hadoop-mapreduce1-project/src/test/org/apache/hadoop/mapred/TestJobTrackerHealthCheck.java b/hadoop-mapreduce1-project/src/test/org/apache/hadoop/mapred/TestJobTrackerHealthCheck.java
+index b948ba7..20fbeec 100644
+--- a/hadoop-mapreduce1-project/src/test/org/apache/hadoop/mapred/TestJobTrackerHealthCheck.java
++++ b/hadoop-mapreduce1-project/src/test/org/apache/hadoop/mapred/TestJobTrackerHealthCheck.java
+@@ -20,8 +20,6 @@ package org.apache.hadoop.mapred;
+ 
+ import static org.junit.Assert.fail;
+ 
+-import java.io.IOException;
+-
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.ha.HealthCheckFailedException;
+ import org.apache.hadoop.test.GenericTestUtils;
+-- 
+1.7.0.4
+

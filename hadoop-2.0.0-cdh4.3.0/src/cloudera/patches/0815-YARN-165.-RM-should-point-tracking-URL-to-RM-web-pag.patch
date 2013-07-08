@@ -1,0 +1,225 @@
+From 1b99ece541aad672636b6cd66cdf3a7fc7fe1472 Mon Sep 17 00:00:00 2001
+From: Robert Joseph Evans <bobby@apache.org>
+Date: Wed, 31 Oct 2012 15:47:11 +0000
+Subject: [PATCH 0815/1357] YARN-165. RM should point tracking URL to RM web page for app when AM fails (jlowe via bobby)
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1404211 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 552b7f16424333e6999da5ef1b8cc71f0ca87316)
+---
+ .../server/resourcemanager/rmapp/RMAppImpl.java    |    2 +-
+ .../rmapp/attempt/RMAppAttemptImpl.java            |   27 ++++++-----
+ .../rmapp/attempt/TestRMAppAttemptTransitions.java |   48 ++++++++++++++++---
+ 3 files changed, 56 insertions(+), 21 deletions(-)
+
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/RMAppImpl.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/RMAppImpl.java
+index 25e5684..f3fe054 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/RMAppImpl.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/RMAppImpl.java
+@@ -531,7 +531,7 @@ public class RMAppImpl implements RMApp {
+ 
+     RMAppAttempt attempt = new RMAppAttemptImpl(appAttemptId,
+         clientTokenStr, rmContext, scheduler, masterService,
+-        submissionContext, YarnConfiguration.getProxyHostAndPort(conf));
++        submissionContext, conf);
+     attempts.put(appAttemptId, attempt);
+     currentAttempt = attempt;
+     handler.handle(
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/attempt/RMAppAttemptImpl.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/attempt/RMAppAttemptImpl.java
+index c4966a1..eebbecb 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/attempt/RMAppAttemptImpl.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/attempt/RMAppAttemptImpl.java
+@@ -18,6 +18,8 @@
+ 
+ package org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt;
+ 
++import static org.apache.hadoop.yarn.util.StringHelper.pjoin;
++
+ import java.net.URI;
+ import java.net.URISyntaxException;
+ import java.util.ArrayList;
+@@ -33,6 +35,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock.WriteLock;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.http.HttpConfig;
+ import org.apache.hadoop.yarn.api.records.ApplicationAttemptId;
+ import org.apache.hadoop.yarn.api.records.ApplicationResourceUsageReport;
+@@ -45,6 +48,7 @@ import org.apache.hadoop.yarn.api.records.ContainerStatus;
+ import org.apache.hadoop.yarn.api.records.NodeId;
+ import org.apache.hadoop.yarn.api.records.Priority;
+ import org.apache.hadoop.yarn.api.records.ResourceRequest;
++import org.apache.hadoop.yarn.conf.YarnConfiguration;
+ import org.apache.hadoop.yarn.event.EventHandler;
+ import org.apache.hadoop.yarn.factories.RecordFactory;
+ import org.apache.hadoop.yarn.factory.providers.RecordFactoryProvider;
+@@ -128,7 +132,7 @@ public class RMAppAttemptImpl implements RMAppAttempt {
+   private FinalApplicationStatus finalStatus = null;
+   private final StringBuilder diagnostics = new StringBuilder();
+ 
+-  private final String proxy;
++  private Configuration conf;
+ 
+   private static final StateMachineFactory<RMAppAttemptImpl,
+                                            RMAppAttemptState,
+@@ -285,9 +289,9 @@ public class RMAppAttemptImpl implements RMAppAttempt {
+       String clientToken, RMContext rmContext, YarnScheduler scheduler,
+       ApplicationMasterService masterService,
+       ApplicationSubmissionContext submissionContext,
+-      String proxy) {
++      Configuration conf) {
+ 
+-    this.proxy = proxy;
++    this.conf = conf;
+     this.applicationAttemptId = appAttemptId;
+     this.rmContext = rmContext;
+     this.eventHandler = rmContext.getDispatcher().getEventHandler();
+@@ -397,6 +401,7 @@ public class RMAppAttemptImpl implements RMAppAttempt {
+     try {
+       URI trackingUri = trackingUriWithoutScheme == null ? null :
+         ProxyUriUtils.getUriFromAMUrl(trackingUriWithoutScheme);
++      String proxy = YarnConfiguration.getProxyHostAndPort(conf);
+       URI proxyUri = ProxyUriUtils.getUriFromAMUrl(proxy);
+       URI result = ProxyUriUtils.getProxyUri(trackingUri, proxyUri,
+           applicationAttemptId.getApplicationId());
+@@ -977,15 +982,13 @@ public class RMAppAttemptImpl implements RMAppAttempt {
+             " due to: " +  containerStatus.getDiagnostics() + "." +
+             "Failing this attempt.");
+ 
+-        /*
+-         * In the case when the AM dies, the trackingUrl is left pointing to the AM's
+-         * URL, which shows up in the scheduler UI as a broken link. Setting it here
+-         * to empty string will prevent any link from being displayed.
+-         * NOTE: don't set trackingUrl to 'null'. That will cause null-pointer exceptions
+-         * in the generated proto code.
+-         */
+-        appAttempt.origTrackingUrl = "";
+-        appAttempt.proxiedTrackingUrl = "";
++        // When the AM dies, the trackingUrl is left pointing to the AM's URL,
++        // which shows up in the scheduler UI as a broken link.  Direct the
++        // user to the app page on the RM so they can see the status and logs.
++        appAttempt.origTrackingUrl = pjoin(
++            YarnConfiguration.getRMWebAppHostAndPort(appAttempt.conf),
++            "cluster", "app", appAttempt.getAppAttemptId().getApplicationId());
++        appAttempt.proxiedTrackingUrl = appAttempt.origTrackingUrl;
+ 
+         new FinalTransition(RMAppAttemptState.FAILED).transition(
+             appAttempt, containerFinishedEvent);
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/attempt/TestRMAppAttemptTransitions.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/attempt/TestRMAppAttemptTransitions.java
+index 0f0cd27..572cb2c 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/attempt/TestRMAppAttemptTransitions.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/attempt/TestRMAppAttemptTransitions.java
+@@ -17,6 +17,7 @@
+ */
+ package org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt;
+ 
++import static org.apache.hadoop.yarn.util.StringHelper.pjoin;
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertFalse;
+ import static org.junit.Assert.assertNotNull;
+@@ -43,6 +44,7 @@ import org.apache.hadoop.yarn.api.records.ContainerState;
+ import org.apache.hadoop.yarn.api.records.ContainerStatus;
+ import org.apache.hadoop.yarn.api.records.FinalApplicationStatus;
+ import org.apache.hadoop.yarn.api.records.Resource;
++import org.apache.hadoop.yarn.conf.YarnConfiguration;
+ import org.apache.hadoop.yarn.event.AsyncDispatcher;
+ import org.apache.hadoop.yarn.event.EventHandler;
+ import org.apache.hadoop.yarn.server.resourcemanager.ApplicationMasterService;
+@@ -85,6 +87,8 @@ public class TestRMAppAttemptTransitions {
+       LogFactory.getLog(TestRMAppAttemptTransitions.class);
+   
+   private static final String EMPTY_DIAGNOSTICS = "";
++  private static final String RM_WEBAPP_ADDR =
++      YarnConfiguration.getRMWebAppHostAndPort(new Configuration());
+   
+   private RMContext rmContext;
+   private YarnScheduler scheduler;
+@@ -203,7 +207,7 @@ public class TestRMAppAttemptTransitions {
+     application = mock(RMApp.class);
+     applicationAttempt = 
+         new RMAppAttemptImpl(applicationAttemptId, null, rmContext, scheduler, 
+-            masterService, submissionContext, null);
++            masterService, submissionContext, new Configuration());
+     when(application.getCurrentAppAttempt()).thenReturn(applicationAttempt);
+     when(application.getApplicationId()).thenReturn(applicationId);
+     
+@@ -216,6 +220,11 @@ public class TestRMAppAttemptTransitions {
+   }
+   
+ 
++  private String getProxyUrl(RMAppAttempt appAttempt) {
++    return pjoin(RM_WEBAPP_ADDR, "proxy",
++        appAttempt.getAppAttemptId().getApplicationId(), "");
++  }
++
+   /**
+    * {@link RMAppAttemptState#NEW}
+    */
+@@ -373,8 +382,8 @@ public class TestRMAppAttemptTransitions {
+     assertEquals(host, applicationAttempt.getHost());
+     assertEquals(rpcPort, applicationAttempt.getRpcPort());
+     assertEquals(trackingUrl, applicationAttempt.getOriginalTrackingUrl());
+-    assertEquals("null/proxy/"+applicationAttempt.getAppAttemptId().
+-        getApplicationId()+"/", applicationAttempt.getTrackingUrl());
++    assertEquals(getProxyUrl(applicationAttempt),
++        applicationAttempt.getTrackingUrl());
+     
+     // TODO - need to add more checks relevant to this state
+   }
+@@ -390,8 +399,8 @@ public class TestRMAppAttemptTransitions {
+         applicationAttempt.getAppAttemptState());
+     assertEquals(diagnostics, applicationAttempt.getDiagnostics());
+     assertEquals(trackingUrl, applicationAttempt.getOriginalTrackingUrl());
+-    assertEquals("null/proxy/"+applicationAttempt.getAppAttemptId().
+-        getApplicationId()+"/", applicationAttempt.getTrackingUrl());
++    assertEquals(getProxyUrl(applicationAttempt),
++        applicationAttempt.getTrackingUrl());
+     assertEquals(container, applicationAttempt.getMasterContainer());
+     assertEquals(finalStatus, applicationAttempt.getFinalApplicationStatus());
+   }
+@@ -408,8 +417,8 @@ public class TestRMAppAttemptTransitions {
+         applicationAttempt.getAppAttemptState());
+     assertEquals(diagnostics, applicationAttempt.getDiagnostics());
+     assertEquals(trackingUrl, applicationAttempt.getOriginalTrackingUrl());
+-    assertEquals("null/proxy/"+applicationAttempt.getAppAttemptId().
+-        getApplicationId()+"/", applicationAttempt.getTrackingUrl());
++    assertEquals(getProxyUrl(applicationAttempt),
++        applicationAttempt.getTrackingUrl());
+     assertEquals(finishedContainerCount, applicationAttempt
+         .getJustFinishedContainers().size());
+     assertEquals(container, applicationAttempt.getMasterContainer());
+@@ -596,7 +605,30 @@ public class TestRMAppAttemptTransitions {
+             diagnostics));
+     testAppAttemptFailedState(amContainer, diagnostics);
+   }
+-  
++
++  @Test
++  public void testRunningToFailed() {
++    Container amContainer = allocateApplicationAttempt();
++    launchApplicationAttempt(amContainer);
++    runApplicationAttempt(amContainer, "host", 8042, "oldtrackingurl");
++    String containerDiagMsg = "some error";
++    int exitCode = 123;
++    ContainerStatus cs = BuilderUtils.newContainerStatus(amContainer.getId(),
++        ContainerState.COMPLETE, containerDiagMsg, exitCode);
++    ApplicationAttemptId appAttemptId = applicationAttempt.getAppAttemptId();
++    applicationAttempt.handle(new RMAppAttemptContainerFinishedEvent(
++        appAttemptId, cs));
++    assertEquals(RMAppAttemptState.FAILED,
++        applicationAttempt.getAppAttemptState());
++    assertEquals(0,applicationAttempt.getJustFinishedContainers().size());
++    assertEquals(amContainer, applicationAttempt.getMasterContainer());
++    assertEquals(0, applicationAttempt.getRanNodes().size());
++    String rmAppPageUrl = pjoin(RM_WEBAPP_ADDR, "cluster", "app",
++        applicationAttempt.getAppAttemptId().getApplicationId());
++    assertEquals(rmAppPageUrl, applicationAttempt.getOriginalTrackingUrl());
++    assertEquals(rmAppPageUrl, applicationAttempt.getTrackingUrl());
++  }
++
+   @Test 
+   public void testUnregisterToKilledFinishing() {
+     Container amContainer = allocateApplicationAttempt();
+-- 
+1.7.0.4
+

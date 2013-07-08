@@ -1,0 +1,714 @@
+From 519276841eea9fcc9360fc78db445dea2a5e7ff2 Mon Sep 17 00:00:00 2001
+From: Vinod Kumar Vavilapalli <vinodkv@apache.org>
+Date: Tue, 10 Jul 2012 21:26:48 +0000
+Subject: [PATCH 0329/1357] MAPREDUCE-3940. ContainerTokens should have an expiry interval. Contributed by Siddharth Seth and Vinod Kumar Vavilapalli.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1359910 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 50a1e204f9c25debf2666e117e0fe45560137def)
+---
+ .../mapreduce/v2/app/TestRMContainerAllocator.java |   15 +++-
+ .../hadoop/yarn/api/records/ContainerToken.java    |   16 ++--
+ .../pb/client/ContainerManagerPBClientImpl.java    |    4 +-
+ .../yarn/security/ContainerTokenIdentifier.java    |   19 ++++-
+ .../security/ContainerTokenSecretManager.java      |   42 +++++++++-
+ .../yarn/server/nodemanager/NodeManager.java       |    2 +-
+ .../containermanager/ContainerManagerImpl.java     |    9 ++
+ .../yarn/server/nodemanager/TestEventFlow.java     |    3 +-
+ .../containermanager/BaseContainerManagerTest.java |    3 +-
+ .../containermanager/TestContainerManager.java     |    2 +-
+ .../server/resourcemanager/ResourceManager.java    |   10 ++-
+ .../rmcontainer/ContainerAllocationExpirer.java    |    1 +
+ .../scheduler/capacity/LeafQueue.java              |   18 +---
+ .../scheduler/fifo/FifoScheduler.java              |   22 ++---
+ .../resourcetracker/TestNMExpiry.java              |    4 +-
+ .../resourcetracker/TestRMNMRPCResponseId.java     |    4 +-
+ .../yarn/server/TestContainerManagerSecurity.java  |   93 ++++++++++++++++++--
+ 17 files changed, 211 insertions(+), 56 deletions(-)
+
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/TestRMContainerAllocator.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/TestRMContainerAllocator.java
+index 1df4f80..d35d421 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/TestRMContainerAllocator.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/TestRMContainerAllocator.java
+@@ -342,7 +342,7 @@ public class TestRMContainerAllocator {
+     }
+     @Override
+     protected ResourceScheduler createScheduler() {
+-      return new MyFifoScheduler();
++      return new MyFifoScheduler(this.getRMContext());
+     }
+   }
+ 
+@@ -998,6 +998,19 @@ public class TestRMContainerAllocator {
+   }
+   
+   private static class MyFifoScheduler extends FifoScheduler {
++
++    public MyFifoScheduler(RMContext rmContext) {
++      super();
++      try {
++        Configuration conf = new Configuration();
++        reinitialize(conf, new ContainerTokenSecretManager(conf),
++            rmContext);
++      } catch (IOException ie) {
++        LOG.info("add application failed with ", ie);
++        assert (false);
++      }
++    }
++
+     // override this to copy the objects otherwise FifoScheduler updates the
+     // numContainers in same objects as kept by RMContainerAllocator
+     @Override
+diff --git a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-api/src/main/java/org/apache/hadoop/yarn/api/records/ContainerToken.java b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-api/src/main/java/org/apache/hadoop/yarn/api/records/ContainerToken.java
+index 0e0e8ed..97cf47d 100644
+--- a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-api/src/main/java/org/apache/hadoop/yarn/api/records/ContainerToken.java
++++ b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-api/src/main/java/org/apache/hadoop/yarn/api/records/ContainerToken.java
+@@ -50,11 +50,11 @@ public interface ContainerToken extends DelegationToken {
+    */
+   @Public
+   @Stable
+-  public abstract ByteBuffer getIdentifier();
++  ByteBuffer getIdentifier();
+   
+   @Private
+   @Stable
+-  public abstract void setIdentifier(ByteBuffer identifier);
++  void setIdentifier(ByteBuffer identifier);
+ 
+   /**
+    * Get the token password
+@@ -62,11 +62,11 @@ public interface ContainerToken extends DelegationToken {
+    */
+   @Public
+   @Stable
+-  public abstract ByteBuffer getPassword();
++  ByteBuffer getPassword();
+   
+   @Private
+   @Stable
+-  public abstract void setPassword(ByteBuffer password);
++  void setPassword(ByteBuffer password);
+ 
+   /**
+    * Get the token kind.
+@@ -74,11 +74,11 @@ public interface ContainerToken extends DelegationToken {
+    */
+   @Public
+   @Stable
+-  public abstract String getKind();
++  String getKind();
+   
+   @Private
+   @Stable
+-  public abstract void setKind(String kind);
++  void setKind(String kind);
+ 
+   /**
+    * Get the service to which the token is allocated.
+@@ -86,10 +86,10 @@ public interface ContainerToken extends DelegationToken {
+    */
+   @Public
+   @Stable
+-  public abstract String getService();
++  String getService();
+ 
+   @Private
+   @Stable
+-  public abstract void setService(String service);
++  void setService(String service);
+ 
+ }
+diff --git a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/api/impl/pb/client/ContainerManagerPBClientImpl.java b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/api/impl/pb/client/ContainerManagerPBClientImpl.java
+index 80d5b09..0a96b36 100644
+--- a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/api/impl/pb/client/ContainerManagerPBClientImpl.java
++++ b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/api/impl/pb/client/ContainerManagerPBClientImpl.java
+@@ -20,6 +20,7 @@ package org.apache.hadoop.yarn.api.impl.pb.client;
+ 
+ import java.io.IOException;
+ import java.net.InetSocketAddress;
++import java.io.Closeable;
+ 
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.ipc.ProtobufRpcEngine;
+@@ -49,7 +50,8 @@ import org.apache.hadoop.yarn.proto.YarnServiceProtos.StopContainerRequestProto;
+ 
+ import com.google.protobuf.ServiceException;
+ 
+-public class ContainerManagerPBClientImpl implements ContainerManager {
++public class ContainerManagerPBClientImpl implements ContainerManager,
++    Closeable {
+ 
+   // Not a documented config. Only used for tests
+   static final String NM_COMMAND_TIMEOUT = YarnConfiguration.YARN_PREFIX
+diff --git a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/security/ContainerTokenIdentifier.java b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/security/ContainerTokenIdentifier.java
+index a7d6d51..eb88576 100644
+--- a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/security/ContainerTokenIdentifier.java
++++ b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/security/ContainerTokenIdentifier.java
+@@ -35,6 +35,11 @@ import org.apache.hadoop.yarn.api.records.ContainerId;
+ import org.apache.hadoop.yarn.api.records.Resource;
+ import org.apache.hadoop.yarn.util.BuilderUtils;
+ 
++/**
++ * TokenIdentifier for a container. Encodes {@link ContainerId},
++ * {@link Resource} needed by the container and the target NMs host-address.
++ * 
++ */
+ public class ContainerTokenIdentifier extends TokenIdentifier {
+ 
+   private static Log LOG = LogFactory.getLog(ContainerTokenIdentifier.class);
+@@ -44,14 +49,19 @@ public class ContainerTokenIdentifier extends TokenIdentifier {
+   private ContainerId containerId;
+   private String nmHostAddr;
+   private Resource resource;
++  private long expiryTimeStamp;
+ 
+   public ContainerTokenIdentifier(ContainerId containerID, String hostName,
+-      Resource r) {
++      Resource r, long expiryTimeStamp) {
+     this.containerId = containerID;
+     this.nmHostAddr = hostName;
+     this.resource = r;
++    this.expiryTimeStamp = expiryTimeStamp;
+   }
+ 
++  /**
++   * Default constructor needed by RPC layer/SecretManager.
++   */
+   public ContainerTokenIdentifier() {
+   }
+ 
+@@ -67,6 +77,10 @@ public class ContainerTokenIdentifier extends TokenIdentifier {
+     return this.resource;
+   }
+ 
++  public long getExpiryTimeStamp() {
++    return this.expiryTimeStamp;
++  }
++
+   @Override
+   public void write(DataOutput out) throws IOException {
+     LOG.debug("Writing ContainerTokenIdentifier to RPC layer: " + this);
+@@ -79,6 +93,7 @@ public class ContainerTokenIdentifier extends TokenIdentifier {
+     out.writeInt(this.containerId.getId());
+     out.writeUTF(this.nmHostAddr);
+     out.writeInt(this.resource.getMemory());
++    out.writeLong(this.expiryTimeStamp);
+   }
+ 
+   @Override
+@@ -91,6 +106,7 @@ public class ContainerTokenIdentifier extends TokenIdentifier {
+         .readInt());
+     this.nmHostAddr = in.readUTF();
+     this.resource = BuilderUtils.newResource(in.readInt());
++    this.expiryTimeStamp = in.readLong();
+   }
+ 
+   @Override
+@@ -103,6 +119,7 @@ public class ContainerTokenIdentifier extends TokenIdentifier {
+     return UserGroupInformation.createRemoteUser(this.containerId.toString());
+   }
+ 
++  // TODO: Needed?
+   @InterfaceAudience.Private
+   public static class Renewer extends Token.TrivialRenewer {
+     @Override
+diff --git a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-common/src/main/java/org/apache/hadoop/yarn/server/security/ContainerTokenSecretManager.java b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-common/src/main/java/org/apache/hadoop/yarn/server/security/ContainerTokenSecretManager.java
+index 7bf1678..3a041c4 100644
+--- a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-common/src/main/java/org/apache/hadoop/yarn/server/security/ContainerTokenSecretManager.java
++++ b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-common/src/main/java/org/apache/hadoop/yarn/server/security/ContainerTokenSecretManager.java
+@@ -18,6 +18,7 @@
+ 
+ package org.apache.hadoop.yarn.server.security;
+ 
++import java.nio.ByteBuffer;
+ import java.util.Map;
+ import java.util.concurrent.ConcurrentHashMap;
+ 
+@@ -25,9 +26,21 @@ import javax.crypto.SecretKey;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.security.token.SecretManager;
++import org.apache.hadoop.yarn.api.records.ContainerId;
++import org.apache.hadoop.yarn.api.records.ContainerToken;
++import org.apache.hadoop.yarn.api.records.NodeId;
++import org.apache.hadoop.yarn.api.records.Resource;
++import org.apache.hadoop.yarn.conf.YarnConfiguration;
+ import org.apache.hadoop.yarn.security.ContainerTokenIdentifier;
++import org.apache.hadoop.yarn.util.BuilderUtils;
+ 
++/**
++ * SecretManager for ContainerTokens. Used by both RM and NM and hence is
++ * present in yarn-server-common package.
++ * 
++ */
+ public class ContainerTokenSecretManager extends
+     SecretManager<ContainerTokenIdentifier> {
+ 
+@@ -36,7 +49,34 @@ public class ContainerTokenSecretManager extends
+ 
+   Map<String, SecretKey> secretkeys =
+     new ConcurrentHashMap<String, SecretKey>();
+-  
++
++  private final long containerTokenExpiryInterval;
++
++  public ContainerTokenSecretManager(Configuration conf) {
++    this.containerTokenExpiryInterval =
++        conf.getInt(YarnConfiguration.RM_CONTAINER_ALLOC_EXPIRY_INTERVAL_MS,
++          YarnConfiguration.DEFAULT_RM_CONTAINER_ALLOC_EXPIRY_INTERVAL_MS);
++  }
++
++  public ContainerToken createContainerToken(ContainerId containerId,
++      NodeId nodeId, Resource capability) {
++    try {
++      long expiryTimeStamp =
++          System.currentTimeMillis() + containerTokenExpiryInterval;
++      ContainerTokenIdentifier tokenIdentifier =
++          new ContainerTokenIdentifier(containerId, nodeId.toString(),
++            capability, expiryTimeStamp);
++      return BuilderUtils.newContainerToken(nodeId,
++        ByteBuffer.wrap(this.createPassword(tokenIdentifier)), tokenIdentifier);
++    } catch (IllegalArgumentException e) {
++      // this could be because DNS is down - in which case we just want
++      // to retry and not bring RM down. Caller should note and act on the fact
++      // that container is not creatable.
++      LOG.error("Error trying to create new container", e);
++      return null;
++    }
++  }
++
+   // Used by master for generation of secretyKey per host
+   public SecretKey createAndGetSecretKey(CharSequence hostName) {
+     String hostNameStr = hostName.toString();
+diff --git a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/NodeManager.java b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/NodeManager.java
+index e7b6b91..c110bd7 100644
+--- a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/NodeManager.java
++++ b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/NodeManager.java
+@@ -115,7 +115,7 @@ public class NodeManager extends CompositeService implements
+     if (UserGroupInformation.isSecurityEnabled()) {
+       LOG.info("Security is enabled on NodeManager. "
+           + "Creating ContainerTokenSecretManager");
+-      this.containerTokenSecretManager = new ContainerTokenSecretManager();
++      this.containerTokenSecretManager = new ContainerTokenSecretManager(conf);
+     }
+ 
+     this.aclsManager = new ApplicationACLsManager(conf);
+diff --git a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/ContainerManagerImpl.java b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/ContainerManagerImpl.java
+index 4e0e0b4..8ec4c5e 100644
+--- a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/ContainerManagerImpl.java
++++ b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/ContainerManagerImpl.java
+@@ -324,6 +324,15 @@ public class ContainerManagerImpl extends CompositeService implements
+                 + containerIDStr);
+       } else {
+ 
++        // Ensure the token is not expired. 
++        // Token expiry is not checked for stopContainer/getContainerStatus
++        if (tokenId.getExpiryTimeStamp() < System.currentTimeMillis()) {
++          unauthorized = true;
++          messageBuilder.append("\nThis token is expired. current time is "
++              + System.currentTimeMillis() + " found "
++              + tokenId.getExpiryTimeStamp());
++        }
++        
+         Resource resource = tokenId.getResource();
+         if (!resource.equals(launchContext.getResource())) {
+           unauthorized = true;
+diff --git a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/TestEventFlow.java b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/TestEventFlow.java
+index 9a358f6..dcdc1b9 100644
+--- a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/TestEventFlow.java
++++ b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/TestEventFlow.java
+@@ -86,7 +86,8 @@ public class TestEventFlow {
+     healthChecker.init(conf);
+     LocalDirsHandlerService dirsHandler = healthChecker.getDiskHandler();
+     NodeManagerMetrics metrics = NodeManagerMetrics.create();
+-    ContainerTokenSecretManager containerTokenSecretManager =  new ContainerTokenSecretManager();
++    ContainerTokenSecretManager containerTokenSecretManager =
++        new ContainerTokenSecretManager(conf);
+     NodeStatusUpdater nodeStatusUpdater =
+         new NodeStatusUpdaterImpl(context, dispatcher, healthChecker, metrics, containerTokenSecretManager) {
+       @Override
+diff --git a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/BaseContainerManagerTest.java b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/BaseContainerManagerTest.java
+index 6d1ad8e..4e42926 100644
+--- a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/BaseContainerManagerTest.java
++++ b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/BaseContainerManagerTest.java
+@@ -70,7 +70,8 @@ public abstract class BaseContainerManagerTest {
+   protected static File localLogDir;
+   protected static File remoteLogDir;
+   protected static File tmpDir;
+-  protected ContainerTokenSecretManager containerTokenSecretManager = new ContainerTokenSecretManager();
++  protected ContainerTokenSecretManager containerTokenSecretManager =
++      new ContainerTokenSecretManager(new Configuration());
+ 
+   protected final NodeManagerMetrics metrics = NodeManagerMetrics.create();
+ 
+diff --git a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/TestContainerManager.java b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/TestContainerManager.java
+index c341548..3ec5fa2 100644
+--- a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/TestContainerManager.java
++++ b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/TestContainerManager.java
+@@ -385,7 +385,7 @@ public class TestContainerManager extends BaseContainerManagerTest {
+     delSrvc.init(conf);
+ 
+     ContainerTokenSecretManager containerTokenSecretManager = new 
+-        ContainerTokenSecretManager();
++        ContainerTokenSecretManager(conf);
+     containerManager = new ContainerManagerImpl(context, exec, delSrvc,
+         nodeStatusUpdater, metrics, containerTokenSecretManager,
+         new ApplicationACLsManager(conf), dirsHandler);
+diff --git a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/ResourceManager.java b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/ResourceManager.java
+index abf3ff9..2145480 100644
+--- a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/ResourceManager.java
++++ b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/ResourceManager.java
+@@ -100,8 +100,7 @@ public class ResourceManager extends CompositeService implements Recoverable {
+   protected ClientToAMSecretManager clientToAMSecretManager =
+       new ClientToAMSecretManager();
+   
+-  protected ContainerTokenSecretManager containerTokenSecretManager =
+-      new ContainerTokenSecretManager();
++  protected ContainerTokenSecretManager containerTokenSecretManager;
+ 
+   protected ApplicationTokenSecretManager appTokenSecretManager;
+ 
+@@ -151,6 +150,8 @@ public class ResourceManager extends CompositeService implements Recoverable {
+         this.rmDispatcher);
+     addService(this.containerAllocationExpirer);
+ 
++    this.containerTokenSecretManager  = new ContainerTokenSecretManager(conf);
++
+     AMLivelinessMonitor amLivelinessMonitor = createAMLivelinessMonitor();
+     addService(amLivelinessMonitor);
+ 
+@@ -604,6 +605,11 @@ public class ResourceManager extends CompositeService implements Recoverable {
+   }
+ 
+   @Private
++  public ContainerTokenSecretManager getContainerTokenSecretManager() {
++    return this.containerTokenSecretManager;
++  }
++
++  @Private
+   public ApplicationTokenSecretManager getApplicationTokenSecretManager(){
+     return this.appTokenSecretManager;
+   }
+diff --git a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmcontainer/ContainerAllocationExpirer.java b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmcontainer/ContainerAllocationExpirer.java
+index 0e65a9b..74abe0a 100644
+--- a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmcontainer/ContainerAllocationExpirer.java
++++ b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmcontainer/ContainerAllocationExpirer.java
+@@ -27,6 +27,7 @@ import org.apache.hadoop.yarn.event.EventHandler;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.event.ContainerExpiredSchedulerEvent;
+ import org.apache.hadoop.yarn.util.AbstractLivelinessMonitor;
+ 
++@SuppressWarnings({"unchecked", "rawtypes"})
+ public class ContainerAllocationExpirer extends
+     AbstractLivelinessMonitor<ContainerId> {
+ 
+diff --git a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/LeafQueue.java b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/LeafQueue.java
+index 1a00baa..db51149 100644
+--- a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/LeafQueue.java
++++ b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/LeafQueue.java
+@@ -19,7 +19,6 @@
+ package org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity;
+ 
+ import java.io.IOException;
+-import java.nio.ByteBuffer;
+ import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.Comparator;
+@@ -54,7 +53,6 @@ import org.apache.hadoop.yarn.api.records.Resource;
+ import org.apache.hadoop.yarn.api.records.ResourceRequest;
+ import org.apache.hadoop.yarn.factories.RecordFactory;
+ import org.apache.hadoop.yarn.factory.providers.RecordFactoryProvider;
+-import org.apache.hadoop.yarn.security.ContainerTokenIdentifier;
+ import org.apache.hadoop.yarn.server.resourcemanager.resource.Resources;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainer;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainerEventType;
+@@ -1183,17 +1181,11 @@ public class LeafQueue implements CSQueue {
+ 
+     // If security is enabled, send the container-tokens too.
+     if (UserGroupInformation.isSecurityEnabled()) {
+-      ContainerTokenIdentifier tokenIdentifier = new ContainerTokenIdentifier(
+-          containerId, nodeId.toString(), capability);
+-      try {
+-        containerToken = BuilderUtils.newContainerToken(nodeId, ByteBuffer
+-            .wrap(containerTokenSecretManager
+-                .createPassword(tokenIdentifier)), tokenIdentifier);
+-      } catch (IllegalArgumentException e) {
+-         // this could be because DNS is down - in which case we just want
+-         // to retry and not bring RM down
+-         LOG.error("Error trying to create new container", e);
+-         return null;
++      containerToken =
++          containerTokenSecretManager.createContainerToken(containerId, nodeId,
++            capability);
++      if (containerToken == null) {
++        return null; // Try again later.
+       }
+     }
+ 
+diff --git a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/FifoScheduler.java b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/FifoScheduler.java
+index 1dafb3a..36bbea5 100644
+--- a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/FifoScheduler.java
++++ b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/FifoScheduler.java
+@@ -19,7 +19,6 @@
+ package org.apache.hadoop.yarn.server.resourcemanager.scheduler.fifo;
+ 
+ import java.io.IOException;
+-import java.nio.ByteBuffer;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collections;
+@@ -32,7 +31,6 @@ import java.util.concurrent.ConcurrentHashMap;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.classification.InterfaceAudience.LimitedPrivate;
+-import org.apache.hadoop.classification.InterfaceAudience.Private;
+ import org.apache.hadoop.classification.InterfaceStability.Evolving;
+ import org.apache.hadoop.conf.Configurable;
+ import org.apache.hadoop.conf.Configuration;
+@@ -55,7 +53,6 @@ import org.apache.hadoop.yarn.api.records.ResourceRequest;
+ import org.apache.hadoop.yarn.conf.YarnConfiguration;
+ import org.apache.hadoop.yarn.factories.RecordFactory;
+ import org.apache.hadoop.yarn.factory.providers.RecordFactoryProvider;
+-import org.apache.hadoop.yarn.security.ContainerTokenIdentifier;
+ import org.apache.hadoop.yarn.server.resourcemanager.RMAuditLogger;
+ import org.apache.hadoop.yarn.server.resourcemanager.RMAuditLogger.AuditConstants;
+ import org.apache.hadoop.yarn.server.resourcemanager.RMContext;
+@@ -545,11 +542,12 @@ public class FifoScheduler implements ResourceScheduler, Configurable {
+ 
+         // If security is enabled, send the container-tokens too.
+         if (UserGroupInformation.isSecurityEnabled()) {
+-          ContainerTokenIdentifier tokenIdentifier = new ContainerTokenIdentifier(
+-              containerId, nodeId.toString(), capability);
+-          containerToken = BuilderUtils.newContainerToken(nodeId, ByteBuffer
+-              .wrap(containerTokenSecretManager
+-                  .createPassword(tokenIdentifier)), tokenIdentifier);
++          containerToken =
++              containerTokenSecretManager.createContainerToken(containerId,
++                nodeId, capability);
++          if (containerToken == null) {
++            return i; // Try again later.
++          }
+         }
+ 
+         // Create the container
+@@ -566,11 +564,11 @@ public class FifoScheduler implements ResourceScheduler, Configurable {
+         // Inform the node
+         node.allocateContainer(application.getApplicationId(), 
+             rmContainer);
++
++        // Update usage for this container
++        Resources.addTo(usedResource, capability);
+       }
+-      
+-      // Update total usage
+-      Resources.addTo(usedResource,
+-          Resources.multiply(capability, assignedContainers));
++
+     }
+     
+     return assignedContainers;
+diff --git a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/resourcetracker/TestNMExpiry.java b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/resourcetracker/TestNMExpiry.java
+index deb71a9..72fbba5 100644
+--- a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/resourcetracker/TestNMExpiry.java
++++ b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/resourcetracker/TestNMExpiry.java
+@@ -52,8 +52,6 @@ public class TestNMExpiry {
+   private static final RecordFactory recordFactory = RecordFactoryProvider.getRecordFactory(null);
+   
+   ResourceTrackerService resourceTrackerService;
+-  ContainerTokenSecretManager containerTokenSecretManager = 
+-    new ContainerTokenSecretManager();
+ 
+   private class TestNmLivelinessMonitor extends NMLivelinessMonitor {
+     public TestNmLivelinessMonitor(Dispatcher dispatcher) {
+@@ -84,6 +82,8 @@ public class TestNMExpiry {
+     nmLivelinessMonitor.start();
+     NodesListManager nodesListManager = new NodesListManager(context);
+     nodesListManager.init(conf);
++    ContainerTokenSecretManager containerTokenSecretManager =
++        new ContainerTokenSecretManager(conf);
+     resourceTrackerService = new ResourceTrackerService(context,
+         nodesListManager, nmLivelinessMonitor, containerTokenSecretManager);
+     
+diff --git a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/resourcetracker/TestRMNMRPCResponseId.java b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/resourcetracker/TestRMNMRPCResponseId.java
+index ef7d4b2..5d4d92a 100644
+--- a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/resourcetracker/TestRMNMRPCResponseId.java
++++ b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/resourcetracker/TestRMNMRPCResponseId.java
+@@ -52,8 +52,6 @@ import org.junit.Test;
+ public class TestRMNMRPCResponseId {
+   private static final RecordFactory recordFactory = RecordFactoryProvider.getRecordFactory(null);
+   ResourceTrackerService resourceTrackerService;
+-  ContainerTokenSecretManager containerTokenSecretManager =
+-    new ContainerTokenSecretManager();
+   private NodeId nodeId;
+ 
+   @Before
+@@ -73,6 +71,8 @@ public class TestRMNMRPCResponseId {
+     NodesListManager nodesListManager = new NodesListManager(context);
+     Configuration conf = new Configuration();
+     nodesListManager.init(conf);
++    ContainerTokenSecretManager containerTokenSecretManager =
++        new ContainerTokenSecretManager(conf);
+     resourceTrackerService = new ResourceTrackerService(context,
+         nodesListManager, new NMLivelinessMonitor(dispatcher),
+         containerTokenSecretManager);
+diff --git a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-tests/src/test/java/org/apache/hadoop/yarn/server/TestContainerManagerSecurity.java b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-tests/src/test/java/org/apache/hadoop/yarn/server/TestContainerManagerSecurity.java
+index 4594c05..1d731cf 100644
+--- a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-tests/src/test/java/org/apache/hadoop/yarn/server/TestContainerManagerSecurity.java
++++ b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-tests/src/test/java/org/apache/hadoop/yarn/server/TestContainerManagerSecurity.java
+@@ -45,6 +45,7 @@ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.UnsupportedFileSystemException;
+ import org.apache.hadoop.io.DataInputBuffer;
+ import org.apache.hadoop.io.Text;
++import org.apache.hadoop.ipc.RPC;
+ import org.apache.hadoop.net.NetUtils;
+ import org.apache.hadoop.security.AccessControlException;
+ import org.apache.hadoop.security.SecurityUtil;
+@@ -214,11 +215,12 @@ public class TestContainerManagerSecurity {
+ 
+     ContainerTokenIdentifier dummyIdentifier = new ContainerTokenIdentifier();
+     dummyIdentifier.readFields(di);
++
+     // Malice user modifies the resource amount
+     Resource modifiedResource = BuilderUtils.newResource(2048);
+     ContainerTokenIdentifier modifiedIdentifier = new ContainerTokenIdentifier(
+         dummyIdentifier.getContainerID(), dummyIdentifier.getNmHostAddress(),
+-        modifiedResource);
++        modifiedResource, Long.MAX_VALUE);
+     Token<ContainerTokenIdentifier> modifiedToken = new Token<ContainerTokenIdentifier>(
+         modifiedIdentifier.getBytes(), containerToken.getPassword().array(),
+         new Text(containerToken.getKind()), new Text(containerToken
+@@ -288,6 +290,7 @@ public class TestContainerManagerSecurity {
+     // Now talk to the NM for launching the container with modified containerID
+     final ContainerId containerID = allocatedContainer.getId();
+ 
++    /////////// Test calls with illegal containerIDs and illegal Resources
+     UserGroupInformation unauthorizedUser = UserGroupInformation
+         .createRemoteUser(containerID.toString());
+     ContainerToken containerToken = allocatedContainer.getContainerToken();
+@@ -303,9 +306,10 @@ public class TestContainerManagerSecurity {
+             containerToken.getKind()), new Text(containerToken.getService()));
+ 
+     unauthorizedUser.addToken(token);
+-    unauthorizedUser.doAs(new PrivilegedAction<Void>() {
++    ContainerManager client =
++        unauthorizedUser.doAs(new PrivilegedAction<ContainerManager>() {
+       @Override
+-      public Void run() {
++      public ContainerManager run() {
+         ContainerManager client = (ContainerManager) yarnRPC.getProxy(
+             ContainerManager.class, NetUtils
+                 .createSocketAddr(allocatedContainer.getNodeId().toString()),
+@@ -316,16 +320,76 @@ public class TestContainerManagerSecurity {
+         callWithIllegalContainerID(client, tokenId);
+         callWithIllegalResource(client, tokenId);
+ 
++        return client;
++      }
++    });
++    
++    /////////// End of testing for illegal containerIDs and illegal Resources
++
++    /////////// Test calls with expired tokens
++    RPC.stopProxy(client);
++    unauthorizedUser = UserGroupInformation
++        .createRemoteUser(containerID.toString());
++
++    final ContainerTokenIdentifier newTokenId =
++        new ContainerTokenIdentifier(tokenId.getContainerID(),
++          tokenId.getNmHostAddress(), tokenId.getResource(),
++          System.currentTimeMillis() - 1);
++    byte[] passowrd =
++        resourceManager.getContainerTokenSecretManager().createPassword(
++            newTokenId);
++    // Create a valid token by using the key from the RM.
++    token = new Token<ContainerTokenIdentifier>(
++        newTokenId.getBytes(), passowrd, new Text(
++            containerToken.getKind()), new Text(containerToken.getService()));
++    
++    
++    
++    unauthorizedUser.addToken(token);
++    unauthorizedUser.doAs(new PrivilegedAction<Void>() {
++      @Override
++      public Void run() {
++        ContainerManager client = (ContainerManager) yarnRPC.getProxy(
++            ContainerManager.class, NetUtils
++                .createSocketAddr(allocatedContainer.getNodeId().toString()),
++            conf);
++
++        LOG.info("Going to contact NM with expired token");
++        ContainerLaunchContext context = createContainerLaunchContextForTest(newTokenId);
++        StartContainerRequest request = Records.newRecord(StartContainerRequest.class);
++        request.setContainerLaunchContext(context);
++
++        //Calling startContainer with an expired token.
++        try {
++          client.startContainer(request);
++          fail("Connection initiation with expired "
++              + "token is expected to fail.");
++        } catch (Throwable t) {
++          LOG.info("Got exception : ", t);
++          Assert.assertTrue(t.getMessage().contains(
++                  "This token is expired. current time is"));
++        }
++
++        // Try stopping a container - should not get an expiry error.
++        StopContainerRequest stopRequest = Records.newRecord(StopContainerRequest.class);
++        stopRequest.setContainerId(newTokenId.getContainerID());
++        try {
++          client.stopContainer(stopRequest);
++        } catch (Throwable t) {
++          fail("Stop Container call should have succeeded");
++        }
++        
+         return null;
+       }
+     });
++    /////////// End of testing calls with expired tokens
+ 
+     KillApplicationRequest request = Records
+         .newRecord(KillApplicationRequest.class);
+     request.setApplicationId(appID);
+     resourceManager.getClientRMService().forceKillApplication(request);
+   }
+-
++  
+   private AMRMProtocol submitAndRegisterApplication(
+       ResourceManager resourceManager, final YarnRPC yarnRPC,
+       ApplicationId appID) throws IOException,
+@@ -481,11 +545,9 @@ public class TestContainerManagerSecurity {
+     StartContainerRequest request = recordFactory
+         .newRecordInstance(StartContainerRequest.class);
+     // Authenticated but unauthorized, due to wrong resource
+-    ContainerLaunchContext context = BuilderUtils.newContainerLaunchContext(
+-        tokenId.getContainerID(), "testUser", BuilderUtils.newResource(2048),
+-        new HashMap<String, LocalResource>(), new HashMap<String, String>(),
+-        new ArrayList<String>(), new HashMap<String, ByteBuffer>(), null,
+-        new HashMap<ApplicationAccessType, String>());
++    ContainerLaunchContext context =
++        createContainerLaunchContextForTest(tokenId);
++    context.getResource().setMemory(2048); // Set a different resource size.
+     request.setContainerLaunchContext(context);
+     try {
+       client.startContainer(request);
+@@ -500,4 +562,17 @@ public class TestContainerManagerSecurity {
+               + " but found " + context.getResource().toString()));
+     }
+   }
++
++  private ContainerLaunchContext createContainerLaunchContextForTest(
++      ContainerTokenIdentifier tokenId) {
++    ContainerLaunchContext context =
++        BuilderUtils.newContainerLaunchContext(tokenId.getContainerID(),
++            "testUser",
++            BuilderUtils.newResource(tokenId.getResource().getMemory()),
++            new HashMap<String, LocalResource>(),
++            new HashMap<String, String>(), new ArrayList<String>(),
++            new HashMap<String, ByteBuffer>(), null,
++            new HashMap<ApplicationAccessType, String>());
++    return context;
++  }
+ }
+-- 
+1.7.0.4
+

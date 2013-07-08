@@ -1,0 +1,195 @@
+From 403d160b3e3b530c6300c5cbb5726b4b040f1d6a Mon Sep 17 00:00:00 2001
+From: Arun Murthy <acmurthy@apache.org>
+Date: Mon, 1 Aug 2011 21:49:39 +0000
+Subject: [PATCH 1293/1357] MR1: MAPREDUCE-2187. Reporter sends progress during sort/merge. Contributed by Anupam Seth.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/branch-0.20-security@1152944 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit a453ed137110e1076d5c8e68736c690d37cf9175)
+
+Conflicts:
+	src/mapred/org/apache/hadoop/mapred/ReduceTask.java
+
+Reason: Bug fix
+Ref: CDH-10929
+Author: Anupam Seth
+---
+ .../src/mapred/mapred-default.xml                  |    8 ++
+ .../mapred/org/apache/hadoop/mapred/MapTask.java   |    2 +-
+ .../org/apache/hadoop/mapred/ReduceTask.java       |    2 +-
+ .../src/mapred/org/apache/hadoop/mapred/Task.java  |   14 ++++-
+ .../hadoop/mapred/TestCombineOutputCollector.java  |   77 ++++++++++++++++++++
+ 5 files changed, 100 insertions(+), 3 deletions(-)
+ create mode 100644 src/test/org/apache/hadoop/mapred/TestCombineOutputCollector.java
+
+diff --git a/hadoop-mapreduce1-project/src/mapred/mapred-default.xml b/hadoop-mapreduce1-project/src/mapred/mapred-default.xml
+index 3a09285..37c7a4d 100644
+--- a/hadoop-mapreduce1-project/src/mapred/mapred-default.xml
++++ b/hadoop-mapreduce1-project/src/mapred/mapred-default.xml
+@@ -1205,6 +1205,14 @@
+ </property>
+ 
+ <property>
++  <name>mapred.combine.recordsBeforeProgress</name>
++  <value>10000</value>
++  <description> The number of records to process during combine output collection
++   before sending a progress notification to the TaskTracker.
++  </description>
++</property>
++
++<property>
+   <name>mapred.merge.recordsBeforeProgress</name>
+   <value>10000</value>
+   <description> The number of records to process during merge before
+diff --git a/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/MapTask.java b/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/MapTask.java
+index 49aba02..ae11cbe 100644
+--- a/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/MapTask.java
++++ b/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/MapTask.java
+@@ -858,7 +858,7 @@ public class MapTask extends Task {
+                                              combineInputCounter,
+                                              reporter, null);
+       if (combinerRunner != null) {
+-        combineCollector= new CombineOutputCollector<K,V>(combineOutputCounter);
++        combineCollector= new CombineOutputCollector<K,V>(combineOutputCounter, reporter, job);
+       } else {
+         combineCollector = null;
+       }
+diff --git a/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/ReduceTask.java b/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/ReduceTask.java
+index 3499cc2..aa8d541 100644
+--- a/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/ReduceTask.java
++++ b/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/ReduceTask.java
+@@ -1889,7 +1889,7 @@ public class ReduceTask extends Task {
+                                                   reporter, null);
+       if (combinerRunner != null) {
+         combineCollector = 
+-          new CombineOutputCollector(reduceTask.reduceCombineOutputCounter);
++          new CombineOutputCollector(reduceTask.reduceCombineOutputCounter, reporter, conf);
+       }
+       
+       this.ioSortFactor = conf.getInt("io.sort.factor", 10);
+diff --git a/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/Task.java b/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/Task.java
+index a28b816..62253e2 100644
+--- a/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/Task.java
++++ b/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/Task.java
+@@ -72,6 +72,8 @@ import org.apache.hadoop.fs.FSDataInputStream;
+ abstract public class Task implements Writable, Configurable {
+   private static final Log LOG =
+     LogFactory.getLog(Task.class);
++  public static final String MR_COMBINE_RECORDS_BEFORE_PROGRESS = "mapred.combine.recordsBeforeProgress";
++  public static final long DEFAULT_MR_COMBINE_RECORDS_BEFORE_PROGRESS = 10000;
+ 
+   // Counters used by Task subclasses
+   public static enum Counter { 
+@@ -1124,16 +1126,26 @@ abstract public class Task implements Writable, Configurable {
+   implements OutputCollector<K, V> {
+     private Writer<K, V> writer;
+     private Counters.Counter outCounter;
+-    public CombineOutputCollector(Counters.Counter outCounter) {
++    private Progressable progressable;
++    private long progressBar;
++
++    public CombineOutputCollector(Counters.Counter outCounter, Progressable progressable, Configuration conf) {
+       this.outCounter = outCounter;
++      this.progressable=progressable;
++      progressBar = conf.getLong(MR_COMBINE_RECORDS_BEFORE_PROGRESS, DEFAULT_MR_COMBINE_RECORDS_BEFORE_PROGRESS);
+     }
++    
+     public synchronized void setWriter(Writer<K, V> writer) {
+       this.writer = writer;
+     }
++    
+     public synchronized void collect(K key, V value)
+         throws IOException {
+       outCounter.increment(1);
+       writer.append(key, value);
++      if ((outCounter.getValue() % progressBar) == 0) {
++        progressable.progress();
++      }
+     }
+   }
+ 
+diff --git a/src/test/org/apache/hadoop/mapred/TestCombineOutputCollector.java b/src/test/org/apache/hadoop/mapred/TestCombineOutputCollector.java
+new file mode 100644
+index 0000000..9399267
+--- /dev/null
++++ b/src/test/org/apache/hadoop/mapred/TestCombineOutputCollector.java
+@@ -0,0 +1,77 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.mapred;
++
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.mapred.IFile.Writer;
++import org.apache.hadoop.mapred.Task.CombineOutputCollector;
++import org.apache.hadoop.mapred.Task.TaskReporter;
++import org.junit.Test;
++
++public class TestCombineOutputCollector {
++  private CombineOutputCollector<String, Integer> coc;
++
++  @Test
++  public void testCustomCollect() throws Throwable {
++    //mock creation
++    TaskReporter mockTaskReporter = mock(TaskReporter.class);
++    Counters.Counter outCounter = new Counters.Counter();
++    Writer<String, Integer> mockWriter = mock(Writer.class);
++
++    Configuration conf = new Configuration();
++    conf.set("mapred.combine.recordsBeforeProgress", "2");
++    
++    coc = new CombineOutputCollector<String, Integer>(outCounter, mockTaskReporter, conf);
++    coc.setWriter(mockWriter);
++    verify(mockTaskReporter, never()).progress();
++
++    coc.collect("dummy", 1);
++    verify(mockTaskReporter, never()).progress();
++    
++    coc.collect("dummy", 2);
++    verify(mockTaskReporter, times(1)).progress();
++  }
++  
++  @Test
++  public void testDefaultCollect() throws Throwable {
++    //mock creation
++    TaskReporter mockTaskReporter = mock(TaskReporter.class);
++    Counters.Counter outCounter = new Counters.Counter();
++    Writer<String, Integer> mockWriter = mock(Writer.class);
++
++    Configuration conf = new Configuration();
++    
++    coc = new CombineOutputCollector<String, Integer>(outCounter, mockTaskReporter, conf);
++    coc.setWriter(mockWriter);
++    verify(mockTaskReporter, never()).progress();
++
++    for(int i = 0; i < Task.DEFAULT_MR_COMBINE_RECORDS_BEFORE_PROGRESS; i++) {
++    	coc.collect("dummy", i);
++    }
++    verify(mockTaskReporter, times(1)).progress();
++    for(int i = 0; i < Task.DEFAULT_MR_COMBINE_RECORDS_BEFORE_PROGRESS; i++) {
++    	coc.collect("dummy", i);
++    }
++    verify(mockTaskReporter, times(2)).progress();
++  }
++}
+-- 
+1.7.0.4
+

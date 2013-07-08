@@ -1,0 +1,3195 @@
+From 592c8000fc64f4d84c61d85b61c8e56cc5ed8c1b Mon Sep 17 00:00:00 2001
+From: Alejandro Abdelnur <tucu@apache.org>
+Date: Wed, 27 Jun 2012 16:13:35 +0000
+Subject: [PATCH 0179/1357] HDFS-3481. Refactor HttpFS handling of JAX-RS query string parameters.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/branch-2@1354603 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit b8ac543acf0a7e9a7f99465832afe08d54915c99)
+---
+ .../hadoop/fs/http/client/HttpFSFileSystem.java    |  149 +++--
+ .../http/server/CheckUploadContentTypeFilter.java  |    7 +-
+ .../fs/http/server/HttpFSExceptionProvider.java    |    6 +
+ .../fs/http/server/HttpFSParametersProvider.java   |  398 ++++++++++++
+ .../apache/hadoop/fs/http/server/HttpFSParams.java |  551 ----------------
+ .../apache/hadoop/fs/http/server/HttpFSServer.java |  684 ++++++++++----------
+ .../org/apache/hadoop/lib/wsrs/BooleanParam.java   |    7 +-
+ .../java/org/apache/hadoop/lib/wsrs/ByteParam.java |    4 +-
+ .../java/org/apache/hadoop/lib/wsrs/EnumParam.java |    4 +-
+ .../org/apache/hadoop/lib/wsrs/IntegerParam.java   |    4 +-
+ .../java/org/apache/hadoop/lib/wsrs/LongParam.java |    4 +-
+ .../java/org/apache/hadoop/lib/wsrs/Param.java     |   23 +-
+ .../org/apache/hadoop/lib/wsrs/Parameters.java     |   51 ++
+ .../apache/hadoop/lib/wsrs/ParametersProvider.java |  107 +++
+ .../org/apache/hadoop/lib/wsrs/ShortParam.java     |    4 +-
+ .../org/apache/hadoop/lib/wsrs/StringParam.java    |   22 +-
+ .../fs/http/client/TestHttpFSFileSystem.java       |    1 +
+ .../server/TestCheckUploadContentTypeFilter.java   |   18 +-
+ .../apache/hadoop/lib/wsrs/TestBooleanParam.java   |   50 --
+ .../org/apache/hadoop/lib/wsrs/TestByteParam.java  |   53 --
+ .../org/apache/hadoop/lib/wsrs/TestEnumParam.java  |   52 --
+ .../apache/hadoop/lib/wsrs/TestIntegerParam.java   |   52 --
+ .../org/apache/hadoop/lib/wsrs/TestLongParam.java  |   47 --
+ .../java/org/apache/hadoop/lib/wsrs/TestParam.java |  120 ++++
+ .../org/apache/hadoop/lib/wsrs/TestShortParam.java |   53 --
+ .../apache/hadoop/lib/wsrs/TestStringParam.java    |   64 --
+ .../src/test/resources/httpfs-log4j.properties     |   22 +
+ 27 files changed, 1161 insertions(+), 1396 deletions(-)
+ create mode 100644 hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/server/HttpFSParametersProvider.java
+ delete mode 100644 hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/server/HttpFSParams.java
+ create mode 100644 hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/lib/wsrs/Parameters.java
+ create mode 100644 hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/lib/wsrs/ParametersProvider.java
+ delete mode 100644 hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/lib/wsrs/TestBooleanParam.java
+ delete mode 100644 hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/lib/wsrs/TestByteParam.java
+ delete mode 100644 hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/lib/wsrs/TestEnumParam.java
+ delete mode 100644 hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/lib/wsrs/TestIntegerParam.java
+ delete mode 100644 hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/lib/wsrs/TestLongParam.java
+ create mode 100644 hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/lib/wsrs/TestParam.java
+ delete mode 100644 hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/lib/wsrs/TestShortParam.java
+ delete mode 100644 hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/lib/wsrs/TestStringParam.java
+ create mode 100644 hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/resources/httpfs-log4j.properties
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/client/HttpFSFileSystem.java b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/client/HttpFSFileSystem.java
+index 4a1a205..fa28ba3 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/client/HttpFSFileSystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/client/HttpFSFileSystem.java
+@@ -154,41 +154,33 @@ public class HttpFSFileSystem extends FileSystem {
+ 
+   public static final int HTTP_TEMPORARY_REDIRECT = 307;
+ 
++  private static final String HTTP_GET = "GET";
++  private static final String HTTP_PUT = "PUT";
++  private static final String HTTP_POST = "POST";
++  private static final String HTTP_DELETE = "DELETE";
+ 
+-  /**
+-   * Get operations.
+-   */
+-  public enum GetOpValues {
+-    OPEN, GETFILESTATUS, LISTSTATUS, GETHOMEDIRECTORY, GETCONTENTSUMMARY, GETFILECHECKSUM,
+-    GETDELEGATIONTOKEN, GETFILEBLOCKLOCATIONS, INSTRUMENTATION
+-  }
++  public enum Operation {
++    OPEN(HTTP_GET), GETFILESTATUS(HTTP_GET), LISTSTATUS(HTTP_GET),
++    GETHOMEDIRECTORY(HTTP_GET), GETCONTENTSUMMARY(HTTP_GET),
++    GETFILECHECKSUM(HTTP_GET),  GETFILEBLOCKLOCATIONS(HTTP_GET),
++    INSTRUMENTATION(HTTP_GET),
++    APPEND(HTTP_POST),
++    CREATE(HTTP_PUT), MKDIRS(HTTP_PUT), RENAME(HTTP_PUT), SETOWNER(HTTP_PUT),
++    SETPERMISSION(HTTP_PUT), SETREPLICATION(HTTP_PUT), SETTIMES(HTTP_PUT),
++    DELETE(HTTP_DELETE);
+ 
+-  /**
+-   * Post operations.
+-   */
+-  public static enum PostOpValues {
+-    APPEND
+-  }
++    private String httpMethod;
+ 
+-  /**
+-   * Put operations.
+-   */
+-  public static enum PutOpValues {
+-    CREATE, MKDIRS, RENAME, SETOWNER, SETPERMISSION, SETREPLICATION, SETTIMES,
+-    RENEWDELEGATIONTOKEN, CANCELDELEGATIONTOKEN
+-  }
++    Operation(String httpMethod) {
++      this.httpMethod = httpMethod;
++    }
++
++    public String getMethod() {
++      return httpMethod;
++    }
+ 
+-  /**
+-   * Delete operations.
+-   */
+-  public static enum DeleteOpValues {
+-    DELETE
+   }
+ 
+-  private static final String HTTP_GET = "GET";
+-  private static final String HTTP_PUT = "PUT";
+-  private static final String HTTP_POST = "POST";
+-  private static final String HTTP_DELETE = "DELETE";
+ 
+   private AuthenticatedURL.Token authToken = new AuthenticatedURL.Token();
+   private URI uri;
+@@ -402,10 +394,12 @@ public class HttpFSFileSystem extends FileSystem {
+   @Override
+   public FSDataInputStream open(Path f, int bufferSize) throws IOException {
+     Map<String, String> params = new HashMap<String, String>();
+-    params.put(OP_PARAM, GetOpValues.OPEN.toString());
+-    HttpURLConnection conn = getConnection(HTTP_GET, params, f, true);
++    params.put(OP_PARAM, Operation.OPEN.toString());
++    HttpURLConnection conn = getConnection(Operation.OPEN.getMethod(), params,
++                                           f, true);
+     validateResponse(conn, HttpURLConnection.HTTP_OK);
+-    return new FSDataInputStream(new HttpFSDataInputStream(conn.getInputStream(), bufferSize));
++    return new FSDataInputStream(
++      new HttpFSDataInputStream(conn.getInputStream(), bufferSize));
+   }
+ 
+   /**
+@@ -508,15 +502,18 @@ public class HttpFSFileSystem extends FileSystem {
+    * @see #setPermission(Path, FsPermission)
+    */
+   @Override
+-  public FSDataOutputStream create(Path f, FsPermission permission, boolean overwrite, int bufferSize,
+-                                   short replication, long blockSize, Progressable progress) throws IOException {
++  public FSDataOutputStream create(Path f, FsPermission permission,
++                                   boolean overwrite, int bufferSize,
++                                   short replication, long blockSize,
++                                   Progressable progress) throws IOException {
+     Map<String, String> params = new HashMap<String, String>();
+-    params.put(OP_PARAM, PutOpValues.CREATE.toString());
++    params.put(OP_PARAM, Operation.CREATE.toString());
+     params.put(OVERWRITE_PARAM, Boolean.toString(overwrite));
+     params.put(REPLICATION_PARAM, Short.toString(replication));
+     params.put(BLOCKSIZE_PARAM, Long.toString(blockSize));
+     params.put(PERMISSION_PARAM, permissionToString(permission));
+-    return uploadData(HTTP_PUT, f, params, bufferSize, HttpURLConnection.HTTP_CREATED);
++    return uploadData(Operation.CREATE.getMethod(), f, params, bufferSize,
++                      HttpURLConnection.HTTP_CREATED);
+   }
+ 
+ 
+@@ -532,10 +529,12 @@ public class HttpFSFileSystem extends FileSystem {
+    * @throws IOException
+    */
+   @Override
+-  public FSDataOutputStream append(Path f, int bufferSize, Progressable progress) throws IOException {
++  public FSDataOutputStream append(Path f, int bufferSize,
++                                   Progressable progress) throws IOException {
+     Map<String, String> params = new HashMap<String, String>();
+-    params.put(OP_PARAM, PostOpValues.APPEND.toString());
+-    return uploadData(HTTP_POST, f, params, bufferSize, HttpURLConnection.HTTP_OK);
++    params.put(OP_PARAM, Operation.APPEND.toString());
++    return uploadData(Operation.APPEND.getMethod(), f, params, bufferSize,
++                      HttpURLConnection.HTTP_OK);
+   }
+ 
+   /**
+@@ -545,9 +544,10 @@ public class HttpFSFileSystem extends FileSystem {
+   @Override
+   public boolean rename(Path src, Path dst) throws IOException {
+     Map<String, String> params = new HashMap<String, String>();
+-    params.put(OP_PARAM, PutOpValues.RENAME.toString());
++    params.put(OP_PARAM, Operation.RENAME.toString());
+     params.put(DESTINATION_PARAM, dst.toString());
+-    HttpURLConnection conn = getConnection(HTTP_PUT, params, src, true);
++    HttpURLConnection conn = getConnection(Operation.RENAME.getMethod(),
++                                           params, src, true);
+     validateResponse(conn, HttpURLConnection.HTTP_OK);
+     JSONObject json = (JSONObject) jsonParse(conn);
+     return (Boolean) json.get(RENAME_JSON);
+@@ -580,9 +580,10 @@ public class HttpFSFileSystem extends FileSystem {
+   @Override
+   public boolean delete(Path f, boolean recursive) throws IOException {
+     Map<String, String> params = new HashMap<String, String>();
+-    params.put(OP_PARAM, DeleteOpValues.DELETE.toString());
++    params.put(OP_PARAM, Operation.DELETE.toString());
+     params.put(RECURSIVE_PARAM, Boolean.toString(recursive));
+-    HttpURLConnection conn = getConnection(HTTP_DELETE, params, f, true);
++    HttpURLConnection conn = getConnection(Operation.DELETE.getMethod(),
++                                           params, f, true);
+     validateResponse(conn, HttpURLConnection.HTTP_OK);
+     JSONObject json = (JSONObject) jsonParse(conn);
+     return (Boolean) json.get(DELETE_JSON);
+@@ -601,8 +602,9 @@ public class HttpFSFileSystem extends FileSystem {
+   @Override
+   public FileStatus[] listStatus(Path f) throws IOException {
+     Map<String, String> params = new HashMap<String, String>();
+-    params.put(OP_PARAM, GetOpValues.LISTSTATUS.toString());
+-    HttpURLConnection conn = getConnection(HTTP_GET, params, f, true);
++    params.put(OP_PARAM, Operation.LISTSTATUS.toString());
++    HttpURLConnection conn = getConnection(Operation.LISTSTATUS.getMethod(),
++                                           params, f, true);
+     validateResponse(conn, HttpURLConnection.HTTP_OK);
+     JSONObject json = (JSONObject) jsonParse(conn);
+     json = (JSONObject) json.get(FILE_STATUSES_JSON);
+@@ -647,9 +649,10 @@ public class HttpFSFileSystem extends FileSystem {
+   @Override
+   public boolean mkdirs(Path f, FsPermission permission) throws IOException {
+     Map<String, String> params = new HashMap<String, String>();
+-    params.put(OP_PARAM, PutOpValues.MKDIRS.toString());
++    params.put(OP_PARAM, Operation.MKDIRS.toString());
+     params.put(PERMISSION_PARAM, permissionToString(permission));
+-    HttpURLConnection conn = getConnection(HTTP_PUT, params, f, true);
++    HttpURLConnection conn = getConnection(Operation.MKDIRS.getMethod(),
++                                           params, f, true);
+     validateResponse(conn, HttpURLConnection.HTTP_OK);
+     JSONObject json = (JSONObject) jsonParse(conn);
+     return (Boolean) json.get(MKDIRS_JSON);
+@@ -668,8 +671,9 @@ public class HttpFSFileSystem extends FileSystem {
+   @Override
+   public FileStatus getFileStatus(Path f) throws IOException {
+     Map<String, String> params = new HashMap<String, String>();
+-    params.put(OP_PARAM, GetOpValues.GETFILESTATUS.toString());
+-    HttpURLConnection conn = getConnection(HTTP_GET, params, f, true);
++    params.put(OP_PARAM, Operation.GETFILESTATUS.toString());
++    HttpURLConnection conn = getConnection(Operation.GETFILESTATUS.getMethod(),
++                                           params, f, true);
+     validateResponse(conn, HttpURLConnection.HTTP_OK);
+     JSONObject json = (JSONObject) jsonParse(conn);
+     json = (JSONObject) json.get(FILE_STATUS_JSON);
+@@ -684,9 +688,11 @@ public class HttpFSFileSystem extends FileSystem {
+   @Override
+   public Path getHomeDirectory() {
+     Map<String, String> params = new HashMap<String, String>();
+-    params.put(OP_PARAM, GetOpValues.GETHOMEDIRECTORY.toString());
++    params.put(OP_PARAM, Operation.GETHOMEDIRECTORY.toString());
+     try {
+-      HttpURLConnection conn = getConnection(HTTP_GET, params, new Path(getUri().toString(), "/"), false);
++      HttpURLConnection conn =
++        getConnection(Operation.GETHOMEDIRECTORY.getMethod(), params,
++                      new Path(getUri().toString(), "/"), false);
+       validateResponse(conn, HttpURLConnection.HTTP_OK);
+       JSONObject json = (JSONObject) jsonParse(conn);
+       return new Path((String) json.get(HOME_DIR_JSON));
+@@ -704,12 +710,14 @@ public class HttpFSFileSystem extends FileSystem {
+    * @param groupname If it is null, the original groupname remains unchanged.
+    */
+   @Override
+-  public void setOwner(Path p, String username, String groupname) throws IOException {
++  public void setOwner(Path p, String username, String groupname)
++    throws IOException {
+     Map<String, String> params = new HashMap<String, String>();
+-    params.put(OP_PARAM, PutOpValues.SETOWNER.toString());
++    params.put(OP_PARAM, Operation.SETOWNER.toString());
+     params.put(OWNER_PARAM, username);
+     params.put(GROUP_PARAM, groupname);
+-    HttpURLConnection conn = getConnection(HTTP_PUT, params, p, true);
++    HttpURLConnection conn = getConnection(Operation.SETOWNER.getMethod(),
++                                           params, p, true);
+     validateResponse(conn, HttpURLConnection.HTTP_OK);
+   }
+ 
+@@ -722,9 +730,9 @@ public class HttpFSFileSystem extends FileSystem {
+   @Override
+   public void setPermission(Path p, FsPermission permission) throws IOException {
+     Map<String, String> params = new HashMap<String, String>();
+-    params.put(OP_PARAM, PutOpValues.SETPERMISSION.toString());
++    params.put(OP_PARAM, Operation.SETPERMISSION.toString());
+     params.put(PERMISSION_PARAM, permissionToString(permission));
+-    HttpURLConnection conn = getConnection(HTTP_PUT, params, p, true);
++    HttpURLConnection conn = getConnection(Operation.SETPERMISSION.getMethod(), params, p, true);
+     validateResponse(conn, HttpURLConnection.HTTP_OK);
+   }
+ 
+@@ -742,10 +750,11 @@ public class HttpFSFileSystem extends FileSystem {
+   @Override
+   public void setTimes(Path p, long mtime, long atime) throws IOException {
+     Map<String, String> params = new HashMap<String, String>();
+-    params.put(OP_PARAM, PutOpValues.SETTIMES.toString());
++    params.put(OP_PARAM, Operation.SETTIMES.toString());
+     params.put(MODIFICATION_TIME_PARAM, Long.toString(mtime));
+     params.put(ACCESS_TIME_PARAM, Long.toString(atime));
+-    HttpURLConnection conn = getConnection(HTTP_PUT, params, p, true);
++    HttpURLConnection conn = getConnection(Operation.SETTIMES.getMethod(),
++                                           params, p, true);
+     validateResponse(conn, HttpURLConnection.HTTP_OK);
+   }
+ 
+@@ -761,11 +770,13 @@ public class HttpFSFileSystem extends FileSystem {
+    * @throws IOException
+    */
+   @Override
+-  public boolean setReplication(Path src, short replication) throws IOException {
++  public boolean setReplication(Path src, short replication)
++    throws IOException {
+     Map<String, String> params = new HashMap<String, String>();
+-    params.put(OP_PARAM, PutOpValues.SETREPLICATION.toString());
++    params.put(OP_PARAM, Operation.SETREPLICATION.toString());
+     params.put(REPLICATION_PARAM, Short.toString(replication));
+-    HttpURLConnection conn = getConnection(HTTP_PUT, params, src, true);
++    HttpURLConnection conn =
++      getConnection(Operation.SETREPLICATION.getMethod(), params, src, true);
+     validateResponse(conn, HttpURLConnection.HTTP_OK);
+     JSONObject json = (JSONObject) jsonParse(conn);
+     return (Boolean) json.get(SET_REPLICATION_JSON);
+@@ -814,10 +825,12 @@ public class HttpFSFileSystem extends FileSystem {
+   @Override
+   public ContentSummary getContentSummary(Path f) throws IOException {
+     Map<String, String> params = new HashMap<String, String>();
+-    params.put(OP_PARAM, GetOpValues.GETCONTENTSUMMARY.toString());
+-    HttpURLConnection conn = getConnection(HTTP_GET, params, f, true);
++    params.put(OP_PARAM, Operation.GETCONTENTSUMMARY.toString());
++    HttpURLConnection conn =
++      getConnection(Operation.GETCONTENTSUMMARY.getMethod(), params, f, true);
+     validateResponse(conn, HttpURLConnection.HTTP_OK);
+-    JSONObject json = (JSONObject) ((JSONObject) jsonParse(conn)).get(CONTENT_SUMMARY_JSON);
++    JSONObject json =
++      (JSONObject) ((JSONObject) jsonParse(conn)).get(CONTENT_SUMMARY_JSON);
+     return new ContentSummary((Long) json.get(CONTENT_SUMMARY_LENGTH_JSON),
+                               (Long) json.get(CONTENT_SUMMARY_FILE_COUNT_JSON),
+                               (Long) json.get(CONTENT_SUMMARY_DIRECTORY_COUNT_JSON),
+@@ -830,10 +843,12 @@ public class HttpFSFileSystem extends FileSystem {
+   @Override
+   public FileChecksum getFileChecksum(Path f) throws IOException {
+     Map<String, String> params = new HashMap<String, String>();
+-    params.put(OP_PARAM, GetOpValues.GETFILECHECKSUM.toString());
+-    HttpURLConnection conn = getConnection(HTTP_GET, params, f, true);
++    params.put(OP_PARAM, Operation.GETFILECHECKSUM.toString());
++    HttpURLConnection conn =
++      getConnection(Operation.GETFILECHECKSUM.getMethod(), params, f, true);
+     validateResponse(conn, HttpURLConnection.HTTP_OK);
+-    final JSONObject json = (JSONObject) ((JSONObject) jsonParse(conn)).get(FILE_CHECKSUM_JSON);
++    final JSONObject json =
++      (JSONObject) ((JSONObject) jsonParse(conn)).get(FILE_CHECKSUM_JSON);
+     return new FileChecksum() {
+       @Override
+       public String getAlgorithmName() {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/server/CheckUploadContentTypeFilter.java b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/server/CheckUploadContentTypeFilter.java
+index 7e73666..abd382d 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/server/CheckUploadContentTypeFilter.java
++++ b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/server/CheckUploadContentTypeFilter.java
+@@ -30,7 +30,6 @@ import javax.servlet.ServletResponse;
+ import javax.servlet.http.HttpServletRequest;
+ import javax.servlet.http.HttpServletResponse;
+ import java.io.IOException;
+-import java.net.InetAddress;
+ import java.util.HashSet;
+ import java.util.Set;
+ 
+@@ -43,8 +42,8 @@ public class CheckUploadContentTypeFilter implements Filter {
+   private static final Set<String> UPLOAD_OPERATIONS = new HashSet<String>();
+ 
+   static {
+-    UPLOAD_OPERATIONS.add(HttpFSFileSystem.PostOpValues.APPEND.toString());
+-    UPLOAD_OPERATIONS.add(HttpFSFileSystem.PutOpValues.CREATE.toString());
++    UPLOAD_OPERATIONS.add(HttpFSFileSystem.Operation.APPEND.toString());
++    UPLOAD_OPERATIONS.add(HttpFSFileSystem.Operation.CREATE.toString());
+   }
+ 
+   /**
+@@ -82,7 +81,7 @@ public class CheckUploadContentTypeFilter implements Filter {
+     if (method.equals("PUT") || method.equals("POST")) {
+       String op = httpReq.getParameter(HttpFSFileSystem.OP_PARAM);
+       if (op != null && UPLOAD_OPERATIONS.contains(op.toUpperCase())) {
+-        if ("true".equalsIgnoreCase(httpReq.getParameter(HttpFSParams.DataParam.NAME))) {
++        if ("true".equalsIgnoreCase(httpReq.getParameter(HttpFSParametersProvider.DataParam.NAME))) {
+           String contentType = httpReq.getContentType();
+           contentTypeOK =
+             HttpFSFileSystem.UPLOAD_CONTENT_TYPE.equalsIgnoreCase(contentType);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/server/HttpFSExceptionProvider.java b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/server/HttpFSExceptionProvider.java
+index 26dff49..b999a72 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/server/HttpFSExceptionProvider.java
++++ b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/server/HttpFSExceptionProvider.java
+@@ -18,6 +18,7 @@
+ 
+ package org.apache.hadoop.fs.http.server;
+ 
++import com.sun.jersey.api.container.ContainerException;
+ import org.apache.hadoop.lib.service.FileSystemAccessException;
+ import org.apache.hadoop.lib.wsrs.ExceptionProvider;
+ import org.slf4j.Logger;
+@@ -59,6 +60,9 @@ public class HttpFSExceptionProvider extends ExceptionProvider {
+     if (throwable instanceof FileSystemAccessException) {
+       throwable = throwable.getCause();
+     }
++    if (throwable instanceof ContainerException) {
++      throwable = throwable.getCause();
++    }
+     if (throwable instanceof SecurityException) {
+       status = Response.Status.UNAUTHORIZED;
+     } else if (throwable instanceof FileNotFoundException) {
+@@ -67,6 +71,8 @@ public class HttpFSExceptionProvider extends ExceptionProvider {
+       status = Response.Status.INTERNAL_SERVER_ERROR;
+     } else if (throwable instanceof UnsupportedOperationException) {
+       status = Response.Status.BAD_REQUEST;
++    } else if (throwable instanceof IllegalArgumentException) {
++      status = Response.Status.BAD_REQUEST;
+     } else {
+       status = Response.Status.INTERNAL_SERVER_ERROR;
+     }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/server/HttpFSParametersProvider.java b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/server/HttpFSParametersProvider.java
+new file mode 100644
+index 0000000..0ab1017
+--- /dev/null
++++ b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/server/HttpFSParametersProvider.java
+@@ -0,0 +1,398 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.fs.http.server;
++
++import org.apache.hadoop.fs.http.client.HttpFSFileSystem;
++import org.apache.hadoop.fs.http.client.HttpFSFileSystem.Operation;
++import org.apache.hadoop.lib.wsrs.BooleanParam;
++import org.apache.hadoop.lib.wsrs.EnumParam;
++import org.apache.hadoop.lib.wsrs.LongParam;
++import org.apache.hadoop.lib.wsrs.Param;
++import org.apache.hadoop.lib.wsrs.ParametersProvider;
++import org.apache.hadoop.lib.wsrs.ShortParam;
++import org.apache.hadoop.lib.wsrs.StringParam;
++import org.apache.hadoop.lib.wsrs.UserProvider;
++import org.slf4j.MDC;
++
++import javax.ws.rs.ext.Provider;
++import java.util.HashMap;
++import java.util.Map;
++import java.util.regex.Pattern;
++
++/**
++ * HttpFS ParametersProvider.
++ */
++@Provider
++public class HttpFSParametersProvider extends ParametersProvider {
++
++  private static final Map<Enum, Class<Param<?>>[]> PARAMS_DEF =
++    new HashMap<Enum, Class<Param<?>>[]>();
++
++  static {
++    PARAMS_DEF.put(Operation.OPEN,
++      new Class[]{DoAsParam.class, OffsetParam.class, LenParam.class});
++    PARAMS_DEF.put(Operation.GETFILESTATUS, new Class[]{DoAsParam.class});
++    PARAMS_DEF.put(Operation.LISTSTATUS,
++      new Class[]{DoAsParam.class, FilterParam.class});
++    PARAMS_DEF.put(Operation.GETHOMEDIRECTORY, new Class[]{DoAsParam.class});
++    PARAMS_DEF.put(Operation.GETCONTENTSUMMARY, new Class[]{DoAsParam.class});
++    PARAMS_DEF.put(Operation.GETFILECHECKSUM, new Class[]{DoAsParam.class});
++    PARAMS_DEF.put(Operation.GETFILEBLOCKLOCATIONS,
++      new Class[]{DoAsParam.class});
++    PARAMS_DEF.put(Operation.INSTRUMENTATION, new Class[]{DoAsParam.class});
++    PARAMS_DEF.put(Operation.APPEND,
++      new Class[]{DoAsParam.class, DataParam.class});
++    PARAMS_DEF.put(Operation.CREATE,
++      new Class[]{DoAsParam.class, PermissionParam.class, OverwriteParam.class,
++                  ReplicationParam.class, BlockSizeParam.class, DataParam.class});
++    PARAMS_DEF.put(Operation.MKDIRS,
++      new Class[]{DoAsParam.class, PermissionParam.class});
++    PARAMS_DEF.put(Operation.RENAME,
++      new Class[]{DoAsParam.class, DestinationParam.class});
++    PARAMS_DEF.put(Operation.SETOWNER,
++      new Class[]{DoAsParam.class, OwnerParam.class, GroupParam.class});
++    PARAMS_DEF.put(Operation.SETPERMISSION,
++      new Class[]{DoAsParam.class, PermissionParam.class});
++    PARAMS_DEF.put(Operation.SETREPLICATION,
++      new Class[]{DoAsParam.class, ReplicationParam.class});
++    PARAMS_DEF.put(Operation.SETTIMES,
++      new Class[]{DoAsParam.class, ModifiedTimeParam.class,
++                  AccessTimeParam.class});
++    PARAMS_DEF.put(Operation.DELETE,
++      new Class[]{DoAsParam.class, RecursiveParam.class});
++  }
++
++  public HttpFSParametersProvider() {
++    super(HttpFSFileSystem.OP_PARAM, HttpFSFileSystem.Operation.class,
++          PARAMS_DEF);
++  }
++
++  /**
++   * Class for access-time parameter.
++   */
++  public static class AccessTimeParam extends LongParam {
++
++    /**
++     * Parameter name.
++     */
++    public static final String NAME = HttpFSFileSystem.ACCESS_TIME_PARAM;
++    /**
++     * Constructor.
++     */
++    public AccessTimeParam() {
++      super(NAME, -1l);
++    }
++  }
++
++  /**
++   * Class for block-size parameter.
++   */
++  public static class BlockSizeParam extends LongParam {
++
++    /**
++     * Parameter name.
++     */
++    public static final String NAME = HttpFSFileSystem.BLOCKSIZE_PARAM;
++
++    /**
++     * Constructor.
++     */
++    public BlockSizeParam() {
++      super(NAME, -1l);
++    }
++  }
++
++  /**
++   * Class for data parameter.
++   */
++  public static class DataParam extends BooleanParam {
++
++    /**
++     * Parameter name.
++     */
++    public static final String NAME = "data";
++
++    /**
++     * Constructor.
++     */
++    public DataParam() {
++      super(NAME, false);
++    }
++  }
++
++  /**
++   * Class for operation parameter.
++   */
++  public static class OperationParam extends EnumParam<HttpFSFileSystem.Operation> {
++
++    /**
++     * Parameter name.
++     */
++    public static final String NAME = HttpFSFileSystem.OP_PARAM;
++    /**
++     * Constructor.
++     */
++    public OperationParam(String operation) {
++      super(NAME, HttpFSFileSystem.Operation.class,
++            HttpFSFileSystem.Operation.valueOf(operation.toUpperCase()));
++    }
++  }
++
++  /**
++   * Class for delete's recursive parameter.
++   */
++  public static class RecursiveParam extends BooleanParam {
++
++    /**
++     * Parameter name.
++     */
++    public static final String NAME = HttpFSFileSystem.RECURSIVE_PARAM;
++
++    /**
++     * Constructor.
++     */
++    public RecursiveParam() {
++      super(NAME, false);
++    }
++  }
++
++  /**
++   * Class for do-as parameter.
++   */
++  public static class DoAsParam extends StringParam {
++
++    /**
++     * Parameter name.
++     */
++    public static final String NAME = HttpFSFileSystem.DO_AS_PARAM;
++
++    /**
++     * Constructor.
++     */
++    public DoAsParam() {
++      super(NAME, null, UserProvider.USER_PATTERN);
++    }
++
++    /**
++     * Delegates to parent and then adds do-as user to
++     * MDC context for logging purposes.
++     *
++     *
++     * @param str parameter value.
++     *
++     * @return parsed parameter
++     */
++    @Override
++    public String parseParam(String str) {
++      String doAs = super.parseParam(str);
++      MDC.put(getName(), (doAs != null) ? doAs : "-");
++      return doAs;
++    }
++  }
++
++  /**
++   * Class for filter parameter.
++   */
++  public static class FilterParam extends StringParam {
++
++    /**
++     * Parameter name.
++     */
++    public static final String NAME = "filter";
++
++    /**
++     * Constructor.
++     */
++    public FilterParam() {
++      super(NAME, null);
++    }
++
++  }
++
++  /**
++   * Class for group parameter.
++   */
++  public static class GroupParam extends StringParam {
++
++    /**
++     * Parameter name.
++     */
++    public static final String NAME = HttpFSFileSystem.GROUP_PARAM;
++
++    /**
++     * Constructor.
++     */
++    public GroupParam() {
++      super(NAME, null, UserProvider.USER_PATTERN);
++    }
++
++  }
++
++  /**
++   * Class for len parameter.
++   */
++  public static class LenParam extends LongParam {
++
++    /**
++     * Parameter name.
++     */
++    public static final String NAME = "len";
++
++    /**
++     * Constructor.
++     */
++    public LenParam() {
++      super(NAME, -1l);
++    }
++  }
++
++  /**
++   * Class for modified-time parameter.
++   */
++  public static class ModifiedTimeParam extends LongParam {
++
++    /**
++     * Parameter name.
++     */
++    public static final String NAME = HttpFSFileSystem.MODIFICATION_TIME_PARAM;
++
++    /**
++     * Constructor.
++     */
++    public ModifiedTimeParam() {
++      super(NAME, -1l);
++    }
++  }
++
++  /**
++   * Class for offset parameter.
++   */
++  public static class OffsetParam extends LongParam {
++
++    /**
++     * Parameter name.
++     */
++    public static final String NAME = "offset";
++
++    /**
++     * Constructor.
++     */
++    public OffsetParam() {
++      super(NAME, 0l);
++    }
++  }
++
++  /**
++   * Class for overwrite parameter.
++   */
++  public static class OverwriteParam extends BooleanParam {
++
++    /**
++     * Parameter name.
++     */
++    public static final String NAME = HttpFSFileSystem.OVERWRITE_PARAM;
++
++    /**
++     * Constructor.
++     */
++    public OverwriteParam() {
++      super(NAME, true);
++    }
++  }
++
++  /**
++   * Class for owner parameter.
++   */
++  public static class OwnerParam extends StringParam {
++
++    /**
++     * Parameter name.
++     */
++    public static final String NAME = HttpFSFileSystem.OWNER_PARAM;
++
++    /**
++     * Constructor.
++     */
++    public OwnerParam() {
++      super(NAME, null, UserProvider.USER_PATTERN);
++    }
++
++  }
++
++  /**
++   * Class for permission parameter.
++   */
++  public static class PermissionParam extends StringParam {
++
++    /**
++     * Parameter name.
++     */
++    public static final String NAME = HttpFSFileSystem.PERMISSION_PARAM;
++
++    /**
++     * Symbolic Unix permissions regular expression pattern.
++     */
++    private static final Pattern PERMISSION_PATTERN =
++      Pattern.compile(HttpFSFileSystem.DEFAULT_PERMISSION +
++                      "|[0-1]?[0-7][0-7][0-7]");
++
++    /**
++     * Constructor.
++     */
++    public PermissionParam() {
++      super(NAME, HttpFSFileSystem.DEFAULT_PERMISSION, PERMISSION_PATTERN);
++    }
++
++  }
++
++  /**
++   * Class for replication parameter.
++   */
++  public static class ReplicationParam extends ShortParam {
++
++    /**
++     * Parameter name.
++     */
++    public static final String NAME = HttpFSFileSystem.REPLICATION_PARAM;
++
++    /**
++     * Constructor.
++     */
++    public ReplicationParam() {
++      super(NAME, (short) -1);
++    }
++  }
++
++  /**
++   * Class for to-path parameter.
++   */
++  public static class DestinationParam extends StringParam {
++
++    /**
++     * Parameter name.
++     */
++    public static final String NAME = HttpFSFileSystem.DESTINATION_PARAM;
++
++    /**
++     * Constructor.
++     */
++    public DestinationParam() {
++      super(NAME, null);
++    }
++  }
++}
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/server/HttpFSParams.java b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/server/HttpFSParams.java
+deleted file mode 100644
+index 3c7b5f7..0000000
+--- a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/server/HttpFSParams.java
++++ /dev/null
+@@ -1,551 +0,0 @@
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package org.apache.hadoop.fs.http.server;
+-
+-import org.apache.hadoop.fs.http.client.HttpFSFileSystem;
+-import org.apache.hadoop.lib.wsrs.BooleanParam;
+-import org.apache.hadoop.lib.wsrs.EnumParam;
+-import org.apache.hadoop.lib.wsrs.LongParam;
+-import org.apache.hadoop.lib.wsrs.ShortParam;
+-import org.apache.hadoop.lib.wsrs.StringParam;
+-import org.apache.hadoop.lib.wsrs.UserProvider;
+-import org.slf4j.MDC;
+-
+-import java.util.regex.Pattern;
+-
+-/**
+- * HttpFS HTTP Parameters used by {@link HttpFSServer}.
+- */
+-public class HttpFSParams {
+-
+-  /**
+-   * To avoid instantiation.
+-   */
+-  private HttpFSParams() {
+-  }
+-
+-  /**
+-   * Class for access-time parameter.
+-   */
+-  public static class AccessTimeParam extends LongParam {
+-
+-    /**
+-     * Parameter name.
+-     */
+-    public static final String NAME = HttpFSFileSystem.ACCESS_TIME_PARAM;
+-
+-    /**
+-     * Default parameter value.
+-     */
+-    public static final String DEFAULT = "-1";
+-
+-    /**
+-     * Constructor.
+-     *
+-     * @param str parameter value.
+-     */
+-    public AccessTimeParam(String str) {
+-      super(NAME, str);
+-    }
+-  }
+-
+-  /**
+-   * Class for block-size parameter.
+-   */
+-  public static class BlockSizeParam extends LongParam {
+-
+-    /**
+-     * Parameter name.
+-     */
+-    public static final String NAME = HttpFSFileSystem.BLOCKSIZE_PARAM;
+-
+-    /**
+-     * Default parameter value.
+-     */
+-    public static final String DEFAULT = "-1";
+-
+-    /**
+-     * Constructor.
+-     *
+-     * @param str parameter value.
+-     */
+-    public BlockSizeParam(String str) {
+-      super(NAME, str);
+-    }
+-  }
+-
+-  /**
+-   * Class for data parameter.
+-   */
+-  public static class DataParam extends BooleanParam {
+-
+-    /**
+-     * Parameter name.
+-     */
+-    public static final String NAME = "data";
+-
+-    /**
+-     * Default parameter value.
+-     */
+-    public static final String DEFAULT = "false";
+-
+-    /**
+-     * Constructor.
+-     *
+-     * @param str parameter value.
+-     */
+-    public DataParam(String str) {
+-      super(NAME, str);
+-    }
+-  }
+-
+-  /**
+-   * Class for DELETE operation parameter.
+-   */
+-  public static class DeleteOpParam extends EnumParam<HttpFSFileSystem.DeleteOpValues> {
+-
+-    /**
+-     * Parameter name.
+-     */
+-    public static final String NAME = HttpFSFileSystem.OP_PARAM;
+-
+-    /**
+-     * Constructor.
+-     *
+-     * @param str parameter value.
+-     */
+-    public DeleteOpParam(String str) {
+-      super(NAME, str, HttpFSFileSystem.DeleteOpValues.class);
+-    }
+-  }
+-
+-  /**
+-   * Class for delete's recursive parameter.
+-   */
+-  public static class DeleteRecursiveParam extends BooleanParam {
+-
+-    /**
+-     * Parameter name.
+-     */
+-    public static final String NAME = HttpFSFileSystem.RECURSIVE_PARAM;
+-
+-    /**
+-     * Default parameter value.
+-     */
+-    public static final String DEFAULT = "false";
+-
+-    /**
+-     * Constructor.
+-     *
+-     * @param str parameter value.
+-     */
+-    public DeleteRecursiveParam(String str) {
+-      super(NAME, str);
+-    }
+-  }
+-
+-  /**
+-   * Class for do-as parameter.
+-   */
+-  public static class DoAsParam extends StringParam {
+-
+-    /**
+-     * Parameter name.
+-     */
+-    public static final String NAME = HttpFSFileSystem.DO_AS_PARAM;
+-
+-    /**
+-     * Default parameter value.
+-     */
+-    public static final String DEFAULT = "";
+-
+-    /**
+-     * Constructor.
+-     *
+-     * @param str parameter value.
+-     */
+-    public DoAsParam(String str) {
+-      super(NAME, str, UserProvider.USER_PATTERN);
+-    }
+-
+-    /**
+-     * Delegates to parent and then adds do-as user to
+-     * MDC context for logging purposes.
+-     *
+-     * @param name parameter name.
+-     * @param str parameter value.
+-     *
+-     * @return parsed parameter
+-     */
+-    @Override
+-    public String parseParam(String name, String str) {
+-      String doAs = super.parseParam(name, str);
+-      MDC.put(NAME, (doAs != null) ? doAs : "-");
+-      return doAs;
+-    }
+-  }
+-
+-  /**
+-   * Class for filter parameter.
+-   */
+-  public static class FilterParam extends StringParam {
+-
+-    /**
+-     * Parameter name.
+-     */
+-    public static final String NAME = "filter";
+-
+-    /**
+-     * Default parameter value.
+-     */
+-    public static final String DEFAULT = "";
+-
+-    /**
+-     * Constructor.
+-     *
+-     * @param expr parameter value.
+-     */
+-    public FilterParam(String expr) {
+-      super(NAME, expr);
+-    }
+-
+-  }
+-
+-  /**
+-   * Class for path parameter.
+-   */
+-  public static class FsPathParam extends StringParam {
+-
+-    /**
+-     * Constructor.
+-     *
+-     * @param path parameter value.
+-     */
+-    public FsPathParam(String path) {
+-      super("path", path);
+-    }
+-
+-    /**
+-     * Makes the path absolute adding '/' to it.
+-     * <p/>
+-     * This is required because JAX-RS resolution of paths does not add
+-     * the root '/'.
+-     */
+-    public void makeAbsolute() {
+-      String path = value();
+-      path = "/" + ((path != null) ? path : "");
+-      setValue(path);
+-    }
+-
+-  }
+-
+-  /**
+-   * Class for GET operation parameter.
+-   */
+-  public static class GetOpParam extends EnumParam<HttpFSFileSystem.GetOpValues> {
+-
+-    /**
+-     * Parameter name.
+-     */
+-    public static final String NAME = HttpFSFileSystem.OP_PARAM;
+-
+-    /**
+-     * Constructor.
+-     *
+-     * @param str parameter value.
+-     */
+-    public GetOpParam(String str) {
+-      super(NAME, str, HttpFSFileSystem.GetOpValues.class);
+-    }
+-  }
+-
+-  /**
+-   * Class for group parameter.
+-   */
+-  public static class GroupParam extends StringParam {
+-
+-    /**
+-     * Parameter name.
+-     */
+-    public static final String NAME = HttpFSFileSystem.GROUP_PARAM;
+-
+-    /**
+-     * Default parameter value.
+-     */
+-    public static final String DEFAULT = "";
+-
+-    /**
+-     * Constructor.
+-     *
+-     * @param str parameter value.
+-     */
+-    public GroupParam(String str) {
+-      super(NAME, str, UserProvider.USER_PATTERN);
+-    }
+-
+-  }
+-
+-  /**
+-   * Class for len parameter.
+-   */
+-  public static class LenParam extends LongParam {
+-
+-    /**
+-     * Parameter name.
+-     */
+-    public static final String NAME = "len";
+-
+-    /**
+-     * Default parameter value.
+-     */
+-    public static final String DEFAULT = "-1";
+-
+-    /**
+-     * Constructor.
+-     *
+-     * @param str parameter value.
+-     */
+-    public LenParam(String str) {
+-      super(NAME, str);
+-    }
+-  }
+-
+-  /**
+-   * Class for modified-time parameter.
+-   */
+-  public static class ModifiedTimeParam extends LongParam {
+-
+-    /**
+-     * Parameter name.
+-     */
+-    public static final String NAME = HttpFSFileSystem.MODIFICATION_TIME_PARAM;
+-
+-    /**
+-     * Default parameter value.
+-     */
+-    public static final String DEFAULT = "-1";
+-
+-    /**
+-     * Constructor.
+-     *
+-     * @param str parameter value.
+-     */
+-    public ModifiedTimeParam(String str) {
+-      super(NAME, str);
+-    }
+-  }
+-
+-  /**
+-   * Class for offset parameter.
+-   */
+-  public static class OffsetParam extends LongParam {
+-
+-    /**
+-     * Parameter name.
+-     */
+-    public static final String NAME = "offset";
+-
+-    /**
+-     * Default parameter value.
+-     */
+-    public static final String DEFAULT = "0";
+-
+-    /**
+-     * Constructor.
+-     *
+-     * @param str parameter value.
+-     */
+-    public OffsetParam(String str) {
+-      super(NAME, str);
+-    }
+-  }
+-
+-  /**
+-   * Class for overwrite parameter.
+-   */
+-  public static class OverwriteParam extends BooleanParam {
+-
+-    /**
+-     * Parameter name.
+-     */
+-    public static final String NAME = HttpFSFileSystem.OVERWRITE_PARAM;
+-
+-    /**
+-     * Default parameter value.
+-     */
+-    public static final String DEFAULT = "true";
+-
+-    /**
+-     * Constructor.
+-     *
+-     * @param str parameter value.
+-     */
+-    public OverwriteParam(String str) {
+-      super(NAME, str);
+-    }
+-  }
+-
+-  /**
+-   * Class for owner parameter.
+-   */
+-  public static class OwnerParam extends StringParam {
+-
+-    /**
+-     * Parameter name.
+-     */
+-    public static final String NAME = HttpFSFileSystem.OWNER_PARAM;
+-
+-    /**
+-     * Default parameter value.
+-     */
+-    public static final String DEFAULT = "";
+-
+-    /**
+-     * Constructor.
+-     *
+-     * @param str parameter value.
+-     */
+-    public OwnerParam(String str) {
+-      super(NAME, str, UserProvider.USER_PATTERN);
+-    }
+-
+-  }
+-
+-  /**
+-   * Class for permission parameter.
+-   */
+-  public static class PermissionParam extends StringParam {
+-
+-    /**
+-     * Parameter name.
+-     */
+-    public static final String NAME = HttpFSFileSystem.PERMISSION_PARAM;
+-
+-    /**
+-     * Default parameter value.
+-     */
+-    public static final String DEFAULT = HttpFSFileSystem.DEFAULT_PERMISSION;
+-
+-
+-    /**
+-     * Symbolic Unix permissions regular expression pattern.
+-     */
+-    private static final Pattern PERMISSION_PATTERN =
+-      Pattern.compile(DEFAULT + "|[0-1]?[0-7][0-7][0-7]");
+-
+-    /**
+-     * Constructor.
+-     *
+-     * @param permission parameter value.
+-     */
+-    public PermissionParam(String permission) {
+-      super(NAME, permission.toLowerCase(), PERMISSION_PATTERN);
+-    }
+-
+-  }
+-
+-  /**
+-   * Class for POST operation parameter.
+-   */
+-  public static class PostOpParam extends EnumParam<HttpFSFileSystem.PostOpValues> {
+-
+-    /**
+-     * Parameter name.
+-     */
+-    public static final String NAME = HttpFSFileSystem.OP_PARAM;
+-
+-    /**
+-     * Constructor.
+-     *
+-     * @param str parameter value.
+-     */
+-    public PostOpParam(String str) {
+-      super(NAME, str, HttpFSFileSystem.PostOpValues.class);
+-    }
+-  }
+-
+-  /**
+-   * Class for PUT operation parameter.
+-   */
+-  public static class PutOpParam extends EnumParam<HttpFSFileSystem.PutOpValues> {
+-
+-    /**
+-     * Parameter name.
+-     */
+-    public static final String NAME = HttpFSFileSystem.OP_PARAM;
+-
+-    /**
+-     * Constructor.
+-     *
+-     * @param str parameter value.
+-     */
+-    public PutOpParam(String str) {
+-      super(NAME, str, HttpFSFileSystem.PutOpValues.class);
+-    }
+-  }
+-
+-  /**
+-   * Class for replication parameter.
+-   */
+-  public static class ReplicationParam extends ShortParam {
+-
+-    /**
+-     * Parameter name.
+-     */
+-    public static final String NAME = HttpFSFileSystem.REPLICATION_PARAM;
+-
+-    /**
+-     * Default parameter value.
+-     */
+-    public static final String DEFAULT = "-1";
+-
+-    /**
+-     * Constructor.
+-     *
+-     * @param str parameter value.
+-     */
+-    public ReplicationParam(String str) {
+-      super(NAME, str);
+-    }
+-  }
+-
+-  /**
+-   * Class for to-path parameter.
+-   */
+-  public static class ToPathParam extends StringParam {
+-
+-    /**
+-     * Parameter name.
+-     */
+-    public static final String NAME = HttpFSFileSystem.DESTINATION_PARAM;
+-
+-    /**
+-     * Default parameter value.
+-     */
+-    public static final String DEFAULT = "";
+-
+-    /**
+-     * Constructor.
+-     *
+-     * @param path parameter value.
+-     */
+-    public ToPathParam(String path) {
+-      super(NAME, path);
+-    }
+-  }
+-}
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/server/HttpFSServer.java b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/server/HttpFSServer.java
+index cf90485..22a173a 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/server/HttpFSServer.java
++++ b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/fs/http/server/HttpFSServer.java
+@@ -21,26 +21,22 @@ package org.apache.hadoop.fs.http.server;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.http.client.HttpFSFileSystem;
+-import org.apache.hadoop.fs.http.server.HttpFSParams.AccessTimeParam;
+-import org.apache.hadoop.fs.http.server.HttpFSParams.BlockSizeParam;
+-import org.apache.hadoop.fs.http.server.HttpFSParams.DataParam;
+-import org.apache.hadoop.fs.http.server.HttpFSParams.DeleteOpParam;
+-import org.apache.hadoop.fs.http.server.HttpFSParams.DeleteRecursiveParam;
+-import org.apache.hadoop.fs.http.server.HttpFSParams.DoAsParam;
+-import org.apache.hadoop.fs.http.server.HttpFSParams.FilterParam;
+-import org.apache.hadoop.fs.http.server.HttpFSParams.FsPathParam;
+-import org.apache.hadoop.fs.http.server.HttpFSParams.GetOpParam;
+-import org.apache.hadoop.fs.http.server.HttpFSParams.GroupParam;
+-import org.apache.hadoop.fs.http.server.HttpFSParams.LenParam;
+-import org.apache.hadoop.fs.http.server.HttpFSParams.ModifiedTimeParam;
+-import org.apache.hadoop.fs.http.server.HttpFSParams.OffsetParam;
+-import org.apache.hadoop.fs.http.server.HttpFSParams.OverwriteParam;
+-import org.apache.hadoop.fs.http.server.HttpFSParams.OwnerParam;
+-import org.apache.hadoop.fs.http.server.HttpFSParams.PermissionParam;
+-import org.apache.hadoop.fs.http.server.HttpFSParams.PostOpParam;
+-import org.apache.hadoop.fs.http.server.HttpFSParams.PutOpParam;
+-import org.apache.hadoop.fs.http.server.HttpFSParams.ReplicationParam;
+-import org.apache.hadoop.fs.http.server.HttpFSParams.ToPathParam;
++import org.apache.hadoop.fs.http.server.HttpFSParametersProvider.OperationParam;
++import org.apache.hadoop.fs.http.server.HttpFSParametersProvider.AccessTimeParam;
++import org.apache.hadoop.fs.http.server.HttpFSParametersProvider.BlockSizeParam;
++import org.apache.hadoop.fs.http.server.HttpFSParametersProvider.DataParam;
++import org.apache.hadoop.fs.http.server.HttpFSParametersProvider.RecursiveParam;
++import org.apache.hadoop.fs.http.server.HttpFSParametersProvider.DoAsParam;
++import org.apache.hadoop.fs.http.server.HttpFSParametersProvider.FilterParam;
++import org.apache.hadoop.fs.http.server.HttpFSParametersProvider.GroupParam;
++import org.apache.hadoop.fs.http.server.HttpFSParametersProvider.LenParam;
++import org.apache.hadoop.fs.http.server.HttpFSParametersProvider.ModifiedTimeParam;
++import org.apache.hadoop.fs.http.server.HttpFSParametersProvider.OffsetParam;
++import org.apache.hadoop.fs.http.server.HttpFSParametersProvider.OverwriteParam;
++import org.apache.hadoop.fs.http.server.HttpFSParametersProvider.OwnerParam;
++import org.apache.hadoop.fs.http.server.HttpFSParametersProvider.PermissionParam;
++import org.apache.hadoop.fs.http.server.HttpFSParametersProvider.ReplicationParam;
++import org.apache.hadoop.fs.http.server.HttpFSParametersProvider.DestinationParam;
+ import org.apache.hadoop.lib.service.FileSystemAccess;
+ import org.apache.hadoop.lib.service.FileSystemAccessException;
+ import org.apache.hadoop.lib.service.Groups;
+@@ -49,6 +45,7 @@ import org.apache.hadoop.lib.service.ProxyUser;
+ import org.apache.hadoop.lib.servlet.FileSystemReleaseFilter;
+ import org.apache.hadoop.lib.servlet.HostnameFilter;
+ import org.apache.hadoop.lib.wsrs.InputStreamEntity;
++import org.apache.hadoop.lib.wsrs.Parameters;
+ import org.apache.hadoop.security.authentication.server.AuthenticationToken;
+ import org.json.simple.JSONObject;
+ import org.slf4j.Logger;
+@@ -57,7 +54,6 @@ import org.slf4j.MDC;
+ 
+ import javax.ws.rs.Consumes;
+ import javax.ws.rs.DELETE;
+-import javax.ws.rs.DefaultValue;
+ import javax.ws.rs.GET;
+ import javax.ws.rs.POST;
+ import javax.ws.rs.PUT;
+@@ -90,39 +86,6 @@ public class HttpFSServer {
+   private static Logger AUDIT_LOG = LoggerFactory.getLogger("httpfsaudit");
+ 
+   /**
+-   * Special binding for '/' as it is not handled by the wildcard binding.
+-   *
+-   * @param user principal making the request.
+-   * @param op GET operation, default value is @link org.apache.hadoop.fs.http.client.HttpFSFileSystem.GetOpValues#OPEN}.
+-   * @param filter Glob filter, default value is none. Used only if the
+-   * operation is @link org.apache.hadoop.fs.http.client.HttpFSFileSystem.GetOpValues#LISTSTATUS}
+-   * @param doAs user being impersonated, defualt value is none. It can be used
+-   * only if the current user is a HttpFSServer proxyuser.
+-   *
+-   * @return the request response
+-   *
+-   * @throws IOException thrown if an IO error occurred. Thrown exceptions are
+-   * handled by {@link HttpFSExceptionProvider}.
+-   * @throws FileSystemAccessException thrown if a FileSystemAccess releated error occurred. Thrown
+-   * exceptions are handled by {@link HttpFSExceptionProvider}.
+-   */
+-  @GET
+-  @Path("/")
+-  @Produces(MediaType.APPLICATION_JSON)
+-  public Response root(@Context Principal user,
+-                       @QueryParam(GetOpParam.NAME) GetOpParam op,
+-                       @QueryParam(FilterParam.NAME) @DefaultValue(FilterParam.DEFAULT) FilterParam filter,
+-                       @QueryParam(DoAsParam.NAME) @DefaultValue(DoAsParam.DEFAULT) DoAsParam doAs)
+-    throws IOException, FileSystemAccessException {
+-    return get(user, new FsPathParam(""), op, new OffsetParam(OffsetParam.DEFAULT),
+-               new LenParam(LenParam.DEFAULT), filter, doAs,
+-               new OverwriteParam(OverwriteParam.DEFAULT),
+-               new BlockSizeParam(BlockSizeParam.DEFAULT),
+-               new PermissionParam(PermissionParam.DEFAULT),
+-               new ReplicationParam(ReplicationParam.DEFAULT));
+-  }
+-
+-  /**
+    * Resolves the effective user that will be used to request a FileSystemAccess filesystem.
+    * <p/>
+    * If the doAs-user is NULL or the same as the user, it returns the user.
+@@ -207,402 +170,405 @@ public class HttpFSServer {
+     return fs;
+   }
+ 
++  private void enforceRootPath(HttpFSFileSystem.Operation op, String path) {
++    if (!path.equals("/")) {
++      throw new UnsupportedOperationException(
++        MessageFormat.format("Operation [{0}], invalid path [{1}], must be '/'",
++                             op, path));
++    }
++  }
++
+   /**
+-   * Binding to handle all GET requests, supported operations are
+-   * @link org.apache.hadoop.fs.http.client.HttpFSFileSystem.GetOpValues}.
+-   * <p/>
+-   * The @link org.apache.hadoop.fs.http.client.HttpFSFileSystem.GetOpValues#INSTRUMENTATION} operation is available only
+-   * to users that are in HttpFSServer's admin group (see {@link HttpFSServer}. It returns
+-   * HttpFSServer instrumentation data. The specified path must be '/'.
++   * Special binding for '/' as it is not handled by the wildcard binding.
+    *
+-   * @param user principal making the request.
+-   * @param path path for the GET request.
+-   * @param op GET operation, default value is @link org.apache.hadoop.fs.http.client.HttpFSFileSystem.GetOpValues#OPEN}.
+-   * @param offset of the  file being fetch, used only with
+-   * @link org.apache.hadoop.fs.http.client.HttpFSFileSystem.GetOpValues#OPEN} operations.
+-   * @param len amounts of bytes, used only with @link org.apache.hadoop.fs.http.client.HttpFSFileSystem.GetOpValues#OPEN}
+-   * operations.
+-   * @param filter Glob filter, default value is none. Used only if the
+-   * operation is @link org.apache.hadoop.fs.http.client.HttpFSFileSystem.GetOpValues#LISTSTATUS}
+-   * @param doAs user being impersonated, defualt value is none. It can be used
+-   * only if the current user is a HttpFSServer proxyuser.
+-   * @param override default is true. Used only for
+-   * @link org.apache.hadoop.fs.http.client.HttpFSFileSystem.PutOpValues#CREATE} operations.
+-   * @param blockSize block size to set, used only by
+-   * @link org.apache.hadoop.fs.http.client.HttpFSFileSystem.PutOpValues#CREATE} operations.
+-   * @param permission permission to set, used only by
+-   * @link org.apache.hadoop.fs.http.client.HttpFSFileSystem.PutOpValues#SETPERMISSION}.
+-   * @param replication replication factor to set, used only by
+-   * @link org.apache.hadoop.fs.http.client.HttpFSFileSystem.PutOpValues#SETREPLICATION}.
++   * @param user the principal of the user making the request.
++   * @param op the HttpFS operation of the request.
++   * @param params the HttpFS parameters of the request.
+    *
+    * @return the request response.
+    *
+    * @throws IOException thrown if an IO error occurred. Thrown exceptions are
+    * handled by {@link HttpFSExceptionProvider}.
+-   * @throws FileSystemAccessException thrown if a FileSystemAccess releated error occurred. Thrown
+-   * exceptions are handled by {@link HttpFSExceptionProvider}.
++   * @throws FileSystemAccessException thrown if a FileSystemAccess releated
++   * error occurred. Thrown exceptions are handled by
++   * {@link HttpFSExceptionProvider}.
++   */
++  @GET
++  @Path("/")
++  @Produces(MediaType.APPLICATION_JSON)
++  public Response getRoot(@Context Principal user,
++                          @QueryParam(OperationParam.NAME) OperationParam op,
++                          @Context Parameters params)
++    throws IOException, FileSystemAccessException {
++    return get(user, "", op, params);
++  }
++
++  private String makeAbsolute(String path) {
++    return "/" + ((path != null) ? path : "");
++  }
++
++  /**
++   * Binding to handle GET requests, supported operations are
++   *
++   * @param user the principal of the user making the request.
++   * @param path the path for operation.
++   * @param op the HttpFS operation of the request.
++   * @param params the HttpFS parameters of the request.
++   *
++   * @return the request response.
++   *
++   * @throws IOException thrown if an IO error occurred. Thrown exceptions are
++   * handled by {@link HttpFSExceptionProvider}.
++   * @throws FileSystemAccessException thrown if a FileSystemAccess releated
++   * error occurred. Thrown exceptions are handled by
++   * {@link HttpFSExceptionProvider}.
+    */
+   @GET
+   @Path("{path:.*}")
+   @Produces({MediaType.APPLICATION_OCTET_STREAM, MediaType.APPLICATION_JSON})
+   public Response get(@Context Principal user,
+-                      @PathParam("path") @DefaultValue("") FsPathParam path,
+-                      @QueryParam(GetOpParam.NAME) GetOpParam op,
+-                      @QueryParam(OffsetParam.NAME) @DefaultValue(OffsetParam.DEFAULT) OffsetParam offset,
+-                      @QueryParam(LenParam.NAME) @DefaultValue(LenParam.DEFAULT) LenParam len,
+-                      @QueryParam(FilterParam.NAME) @DefaultValue(FilterParam.DEFAULT) FilterParam filter,
+-                      @QueryParam(DoAsParam.NAME) @DefaultValue(DoAsParam.DEFAULT) DoAsParam doAs,
+-
+-                      //these params are only for createHandle operation acceptance purposes
+-                      @QueryParam(OverwriteParam.NAME) @DefaultValue(OverwriteParam.DEFAULT) OverwriteParam override,
+-                      @QueryParam(BlockSizeParam.NAME) @DefaultValue(BlockSizeParam.DEFAULT) BlockSizeParam blockSize,
+-                      @QueryParam(PermissionParam.NAME) @DefaultValue(PermissionParam.DEFAULT)
+-                      PermissionParam permission,
+-                      @QueryParam(ReplicationParam.NAME) @DefaultValue(ReplicationParam.DEFAULT)
+-                      ReplicationParam replication
+-  )
++                      @PathParam("path") String path,
++                      @QueryParam(OperationParam.NAME) OperationParam op,
++                      @Context Parameters params)
+     throws IOException, FileSystemAccessException {
+-    Response response = null;
+-    if (op == null) {
+-      throw new UnsupportedOperationException(MessageFormat.format("Missing [{0}] parameter", GetOpParam.NAME));
+-    } else {
+-      path.makeAbsolute();
+-      MDC.put(HttpFSFileSystem.OP_PARAM, op.value().name());
+-      switch (op.value()) {
+-        case OPEN: {
+-          //Invoking the command directly using an unmanaged FileSystem that is released by the
+-          //FileSystemReleaseFilter
+-          FSOperations.FSOpen command = new FSOperations.FSOpen(path.value());
+-          FileSystem fs = createFileSystem(user, doAs.value());
+-          InputStream is = command.execute(fs);
+-          AUDIT_LOG.info("[{}] offset [{}] len [{}]", new Object[]{path, offset, len});
+-          InputStreamEntity entity = new InputStreamEntity(is, offset.value(), len.value());
+-          response = Response.ok(entity).type(MediaType.APPLICATION_OCTET_STREAM).build();
+-          break;
+-        }
+-        case GETFILESTATUS: {
+-          FSOperations.FSFileStatus command = new FSOperations.FSFileStatus(path.value());
+-          Map json = fsExecute(user, doAs.value(), command);
+-          AUDIT_LOG.info("[{}]", path);
+-          response = Response.ok(json).type(MediaType.APPLICATION_JSON).build();
+-          break;
+-        }
+-        case LISTSTATUS: {
+-          FSOperations.FSListStatus command = new FSOperations.FSListStatus(path.value(), filter.value());
+-          Map json = fsExecute(user, doAs.value(), command);
+-          if (filter.value() == null) {
+-            AUDIT_LOG.info("[{}]", path);
+-          } else {
+-            AUDIT_LOG.info("[{}] filter [{}]", path, filter.value());
+-          }
+-          response = Response.ok(json).type(MediaType.APPLICATION_JSON).build();
+-          break;
+-        }
+-        case GETHOMEDIRECTORY: {
+-          FSOperations.FSHomeDir command = new FSOperations.FSHomeDir();
+-          JSONObject json = fsExecute(user, doAs.value(), command);
+-          AUDIT_LOG.info("");
+-          response = Response.ok(json).type(MediaType.APPLICATION_JSON).build();
+-          break;
+-        }
+-        case INSTRUMENTATION: {
+-          if (!path.value().equals("/")) {
+-            throw new UnsupportedOperationException(
+-              MessageFormat.format("Invalid path for {0}={1}, must be '/'",
+-                                   GetOpParam.NAME, HttpFSFileSystem.GetOpValues.INSTRUMENTATION));
+-          }
+-          Groups groups = HttpFSServerWebApp.get().get(Groups.class);
+-          List<String> userGroups = groups.getGroups(user.getName());
+-          if (!userGroups.contains(HttpFSServerWebApp.get().getAdminGroup())) {
+-            throw new AccessControlException("User not in HttpFSServer admin group");
+-          }
+-          Instrumentation instrumentation = HttpFSServerWebApp.get().get(Instrumentation.class);
+-          Map snapshot = instrumentation.getSnapshot();
+-          response = Response.ok(snapshot).build();
+-          break;
+-        }
+-        case GETCONTENTSUMMARY: {
+-          FSOperations.FSContentSummary command = new FSOperations.FSContentSummary(path.value());
+-          Map json = fsExecute(user, doAs.value(), command);
+-          AUDIT_LOG.info("[{}]", path);
+-          response = Response.ok(json).type(MediaType.APPLICATION_JSON).build();
+-          break;
+-        }
+-        case GETFILECHECKSUM: {
+-          FSOperations.FSFileChecksum command = new FSOperations.FSFileChecksum(path.value());
+-          Map json = fsExecute(user, doAs.value(), command);
+-          AUDIT_LOG.info("[{}]", path);
+-          response = Response.ok(json).type(MediaType.APPLICATION_JSON).build();
+-          break;
+-        }
+-        case GETDELEGATIONTOKEN: {
+-          response = Response.status(Response.Status.BAD_REQUEST).build();
+-          break;
+-        }
+-        case GETFILEBLOCKLOCATIONS: {
+-          response = Response.status(Response.Status.BAD_REQUEST).build();
+-          break;
++    Response response;
++    path = makeAbsolute(path);
++    MDC.put(HttpFSFileSystem.OP_PARAM, op.value().name());
++    String doAs = params.get(DoAsParam.NAME, DoAsParam.class);
++    switch (op.value()) {
++      case OPEN: {
++        //Invoking the command directly using an unmanaged FileSystem that is
++        // released by the FileSystemReleaseFilter
++        FSOperations.FSOpen command = new FSOperations.FSOpen(path);
++        FileSystem fs = createFileSystem(user, doAs);
++        InputStream is = command.execute(fs);
++        Long offset = params.get(OffsetParam.NAME, OffsetParam.class);
++        Long len = params.get(LenParam.NAME, LenParam.class);
++        AUDIT_LOG.info("[{}] offset [{}] len [{}]",
++                       new Object[]{path, offset, len});
++        InputStreamEntity entity = new InputStreamEntity(is, offset, len);
++        response =
++          Response.ok(entity).type(MediaType.APPLICATION_OCTET_STREAM).build();
++        break;
++      }
++      case GETFILESTATUS: {
++        FSOperations.FSFileStatus command =
++          new FSOperations.FSFileStatus(path);
++        Map json = fsExecute(user, doAs, command);
++        AUDIT_LOG.info("[{}]", path);
++        response = Response.ok(json).type(MediaType.APPLICATION_JSON).build();
++        break;
++      }
++      case LISTSTATUS: {
++        String filter = params.get(FilterParam.NAME, FilterParam.class);
++        FSOperations.FSListStatus command = new FSOperations.FSListStatus(
++          path, filter);
++        Map json = fsExecute(user, doAs, command);
++        AUDIT_LOG.info("[{}] filter [{}]", path,
++                       (filter != null) ? filter : "-");
++        response = Response.ok(json).type(MediaType.APPLICATION_JSON).build();
++        break;
++      }
++      case GETHOMEDIRECTORY: {
++        enforceRootPath(op.value(), path);
++        FSOperations.FSHomeDir command = new FSOperations.FSHomeDir();
++        JSONObject json = fsExecute(user, doAs, command);
++        AUDIT_LOG.info("");
++        response = Response.ok(json).type(MediaType.APPLICATION_JSON).build();
++        break;
++      }
++      case INSTRUMENTATION: {
++        enforceRootPath(op.value(), path);
++        Groups groups = HttpFSServerWebApp.get().get(Groups.class);
++        List<String> userGroups = groups.getGroups(user.getName());
++        if (!userGroups.contains(HttpFSServerWebApp.get().getAdminGroup())) {
++          throw new AccessControlException(
++            "User not in HttpFSServer admin group");
+         }
++        Instrumentation instrumentation =
++          HttpFSServerWebApp.get().get(Instrumentation.class);
++        Map snapshot = instrumentation.getSnapshot();
++        response = Response.ok(snapshot).build();
++        break;
++      }
++      case GETCONTENTSUMMARY: {
++        FSOperations.FSContentSummary command =
++          new FSOperations.FSContentSummary(path);
++        Map json = fsExecute(user, doAs, command);
++        AUDIT_LOG.info("[{}]", path);
++        response = Response.ok(json).type(MediaType.APPLICATION_JSON).build();
++        break;
++      }
++      case GETFILECHECKSUM: {
++        FSOperations.FSFileChecksum command =
++          new FSOperations.FSFileChecksum(path);
++        Map json = fsExecute(user, doAs, command);
++        AUDIT_LOG.info("[{}]", path);
++        response = Response.ok(json).type(MediaType.APPLICATION_JSON).build();
++        break;
++      }
++      case GETFILEBLOCKLOCATIONS: {
++        response = Response.status(Response.Status.BAD_REQUEST).build();
++        break;
++      }
++      default: {
++        throw new IOException(
++          MessageFormat.format("Invalid HTTP GET operation [{0}]",
++                               op.value()));
+       }
+-      return response;
+     }
++    return response;
+   }
+ 
+-  /**
+-   * Creates the URL for an upload operation (create or append).
+-   *
+-   * @param uriInfo uri info of the request.
+-   * @param uploadOperation operation for the upload URL.
+-   *
+-   * @return the URI for uploading data.
+-   */
+-  protected URI createUploadRedirectionURL(UriInfo uriInfo, Enum<?> uploadOperation) {
+-    UriBuilder uriBuilder = uriInfo.getRequestUriBuilder();
+-    uriBuilder = uriBuilder.replaceQueryParam(PutOpParam.NAME, uploadOperation).
+-      queryParam(DataParam.NAME, Boolean.TRUE);
+-    return uriBuilder.build(null);
+-  }
+ 
+   /**
+-   * Binding to handle all DELETE requests.
++   * Binding to handle DELETE requests.
+    *
+-   * @param user principal making the request.
+-   * @param path path for the DELETE request.
+-   * @param op DELETE operation, default value is @link org.apache.hadoop.fs.http.client.HttpFSFileSystem.DeleteOpValues#DELETE}.
+-   * @param recursive indicates if the delete is recursive, default is <code>false</code>
+-   * @param doAs user being impersonated, defualt value is none. It can be used
+-   * only if the current user is a HttpFSServer proxyuser.
++   * @param user the principal of the user making the request.
++   * @param path the path for operation.
++   * @param op the HttpFS operation of the request.
++   * @param params the HttpFS parameters of the request.
+    *
+    * @return the request response.
+    *
+    * @throws IOException thrown if an IO error occurred. Thrown exceptions are
+    * handled by {@link HttpFSExceptionProvider}.
+-   * @throws FileSystemAccessException thrown if a FileSystemAccess releated error occurred. Thrown
+-   * exceptions are handled by {@link HttpFSExceptionProvider}.
++   * @throws FileSystemAccessException thrown if a FileSystemAccess releated
++   * error occurred. Thrown exceptions are handled by
++   * {@link HttpFSExceptionProvider}.
+    */
+   @DELETE
+   @Path("{path:.*}")
+   @Produces(MediaType.APPLICATION_JSON)
+   public Response delete(@Context Principal user,
+-                         @PathParam("path") FsPathParam path,
+-                         @QueryParam(DeleteOpParam.NAME) DeleteOpParam op,
+-                         @QueryParam(DeleteRecursiveParam.NAME) @DefaultValue(DeleteRecursiveParam.DEFAULT)
+-                         DeleteRecursiveParam recursive,
+-                         @QueryParam(DoAsParam.NAME) @DefaultValue(DoAsParam.DEFAULT) DoAsParam doAs)
++                      @PathParam("path") String path,
++                      @QueryParam(OperationParam.NAME) OperationParam op,
++                      @Context Parameters params)
+     throws IOException, FileSystemAccessException {
+-    Response response = null;
+-    if (op == null) {
+-      throw new UnsupportedOperationException(MessageFormat.format("Missing [{0}] parameter", DeleteOpParam.NAME));
+-    }
++    Response response;
++    path = makeAbsolute(path);
++    MDC.put(HttpFSFileSystem.OP_PARAM, op.value().name());
++    String doAs = params.get(DoAsParam.NAME, DoAsParam.class);
+     switch (op.value()) {
+       case DELETE: {
+-        path.makeAbsolute();
+-        MDC.put(HttpFSFileSystem.OP_PARAM, "DELETE");
++        Boolean recursive =
++          params.get(RecursiveParam.NAME,  RecursiveParam.class);
+         AUDIT_LOG.info("[{}] recursive [{}]", path, recursive);
+-        FSOperations.FSDelete command = new FSOperations.FSDelete(path.value(), recursive.value());
+-        JSONObject json = fsExecute(user, doAs.value(), command);
++        FSOperations.FSDelete command =
++          new FSOperations.FSDelete(path, recursive);
++        JSONObject json = fsExecute(user, doAs, command);
+         response = Response.ok(json).type(MediaType.APPLICATION_JSON).build();
+         break;
+       }
++      default: {
++        throw new IOException(
++          MessageFormat.format("Invalid HTTP DELETE operation [{0}]",
++                               op.value()));
++      }
+     }
+     return response;
+   }
+ 
++  /**
++   * Binding to handle POST requests.
++   *
++   * @param is the inputstream for the request payload.
++   * @param user the principal of the user making the request.
++   * @param uriInfo the of the request.
++   * @param path the path for operation.
++   * @param op the HttpFS operation of the request.
++   * @param params the HttpFS parameters of the request.
++   *
++   * @return the request response.
++   *
++   * @throws IOException thrown if an IO error occurred. Thrown exceptions are
++   * handled by {@link HttpFSExceptionProvider}.
++   * @throws FileSystemAccessException thrown if a FileSystemAccess releated
++   * error occurred. Thrown exceptions are handled by
++   * {@link HttpFSExceptionProvider}.
++   */
++  @POST
++  @Path("{path:.*}")
++  @Consumes({"*/*"})
++  @Produces({MediaType.APPLICATION_JSON})
++  public Response post(InputStream is,
++                       @Context Principal user,
++                       @Context UriInfo uriInfo,
++                       @PathParam("path") String path,
++                       @QueryParam(OperationParam.NAME) OperationParam op,
++                       @Context Parameters params)
++    throws IOException, FileSystemAccessException {
++    Response response;
++    path = makeAbsolute(path);
++    MDC.put(HttpFSFileSystem.OP_PARAM, op.value().name());
++    String doAs = params.get(DoAsParam.NAME, DoAsParam.class);
++    switch (op.value()) {
++      case APPEND: {
++        boolean hasData = params.get(DataParam.NAME, DataParam.class);
++        if (!hasData) {
++          response = Response.temporaryRedirect(
++            createUploadRedirectionURL(uriInfo,
++              HttpFSFileSystem.Operation.APPEND)).build();
++        } else {
++          FSOperations.FSAppend command =
++            new FSOperations.FSAppend(is, path);
++          fsExecute(user, doAs, command);
++          AUDIT_LOG.info("[{}]", path);
++          response = Response.ok().type(MediaType.APPLICATION_JSON).build();
++        }
++        break;
++      }
++      default: {
++        throw new IOException(
++          MessageFormat.format("Invalid HTTP POST operation [{0}]",
++                               op.value()));
++      }
++    }
++    return response;
++  }
+ 
+   /**
+-   * Binding to handle all PUT requests, supported operations are
+-   * @link org.apache.hadoop.fs.http.client.HttpFSFileSystem.PutOpValues}.
++   * Creates the URL for an upload operation (create or append).
+    *
+-   * @param is request input stream, used only for
+-   * @link org.apache.hadoop.fs.http.client.HttpFSFileSystem.PostOpValues#APPEND} operations.
+-   * @param user principal making the request.
+-   * @param uriInfo the request uriInfo.
+-   * @param path path for the PUT request.
+-   * @param op PUT operation, no default value.
+-   * @param toPath new path, used only for
+-   * {@link org.apache.hadoop.fs.http.client.HttpFSFileSystem.PutOpValues#RENAME} operations.
+-   * @link org.apache.hadoop.fs.http.client.HttpFSFileSystem.PutOpValues#SETTIMES}.
+-   * @param owner owner to set, used only for
+-   * @link org.apache.hadoop.fs.http.client.HttpFSFileSystem.PutOpValues#SETOWNER} operations.
+-   * @param group group to set, used only for
+-   * @link org.apache.hadoop.fs.http.client.HttpFSFileSystem.PutOpValues#SETOWNER} operations.
+-   * @param override default is true. Used only for
+-   * @link org.apache.hadoop.fs.http.client.HttpFSFileSystem.PutOpValues#CREATE} operations.
+-   * @param blockSize block size to set, used only by
+-   * @link org.apache.hadoop.fs.http.client.HttpFSFileSystem.PutOpValues#CREATE} operations.
+-   * @param permission permission to set, used only by
+-   * @link org.apache.hadoop.fs.http.client.HttpFSFileSystem.PutOpValues#SETPERMISSION}.
+-   * @param replication replication factor to set, used only by
+-   * @link org.apache.hadoop.fs.http.client.HttpFSFileSystem.PutOpValues#SETREPLICATION}.
+-   * @param modifiedTime modified time, in seconds since EPOC, used only by
+-   * @link org.apache.hadoop.fs.http.client.HttpFSFileSystem.PutOpValues#SETTIMES}.
+-   * @param accessTime accessed time, in seconds since EPOC, used only by
+-   * @link org.apache.hadoop.fs.http.client.HttpFSFileSystem.PutOpValues#SETTIMES}.
+-   * @param hasData indicates if the append request is uploading data or not
+-   * (just getting the handle).
+-   * @param doAs user being impersonated, defualt value is none. It can be used
+-   * only if the current user is a HttpFSServer proxyuser.
++   * @param uriInfo uri info of the request.
++   * @param uploadOperation operation for the upload URL.
++   *
++   * @return the URI for uploading data.
++   */
++  protected URI createUploadRedirectionURL(UriInfo uriInfo, Enum<?> uploadOperation) {
++    UriBuilder uriBuilder = uriInfo.getRequestUriBuilder();
++    uriBuilder = uriBuilder.replaceQueryParam(OperationParam.NAME, uploadOperation).
++      queryParam(DataParam.NAME, Boolean.TRUE);
++    return uriBuilder.build(null);
++  }
++
++
++  /**
++   * Binding to handle PUT requests.
++   *
++   * @param is the inputstream for the request payload.
++   * @param user the principal of the user making the request.
++   * @param uriInfo the of the request.
++   * @param path the path for operation.
++   * @param op the HttpFS operation of the request.
++   * @param params the HttpFS parameters of the request.
+    *
+    * @return the request response.
+    *
+    * @throws IOException thrown if an IO error occurred. Thrown exceptions are
+    * handled by {@link HttpFSExceptionProvider}.
+-   * @throws FileSystemAccessException thrown if a FileSystemAccess releated error occurred. Thrown
+-   * exceptions are handled by {@link HttpFSExceptionProvider}.
++   * @throws FileSystemAccessException thrown if a FileSystemAccess releated
++   * error occurred. Thrown exceptions are handled by
++   * {@link HttpFSExceptionProvider}.
+    */
+   @PUT
+   @Path("{path:.*}")
+   @Consumes({"*/*"})
+   @Produces({MediaType.APPLICATION_JSON})
+   public Response put(InputStream is,
+-                      @Context Principal user,
+-                      @Context UriInfo uriInfo,
+-                      @PathParam("path") FsPathParam path,
+-                      @QueryParam(PutOpParam.NAME) PutOpParam op,
+-                      @QueryParam(ToPathParam.NAME) @DefaultValue(ToPathParam.DEFAULT) ToPathParam toPath,
+-                      @QueryParam(OwnerParam.NAME) @DefaultValue(OwnerParam.DEFAULT) OwnerParam owner,
+-                      @QueryParam(GroupParam.NAME) @DefaultValue(GroupParam.DEFAULT) GroupParam group,
+-                      @QueryParam(OverwriteParam.NAME) @DefaultValue(OverwriteParam.DEFAULT) OverwriteParam override,
+-                      @QueryParam(BlockSizeParam.NAME) @DefaultValue(BlockSizeParam.DEFAULT) BlockSizeParam blockSize,
+-                      @QueryParam(PermissionParam.NAME) @DefaultValue(PermissionParam.DEFAULT)
+-                      PermissionParam permission,
+-                      @QueryParam(ReplicationParam.NAME) @DefaultValue(ReplicationParam.DEFAULT)
+-                      ReplicationParam replication,
+-                      @QueryParam(ModifiedTimeParam.NAME) @DefaultValue(ModifiedTimeParam.DEFAULT)
+-                      ModifiedTimeParam modifiedTime,
+-                      @QueryParam(AccessTimeParam.NAME) @DefaultValue(AccessTimeParam.DEFAULT)
+-                      AccessTimeParam accessTime,
+-                      @QueryParam(DataParam.NAME) @DefaultValue(DataParam.DEFAULT) DataParam hasData,
+-                      @QueryParam(DoAsParam.NAME) @DefaultValue(DoAsParam.DEFAULT) DoAsParam doAs)
++                       @Context Principal user,
++                       @Context UriInfo uriInfo,
++                       @PathParam("path") String path,
++                       @QueryParam(OperationParam.NAME) OperationParam op,
++                       @Context Parameters params)
+     throws IOException, FileSystemAccessException {
+-    Response response = null;
+-    if (op == null) {
+-      throw new UnsupportedOperationException(MessageFormat.format("Missing [{0}] parameter", PutOpParam.NAME));
+-    }
+-    path.makeAbsolute();
++    Response response;
++    path = makeAbsolute(path);
+     MDC.put(HttpFSFileSystem.OP_PARAM, op.value().name());
++    String doAs = params.get(DoAsParam.NAME, DoAsParam.class);
+     switch (op.value()) {
+       case CREATE: {
+-        if (!hasData.value()) {
++        boolean hasData = params.get(DataParam.NAME, DataParam.class);
++        if (!hasData) {
+           response = Response.temporaryRedirect(
+-            createUploadRedirectionURL(uriInfo, HttpFSFileSystem.PutOpValues.CREATE)).build();
++            createUploadRedirectionURL(uriInfo,
++              HttpFSFileSystem.Operation.CREATE)).build();
+         } else {
+-          FSOperations.FSCreate
+-            command = new FSOperations.FSCreate(is, path.value(), permission.value(), override.value(),
+-                                                replication.value(), blockSize.value());
+-          fsExecute(user, doAs.value(), command);
+-          AUDIT_LOG.info("[{}] permission [{}] override [{}] replication [{}] blockSize [{}]",
+-                         new Object[]{path, permission, override, replication, blockSize});
++          String permission = params.get(PermissionParam.NAME,
++                                         PermissionParam.class);
++          boolean override = params.get(OverwriteParam.NAME,
++                                        OverwriteParam.class);
++          short replication = params.get(ReplicationParam.NAME,
++                                         ReplicationParam.class);
++          long blockSize = params.get(BlockSizeParam.NAME,
++                                      BlockSizeParam.class);
++          FSOperations.FSCreate command =
++            new FSOperations.FSCreate(is, path, permission, override,
++                                      replication, blockSize);
++          fsExecute(user, doAs, command);
++          AUDIT_LOG.info(
++            "[{}] permission [{}] override [{}] replication [{}] blockSize [{}]",
++            new Object[]{path, permission, override, replication, blockSize});
+           response = Response.status(Response.Status.CREATED).build();
+         }
+         break;
+       }
+       case MKDIRS: {
+-        FSOperations.FSMkdirs command = new FSOperations.FSMkdirs(path.value(), permission.value());
+-        JSONObject json = fsExecute(user, doAs.value(), command);
+-        AUDIT_LOG.info("[{}] permission [{}]", path, permission.value());
++        String permission = params.get(PermissionParam.NAME,
++                                       PermissionParam.class);
++        FSOperations.FSMkdirs command =
++          new FSOperations.FSMkdirs(path, permission);
++        JSONObject json = fsExecute(user, doAs, command);
++        AUDIT_LOG.info("[{}] permission [{}]", path, permission);
+         response = Response.ok(json).type(MediaType.APPLICATION_JSON).build();
+         break;
+       }
+       case RENAME: {
+-        FSOperations.FSRename command = new FSOperations.FSRename(path.value(), toPath.value());
+-        JSONObject json = fsExecute(user, doAs.value(), command);
++        String toPath = params.get(DestinationParam.NAME, DestinationParam.class);
++        FSOperations.FSRename command =
++          new FSOperations.FSRename(path, toPath);
++        JSONObject json = fsExecute(user, doAs, command);
+         AUDIT_LOG.info("[{}] to [{}]", path, toPath);
+         response = Response.ok(json).type(MediaType.APPLICATION_JSON).build();
+         break;
+       }
+       case SETOWNER: {
+-        FSOperations.FSSetOwner command = new FSOperations.FSSetOwner(path.value(), owner.value(), group.value());
+-        fsExecute(user, doAs.value(), command);
+-        AUDIT_LOG.info("[{}] to (O/G)[{}]", path, owner.value() + ":" + group.value());
++        String owner = params.get(OwnerParam.NAME, OwnerParam.class);
++        String group = params.get(GroupParam.NAME, GroupParam.class);
++        FSOperations.FSSetOwner command =
++          new FSOperations.FSSetOwner(path, owner, group);
++        fsExecute(user, doAs, command);
++        AUDIT_LOG.info("[{}] to (O/G)[{}]", path, owner + ":" + group);
+         response = Response.ok().build();
+         break;
+       }
+       case SETPERMISSION: {
+-        FSOperations.FSSetPermission command = new FSOperations.FSSetPermission(path.value(), permission.value());
+-        fsExecute(user, doAs.value(), command);
+-        AUDIT_LOG.info("[{}] to [{}]", path, permission.value());
++        String permission = params.get(PermissionParam.NAME,
++                                       PermissionParam.class);
++        FSOperations.FSSetPermission command =
++          new FSOperations.FSSetPermission(path, permission);
++        fsExecute(user, doAs, command);
++        AUDIT_LOG.info("[{}] to [{}]", path, permission);
+         response = Response.ok().build();
+         break;
+       }
+       case SETREPLICATION: {
+-        FSOperations.FSSetReplication command = new FSOperations.FSSetReplication(path.value(), replication.value());
+-        JSONObject json = fsExecute(user, doAs.value(), command);
+-        AUDIT_LOG.info("[{}] to [{}]", path, replication.value());
++        short replication = params.get(ReplicationParam.NAME,
++                                       ReplicationParam.class);
++        FSOperations.FSSetReplication command =
++          new FSOperations.FSSetReplication(path, replication);
++        JSONObject json = fsExecute(user, doAs, command);
++        AUDIT_LOG.info("[{}] to [{}]", path, replication);
+         response = Response.ok(json).build();
+         break;
+       }
+       case SETTIMES: {
+-        FSOperations.FSSetTimes
+-          command = new FSOperations.FSSetTimes(path.value(), modifiedTime.value(), accessTime.value());
+-        fsExecute(user, doAs.value(), command);
+-        AUDIT_LOG.info("[{}] to (M/A)[{}]", path, modifiedTime.value() + ":" + accessTime.value());
++        long modifiedTime = params.get(ModifiedTimeParam.NAME,
++                                       ModifiedTimeParam.class);
++        long accessTime = params.get(AccessTimeParam.NAME,
++                                     AccessTimeParam.class);
++        FSOperations.FSSetTimes command =
++          new FSOperations.FSSetTimes(path, modifiedTime, accessTime);
++        fsExecute(user, doAs, command);
++        AUDIT_LOG.info("[{}] to (M/A)[{}]", path,
++                       modifiedTime + ":" + accessTime);
+         response = Response.ok().build();
+         break;
+       }
+-      case RENEWDELEGATIONTOKEN: {
+-        response = Response.status(Response.Status.BAD_REQUEST).build();
+-        break;
+-      }
+-      case CANCELDELEGATIONTOKEN: {
+-        response = Response.status(Response.Status.BAD_REQUEST).build();
+-        break;
+-      }
+-    }
+-    return response;
+-  }
+-
+-  /**
+-   * Binding to handle all OPST requests, supported operations are
+-   * @link org.apache.hadoop.fs.http.client.HttpFSFileSystem.PostOpValues}.
+-   *
+-   * @param is request input stream, used only for
+-   * @link org.apache.hadoop.fs.http.client.HttpFSFileSystem.PostOpValues#APPEND} operations.
+-   * @param user principal making the request.
+-   * @param uriInfo the request uriInfo.
+-   * @param path path for the POST request.
+-   * @param op POST operation, default is @link org.apache.hadoop.fs.http.client.HttpFSFileSystem.PostOpValues#APPEND}.
+-   * @param hasData indicates if the append request is uploading data or not (just getting the handle).
+-   * @param doAs user being impersonated, defualt value is none. It can be used
+-   * only if the current user is a HttpFSServer proxyuser.
+-   *
+-   * @return the request response.
+-   *
+-   * @throws IOException thrown if an IO error occurred. Thrown exceptions are
+-   * handled by {@link HttpFSExceptionProvider}.
+-   * @throws FileSystemAccessException thrown if a FileSystemAccess releated error occurred. Thrown
+-   * exceptions are handled by {@link HttpFSExceptionProvider}.
+-   */
+-  @POST
+-  @Path("{path:.*}")
+-  @Consumes({"*/*"})
+-  @Produces({MediaType.APPLICATION_JSON})
+-  public Response post(InputStream is,
+-                       @Context Principal user,
+-                       @Context UriInfo uriInfo,
+-                       @PathParam("path") FsPathParam path,
+-                       @QueryParam(PostOpParam.NAME) PostOpParam op,
+-                       @QueryParam(DataParam.NAME) @DefaultValue(DataParam.DEFAULT) DataParam hasData,
+-                       @QueryParam(DoAsParam.NAME) @DefaultValue(DoAsParam.DEFAULT) DoAsParam doAs)
+-    throws IOException, FileSystemAccessException {
+-    Response response = null;
+-    if (op == null) {
+-      throw new UnsupportedOperationException(MessageFormat.format("Missing [{0}] parameter", PostOpParam.NAME));
+-    }
+-    path.makeAbsolute();
+-    MDC.put(HttpFSFileSystem.OP_PARAM, op.value().name());
+-    switch (op.value()) {
+-      case APPEND: {
+-        if (!hasData.value()) {
+-          response = Response.temporaryRedirect(
+-            createUploadRedirectionURL(uriInfo, HttpFSFileSystem.PostOpValues.APPEND)).build();
+-        } else {
+-          FSOperations.FSAppend command = new FSOperations.FSAppend(is, path.value());
+-          fsExecute(user, doAs.value(), command);
+-          AUDIT_LOG.info("[{}]", path);
+-          response = Response.ok().type(MediaType.APPLICATION_JSON).build();
+-        }
+-        break;
++      default: {
++        throw new IOException(
++          MessageFormat.format("Invalid HTTP PUT operation [{0}]",
++                               op.value()));
+       }
+     }
+     return response;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/lib/wsrs/BooleanParam.java b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/lib/wsrs/BooleanParam.java
+index 7bc3a14..e4e6355 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/lib/wsrs/BooleanParam.java
++++ b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/lib/wsrs/BooleanParam.java
+@@ -22,15 +22,14 @@ import java.text.MessageFormat;
+ 
+ public abstract class BooleanParam extends Param<Boolean> {
+ 
+-  public BooleanParam(String name, String str) {
+-    value = parseParam(name, str);
++  public BooleanParam(String name, Boolean defaultValue) {
++    super(name, defaultValue);
+   }
+ 
+   protected Boolean parse(String str) throws Exception {
+     if (str.equalsIgnoreCase("true")) {
+       return true;
+-    }
+-    if (str.equalsIgnoreCase("false")) {
++    } else if (str.equalsIgnoreCase("false")) {
+       return false;
+     }
+     throw new IllegalArgumentException(MessageFormat.format("Invalid value [{0}], must be a boolean", str));
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/lib/wsrs/ByteParam.java b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/lib/wsrs/ByteParam.java
+index aa9408f..96b46c4 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/lib/wsrs/ByteParam.java
++++ b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/lib/wsrs/ByteParam.java
+@@ -20,8 +20,8 @@ package org.apache.hadoop.lib.wsrs;
+ 
+ public abstract class ByteParam extends Param<Byte> {
+ 
+-  public ByteParam(String name, String str) {
+-    value = parseParam(name, str);
++  public ByteParam(String name, Byte defaultValue) {
++    super(name, defaultValue);
+   }
+ 
+   protected Byte parse(String str) throws Exception {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/lib/wsrs/EnumParam.java b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/lib/wsrs/EnumParam.java
+index ff86406..f605bd2 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/lib/wsrs/EnumParam.java
++++ b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/lib/wsrs/EnumParam.java
+@@ -25,9 +25,9 @@ import java.util.Arrays;
+ public abstract class EnumParam<E extends Enum<E>> extends Param<E> {
+   Class<E> klass;
+ 
+-  public EnumParam(String label, String str, Class<E> e) {
++  public EnumParam(String name, Class<E> e, E defaultValue) {
++    super(name, defaultValue);
+     klass = e;
+-    value = parseParam(label, str);
+   }
+ 
+   protected E parse(String str) throws Exception {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/lib/wsrs/IntegerParam.java b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/lib/wsrs/IntegerParam.java
+index 6eddaa2..7c0f081 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/lib/wsrs/IntegerParam.java
++++ b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/lib/wsrs/IntegerParam.java
+@@ -20,8 +20,8 @@ package org.apache.hadoop.lib.wsrs;
+ 
+ public abstract class IntegerParam extends Param<Integer> {
+ 
+-  public IntegerParam(String name, String str) {
+-    value = parseParam(name, str);
++  public IntegerParam(String name, Integer defaultValue) {
++    super(name, defaultValue);
+   }
+ 
+   protected Integer parse(String str) throws Exception {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/lib/wsrs/LongParam.java b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/lib/wsrs/LongParam.java
+index 354a550..ec601bb 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/lib/wsrs/LongParam.java
++++ b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/lib/wsrs/LongParam.java
+@@ -20,8 +20,8 @@ package org.apache.hadoop.lib.wsrs;
+ 
+ public abstract class LongParam extends Param<Long> {
+ 
+-  public LongParam(String name, String str) {
+-    value = parseParam(name, str);
++  public LongParam(String name, Long defaultValue) {
++    super(name, defaultValue);
+   }
+ 
+   protected Long parse(String str) throws Exception {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/lib/wsrs/Param.java b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/lib/wsrs/Param.java
+index 68a41d5..62af481 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/lib/wsrs/Param.java
++++ b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/lib/wsrs/Param.java
+@@ -23,32 +23,39 @@ import org.apache.hadoop.lib.util.Check;
+ import java.text.MessageFormat;
+ 
+ public abstract class Param<T> {
++  private String name;
+   protected T value;
+ 
+-  public T parseParam(String name, String str) {
+-    Check.notNull(name, "name");
++  public Param(String name, T defaultValue) {
++    this.name = name;
++    this.value = defaultValue;
++  }
++
++  public String getName() {
++    return name;
++  }
++
++  public T parseParam(String str) {
+     try {
+-      return (str != null && str.trim().length() > 0) ? parse(str) : null;
++      value = (str != null && str.trim().length() > 0) ? parse(str) : value;
+     } catch (Exception ex) {
+       throw new IllegalArgumentException(
+         MessageFormat.format("Parameter [{0}], invalid value [{1}], value must be [{2}]",
+                              name, str, getDomain()));
+     }
++    return value;
+   }
+ 
+   public T value() {
+     return value;
+   }
+ 
+-  protected void setValue(T value) {
+-    this.value = value;
+-  }
+-
+   protected abstract String getDomain();
+ 
+   protected abstract T parse(String str) throws Exception;
+ 
+   public String toString() {
+-    return value.toString();
++    return (value != null) ? value.toString() : "NULL";
+   }
++
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/lib/wsrs/Parameters.java b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/lib/wsrs/Parameters.java
+new file mode 100644
+index 0000000..b5ec214
+--- /dev/null
++++ b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/lib/wsrs/Parameters.java
+@@ -0,0 +1,51 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.lib.wsrs;
++
++import java.util.Map;
++
++/**
++ * Class that contains all parsed JAX-RS parameters.
++ * <p/>
++ * Instances are created by the {@link ParametersProvider} class.
++ */
++public class Parameters {
++  private Map<String, Param<?>> params;
++
++  /**
++   * Constructor that receives the request parsed parameters.
++   *
++   * @param params the request parsed parameters.
++   */
++  public Parameters(Map<String, Param<?>> params) {
++    this.params = params;
++  }
++
++  /**
++   * Returns the value of a request parsed parameter.
++   *
++   * @param name parameter name.
++   * @param klass class of the parameter, used for value casting.
++  * @return the value of the parameter.
++   */
++  @SuppressWarnings("unchecked")
++  public <V, T extends Param<V>> V get(String name, Class<T> klass) {
++    return ((T)params.get(name)).value();
++  }
++  
++}
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/lib/wsrs/ParametersProvider.java b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/lib/wsrs/ParametersProvider.java
+new file mode 100644
+index 0000000..3d41d99
+--- /dev/null
++++ b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/lib/wsrs/ParametersProvider.java
+@@ -0,0 +1,107 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.lib.wsrs;
++
++import com.sun.jersey.api.core.HttpContext;
++import com.sun.jersey.core.spi.component.ComponentContext;
++import com.sun.jersey.core.spi.component.ComponentScope;
++import com.sun.jersey.server.impl.inject.AbstractHttpContextInjectable;
++import com.sun.jersey.spi.inject.Injectable;
++import com.sun.jersey.spi.inject.InjectableProvider;
++
++import javax.ws.rs.core.Context;
++import javax.ws.rs.core.MultivaluedMap;
++import java.lang.reflect.Type;
++import java.text.MessageFormat;
++import java.util.HashMap;
++import java.util.Map;
++
++/**
++ * Jersey provider that parses the request parameters based on the
++ * given parameter definition. 
++ */
++public class ParametersProvider
++  extends AbstractHttpContextInjectable<Parameters>
++  implements InjectableProvider<Context, Type> {
++
++  private String driverParam;
++  private Class<? extends Enum> enumClass;
++  private Map<Enum, Class<Param<?>>[]> paramsDef;
++
++  public ParametersProvider(String driverParam, Class<? extends Enum> enumClass,
++                            Map<Enum, Class<Param<?>>[]> paramsDef) {
++    this.driverParam = driverParam;
++    this.enumClass = enumClass;
++    this.paramsDef = paramsDef;
++  }
++
++  @Override
++  @SuppressWarnings("unchecked")
++  public Parameters getValue(HttpContext httpContext) {
++    Map<String, Param<?>> map = new HashMap<String, Param<?>>();
++    MultivaluedMap<String, String> queryString =
++      httpContext.getRequest().getQueryParameters();
++    String str = queryString.getFirst(driverParam);
++    if (str == null) {
++      throw new IllegalArgumentException(
++        MessageFormat.format("Missing Operation parameter [{0}]",
++                             driverParam));
++    }
++    Enum op;
++    try {
++      op = Enum.valueOf(enumClass, str.toUpperCase());
++    } catch (IllegalArgumentException ex) {
++      throw new IllegalArgumentException(
++        MessageFormat.format("Invalid Operation [{0}]", str));
++    }
++    if (!paramsDef.containsKey(op)) {
++      throw new IllegalArgumentException(
++        MessageFormat.format("Unsupported Operation [{0}]", op));
++    }
++    for (Class<Param<?>> paramClass : paramsDef.get(op)) {
++      Param<?> param;
++      try {
++        param = paramClass.newInstance();
++      } catch (Exception ex) {
++        throw new UnsupportedOperationException(
++          MessageFormat.format(
++            "Param class [{0}] does not have default constructor",
++            paramClass.getName()));
++      }
++      try {
++        param.parseParam(queryString.getFirst(param.getName()));
++      }
++      catch (Exception ex) {
++        throw new IllegalArgumentException(ex.toString(), ex);
++      }
++      map.put(param.getName(), param);
++    }
++    return new Parameters(map);
++  }
++
++  @Override
++  public ComponentScope getScope() {
++    return ComponentScope.PerRequest;
++  }
++
++  @Override
++  public Injectable getInjectable(ComponentContext componentContext, Context context, Type type) {
++    return (type.equals(Parameters.class)) ? this : null;
++  }
++}
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/lib/wsrs/ShortParam.java b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/lib/wsrs/ShortParam.java
+index a3995ba..cc75a86 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/lib/wsrs/ShortParam.java
++++ b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/lib/wsrs/ShortParam.java
+@@ -20,8 +20,8 @@ package org.apache.hadoop.lib.wsrs;
+ 
+ public abstract class ShortParam extends Param<Short> {
+ 
+-  public ShortParam(String name, String str) {
+-    value = parseParam(name, str);
++  public ShortParam(String name, Short defaultValue) {
++    super(name, defaultValue);
+   }
+ 
+   protected Short parse(String str) throws Exception {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/lib/wsrs/StringParam.java b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/lib/wsrs/StringParam.java
+index 4b3a927..79e6336 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/lib/wsrs/StringParam.java
++++ b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/main/java/org/apache/hadoop/lib/wsrs/StringParam.java
+@@ -15,42 +15,38 @@
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
+-
+ package org.apache.hadoop.lib.wsrs;
+ 
+-import org.apache.hadoop.lib.util.Check;
+-
+ import java.text.MessageFormat;
+ import java.util.regex.Pattern;
+ 
+ public abstract class StringParam extends Param<String> {
+   private Pattern pattern;
+ 
+-  public StringParam(String name, String str) {
+-    this(name, str, null);
++  public StringParam(String name, String defaultValue) {
++    this(name, defaultValue, null);
+   }
+ 
+-  public StringParam(String name, String str, Pattern pattern) {
++  public StringParam(String name, String defaultValue, Pattern pattern) {
++    super(name, defaultValue);
+     this.pattern = pattern;
+-    value = parseParam(name, str);
++    parseParam(defaultValue);
+   }
+ 
+-  public String parseParam(String name, String str) {
+-    String ret = null;
+-    Check.notNull(name, "name");
++  public String parseParam(String str) {
+     try {
+       if (str != null) {
+         str = str.trim();
+         if (str.length() > 0) {
+-          return parse(str);
++          value = parse(str);
+         }
+       }
+     } catch (Exception ex) {
+       throw new IllegalArgumentException(
+         MessageFormat.format("Parameter [{0}], invalid value [{1}], value must be [{2}]",
+-                             name, str, getDomain()));
++                             getName(), str, getDomain()));
+     }
+-    return ret;
++    return value;
+   }
+ 
+   protected String parse(String str) throws Exception {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/fs/http/client/TestHttpFSFileSystem.java b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/fs/http/client/TestHttpFSFileSystem.java
+index a55d5e2..e2f8b84 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/fs/http/client/TestHttpFSFileSystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/fs/http/client/TestHttpFSFileSystem.java
+@@ -475,6 +475,7 @@ public class TestHttpFSFileSystem extends HFSTestCase {
+       ops[i] = new Object[]{Operation.values()[i]};
+     }
+     return Arrays.asList(ops);
++//    return Arrays.asList(new Object[][]{ new Object[]{Operation.CREATE}});
+   }
+ 
+   private Operation operation;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/fs/http/server/TestCheckUploadContentTypeFilter.java b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/fs/http/server/TestCheckUploadContentTypeFilter.java
+index 2596be9..9996e0b 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/fs/http/server/TestCheckUploadContentTypeFilter.java
++++ b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/fs/http/server/TestCheckUploadContentTypeFilter.java
+@@ -31,34 +31,34 @@ public class TestCheckUploadContentTypeFilter {
+ 
+   @Test
+   public void putUpload() throws Exception {
+-    test("PUT", HttpFSFileSystem.PutOpValues.CREATE.toString(), "application/octet-stream", true, false);
++    test("PUT", HttpFSFileSystem.Operation.CREATE.toString(), "application/octet-stream", true, false);
+   }
+ 
+   @Test
+   public void postUpload() throws Exception {
+-    test("POST", HttpFSFileSystem.PostOpValues.APPEND.toString(), "APPLICATION/OCTET-STREAM", true, false);
++    test("POST", HttpFSFileSystem.Operation.APPEND.toString(), "APPLICATION/OCTET-STREAM", true, false);
+   }
+ 
+   @Test
+   public void putUploadWrong() throws Exception {
+-    test("PUT", HttpFSFileSystem.PutOpValues.CREATE.toString(), "plain/text", false, false);
+-    test("PUT", HttpFSFileSystem.PutOpValues.CREATE.toString(), "plain/text", true, true);
++    test("PUT", HttpFSFileSystem.Operation.CREATE.toString(), "plain/text", false, false);
++    test("PUT", HttpFSFileSystem.Operation.CREATE.toString(), "plain/text", true, true);
+   }
+ 
+   @Test
+   public void postUploadWrong() throws Exception {
+-    test("POST", HttpFSFileSystem.PostOpValues.APPEND.toString(), "plain/text", false, false);
+-    test("POST", HttpFSFileSystem.PostOpValues.APPEND.toString(), "plain/text", true, true);
++    test("POST", HttpFSFileSystem.Operation.APPEND.toString(), "plain/text", false, false);
++    test("POST", HttpFSFileSystem.Operation.APPEND.toString(), "plain/text", true, true);
+   }
+ 
+   @Test
+   public void getOther() throws Exception {
+-    test("GET", HttpFSFileSystem.GetOpValues.GETHOMEDIRECTORY.toString(), "plain/text", false, false);
++    test("GET", HttpFSFileSystem.Operation.GETHOMEDIRECTORY.toString(), "plain/text", false, false);
+   }
+ 
+   @Test
+   public void putOther() throws Exception {
+-    test("PUT", HttpFSFileSystem.PutOpValues.MKDIRS.toString(), "plain/text", false, false);
++    test("PUT", HttpFSFileSystem.Operation.MKDIRS.toString(), "plain/text", false, false);
+   }
+ 
+   private void test(String method, String operation, String contentType,
+@@ -68,7 +68,7 @@ public class TestCheckUploadContentTypeFilter {
+     Mockito.reset(request);
+     Mockito.when(request.getMethod()).thenReturn(method);
+     Mockito.when(request.getParameter(HttpFSFileSystem.OP_PARAM)).thenReturn(operation);
+-    Mockito.when(request.getParameter(HttpFSParams.DataParam.NAME)).
++    Mockito.when(request.getParameter(HttpFSParametersProvider.DataParam.NAME)).
+       thenReturn(Boolean.toString(upload));
+     Mockito.when(request.getContentType()).thenReturn(contentType);
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/lib/wsrs/TestBooleanParam.java b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/lib/wsrs/TestBooleanParam.java
+deleted file mode 100644
+index b1b140d..0000000
+--- a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/lib/wsrs/TestBooleanParam.java
++++ /dev/null
+@@ -1,50 +0,0 @@
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package org.apache.hadoop.lib.wsrs;
+-
+-import junit.framework.Assert;
+-import org.junit.Test;
+-
+-public class TestBooleanParam {
+-
+-  @Test
+-  public void param() throws Exception {
+-    BooleanParam param = new BooleanParam("p", "true") {
+-    };
+-    Assert.assertEquals(param.getDomain(), "a boolean");
+-    Assert.assertEquals(param.value(), Boolean.TRUE);
+-    Assert.assertEquals(param.toString(), "true");
+-    param = new BooleanParam("p", "false") {
+-    };
+-    Assert.assertEquals(param.value(), Boolean.FALSE);
+-    param = new BooleanParam("p", null) {
+-    };
+-    Assert.assertEquals(param.value(), null);
+-    param = new BooleanParam("p", "") {
+-    };
+-    Assert.assertEquals(param.value(), null);
+-  }
+-
+-  @Test(expected = IllegalArgumentException.class)
+-  public void invalid() throws Exception {
+-    new BooleanParam("p", "x") {
+-    };
+-  }
+-
+-}
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/lib/wsrs/TestByteParam.java b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/lib/wsrs/TestByteParam.java
+deleted file mode 100644
+index 6b1a5ef..0000000
+--- a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/lib/wsrs/TestByteParam.java
++++ /dev/null
+@@ -1,53 +0,0 @@
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package org.apache.hadoop.lib.wsrs;
+-
+-
+-import junit.framework.Assert;
+-import org.junit.Test;
+-
+-public class TestByteParam {
+-
+-  @Test
+-  public void param() throws Exception {
+-    ByteParam param = new ByteParam("p", "1") {
+-    };
+-    Assert.assertEquals(param.getDomain(), "a byte");
+-    Assert.assertEquals(param.value(), new Byte((byte) 1));
+-    Assert.assertEquals(param.toString(), "1");
+-    param = new ByteParam("p", null) {
+-    };
+-    Assert.assertEquals(param.value(), null);
+-    param = new ByteParam("p", "") {
+-    };
+-    Assert.assertEquals(param.value(), null);
+-  }
+-
+-  @Test(expected = IllegalArgumentException.class)
+-  public void invalid1() throws Exception {
+-    new ByteParam("p", "x") {
+-    };
+-  }
+-
+-  @Test(expected = IllegalArgumentException.class)
+-  public void invalid2() throws Exception {
+-    new ByteParam("p", "256") {
+-    };
+-  }
+-}
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/lib/wsrs/TestEnumParam.java b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/lib/wsrs/TestEnumParam.java
+deleted file mode 100644
+index bb37f75..0000000
+--- a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/lib/wsrs/TestEnumParam.java
++++ /dev/null
+@@ -1,52 +0,0 @@
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package org.apache.hadoop.lib.wsrs;
+-
+-
+-import junit.framework.Assert;
+-import org.junit.Test;
+-
+-public class TestEnumParam {
+-
+-  public static enum ENUM {
+-    FOO, BAR
+-  }
+-
+-  @Test
+-  public void param() throws Exception {
+-    EnumParam<ENUM> param = new EnumParam<ENUM>("p", "FOO", ENUM.class) {
+-    };
+-    Assert.assertEquals(param.getDomain(), "FOO,BAR");
+-    Assert.assertEquals(param.value(), ENUM.FOO);
+-    Assert.assertEquals(param.toString(), "FOO");
+-    param = new EnumParam<ENUM>("p", null, ENUM.class) {
+-    };
+-    Assert.assertEquals(param.value(), null);
+-    param = new EnumParam<ENUM>("p", "", ENUM.class) {
+-    };
+-    Assert.assertEquals(param.value(), null);
+-  }
+-
+-  @Test(expected = IllegalArgumentException.class)
+-  public void invalid1() throws Exception {
+-    new EnumParam<ENUM>("p", "x", ENUM.class) {
+-    };
+-  }
+-
+-}
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/lib/wsrs/TestIntegerParam.java b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/lib/wsrs/TestIntegerParam.java
+deleted file mode 100644
+index 634dbe7..0000000
+--- a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/lib/wsrs/TestIntegerParam.java
++++ /dev/null
+@@ -1,52 +0,0 @@
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package org.apache.hadoop.lib.wsrs;
+-
+-import junit.framework.Assert;
+-import org.junit.Test;
+-
+-public class TestIntegerParam {
+-
+-  @Test
+-  public void param() throws Exception {
+-    IntegerParam param = new IntegerParam("p", "1") {
+-    };
+-    Assert.assertEquals(param.getDomain(), "an integer");
+-    Assert.assertEquals(param.value(), new Integer(1));
+-    Assert.assertEquals(param.toString(), "1");
+-    param = new IntegerParam("p", null) {
+-    };
+-    Assert.assertEquals(param.value(), null);
+-    param = new IntegerParam("p", "") {
+-    };
+-    Assert.assertEquals(param.value(), null);
+-  }
+-
+-  @Test(expected = IllegalArgumentException.class)
+-  public void invalid1() throws Exception {
+-    new IntegerParam("p", "x") {
+-    };
+-  }
+-
+-  @Test(expected = IllegalArgumentException.class)
+-  public void invalid2() throws Exception {
+-    new IntegerParam("p", "" + Long.MAX_VALUE) {
+-    };
+-  }
+-}
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/lib/wsrs/TestLongParam.java b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/lib/wsrs/TestLongParam.java
+deleted file mode 100644
+index 1a7ddd8..0000000
+--- a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/lib/wsrs/TestLongParam.java
++++ /dev/null
+@@ -1,47 +0,0 @@
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package org.apache.hadoop.lib.wsrs;
+-
+-import junit.framework.Assert;
+-import org.junit.Test;
+-
+-public class TestLongParam {
+-
+-  @Test
+-  public void param() throws Exception {
+-    LongParam param = new LongParam("p", "1") {
+-    };
+-    Assert.assertEquals(param.getDomain(), "a long");
+-    Assert.assertEquals(param.value(), new Long(1));
+-    Assert.assertEquals(param.toString(), "1");
+-    param = new LongParam("p", null) {
+-    };
+-    Assert.assertEquals(param.value(), null);
+-    param = new LongParam("p", "") {
+-    };
+-    Assert.assertEquals(param.value(), null);
+-  }
+-
+-  @Test(expected = IllegalArgumentException.class)
+-  public void invalid1() throws Exception {
+-    new LongParam("p", "x") {
+-    };
+-  }
+-
+-}
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/lib/wsrs/TestParam.java b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/lib/wsrs/TestParam.java
+new file mode 100644
+index 0000000..ed79c86
+--- /dev/null
++++ b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/lib/wsrs/TestParam.java
+@@ -0,0 +1,120 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.lib.wsrs;
++
++import junit.framework.Assert;
++import org.junit.Test;
++
++import java.util.regex.Pattern;
++
++public class TestParam {
++
++  private <T> void test(Param<T> param, String name,
++                   String domain, T defaultValue, T validValue,
++                   String invalidStrValue, String outOfRangeValue) throws Exception {
++
++    Assert.assertEquals(name, param.getName());
++    Assert.assertEquals(domain, param.getDomain());
++    Assert.assertEquals(defaultValue, param.value());
++    Assert.assertEquals(defaultValue, param.parseParam(""));
++    Assert.assertEquals(defaultValue, param.parseParam(null));
++    Assert.assertEquals(validValue, param.parseParam(validValue.toString()));
++    if (invalidStrValue != null) {
++      try {
++        param.parseParam(invalidStrValue);
++        Assert.fail();
++      } catch (IllegalArgumentException ex) {
++        //NOP
++      } catch (Exception ex) {
++        Assert.fail();
++      }
++    }
++    if (outOfRangeValue != null) {
++      try {
++        param.parseParam(outOfRangeValue);
++        Assert.fail();
++      } catch (IllegalArgumentException ex) {
++        //NOP
++      } catch (Exception ex) {
++        Assert.fail();
++      }
++    }
++   }
++
++  @Test
++  public void testBoolean() throws Exception {
++    Param<Boolean> param = new BooleanParam("b", false) {
++    };
++    test(param, "b", "a boolean", false, true, "x", null);
++  }
++
++  @Test
++  public void testByte() throws Exception {
++    Param<Byte> param = new ByteParam("B", (byte) 1) {
++    };
++    test(param, "B", "a byte", (byte) 1, (byte) 2, "x", "256");
++  }
++
++  @Test
++  public void testShort() throws Exception {
++    Param<Short> param = new ShortParam("S", (short) 1) {
++    };
++    test(param, "S", "a short", (short) 1, (short) 2, "x",
++         "" + ((int)Short.MAX_VALUE + 1));
++  }
++
++  @Test
++  public void testInteger() throws Exception {
++    Param<Integer> param = new IntegerParam("I", 1) {
++    };
++    test(param, "I", "an integer", 1, 2, "x", "" + ((long)Integer.MAX_VALUE + 1));
++  }
++
++  @Test
++  public void testLong() throws Exception {
++    Param<Long> param = new LongParam("L", 1L) {
++    };
++    test(param, "L", "a long", 1L, 2L, "x", null);
++  }
++
++  public static enum ENUM {
++    FOO, BAR
++  }
++
++  @Test
++  public void testEnum() throws Exception {
++    EnumParam<ENUM> param = new EnumParam<ENUM>("e", ENUM.class, ENUM.FOO) {
++    };
++    test(param, "e", "FOO,BAR", ENUM.FOO, ENUM.BAR, "x", null);
++  }
++
++  @Test
++  public void testString() throws Exception {
++    Param<String> param = new StringParam("s", "foo") {
++    };
++    test(param, "s", "a string", "foo", "bar", null, null);
++  }
++
++  @Test
++  public void testRegEx() throws Exception {
++    Param<String> param = new StringParam("r", "aa", Pattern.compile("..")) {
++    };
++    test(param, "r", "..", "aa", "bb", "c", null);
++  }
++}
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/lib/wsrs/TestShortParam.java b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/lib/wsrs/TestShortParam.java
+deleted file mode 100644
+index b37bddf..0000000
+--- a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/lib/wsrs/TestShortParam.java
++++ /dev/null
+@@ -1,53 +0,0 @@
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package org.apache.hadoop.lib.wsrs;
+-
+-
+-import junit.framework.Assert;
+-import org.junit.Test;
+-
+-public class TestShortParam {
+-
+-  @Test
+-  public void param() throws Exception {
+-    ShortParam param = new ShortParam("p", "1") {
+-    };
+-    Assert.assertEquals(param.getDomain(), "a short");
+-    Assert.assertEquals(param.value(), new Short((short) 1));
+-    Assert.assertEquals(param.toString(), "1");
+-    param = new ShortParam("p", null) {
+-    };
+-    Assert.assertEquals(param.value(), null);
+-    param = new ShortParam("p", "") {
+-    };
+-    Assert.assertEquals(param.value(), null);
+-  }
+-
+-  @Test(expected = IllegalArgumentException.class)
+-  public void invalid1() throws Exception {
+-    new ShortParam("p", "x") {
+-    };
+-  }
+-
+-  @Test(expected = IllegalArgumentException.class)
+-  public void invalid2() throws Exception {
+-    new ShortParam("p", "" + Integer.MAX_VALUE) {
+-    };
+-  }
+-}
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/lib/wsrs/TestStringParam.java b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/lib/wsrs/TestStringParam.java
+deleted file mode 100644
+index feb489e..0000000
+--- a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/java/org/apache/hadoop/lib/wsrs/TestStringParam.java
++++ /dev/null
+@@ -1,64 +0,0 @@
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package org.apache.hadoop.lib.wsrs;
+-
+-
+-import junit.framework.Assert;
+-import org.junit.Test;
+-
+-import java.util.regex.Pattern;
+-
+-public class TestStringParam {
+-
+-  @Test
+-  public void param() throws Exception {
+-    StringParam param = new StringParam("p", "s") {
+-    };
+-    Assert.assertEquals(param.getDomain(), "a string");
+-    Assert.assertEquals(param.value(), "s");
+-    Assert.assertEquals(param.toString(), "s");
+-    param = new StringParam("p", null) {
+-    };
+-    Assert.assertEquals(param.value(), null);
+-    param = new StringParam("p", "") {
+-    };
+-    Assert.assertEquals(param.value(), null);
+-
+-    param.setValue("S");
+-    Assert.assertEquals(param.value(), "S");
+-  }
+-
+-  @Test
+-  public void paramRegEx() throws Exception {
+-    StringParam param = new StringParam("p", "Aaa", Pattern.compile("A.*")) {
+-    };
+-    Assert.assertEquals(param.getDomain(), "A.*");
+-    Assert.assertEquals(param.value(), "Aaa");
+-    Assert.assertEquals(param.toString(), "Aaa");
+-    param = new StringParam("p", null) {
+-    };
+-    Assert.assertEquals(param.value(), null);
+-  }
+-
+-  @Test(expected = IllegalArgumentException.class)
+-  public void paramInvalidRegEx() throws Exception {
+-    new StringParam("p", "Baa", Pattern.compile("A.*")) {
+-    };
+-  }
+-}
+diff --git a/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/resources/httpfs-log4j.properties b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/resources/httpfs-log4j.properties
+new file mode 100644
+index 0000000..7517512
+--- /dev/null
++++ b/hadoop-hdfs-project/hadoop-hdfs-httpfs/src/test/resources/httpfs-log4j.properties
+@@ -0,0 +1,22 @@
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#  http://www.apache.org/licenses/LICENSE-2.0
++#
++#  Unless required by applicable law or agreed to in writing, software
++#  distributed under the License is distributed on an "AS IS" BASIS,
++#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++#  See the License for the specific language governing permissions and
++#  limitations under the License.
++#
++#log4j.appender.test=org.apache.log4j.varia.NullAppender
++#log4j.appender.test=org.apache.log4j.ConsoleAppender
++log4j.appender.test=org.apache.log4j.FileAppender
++log4j.appender.test.File=${test.dir}/test.log
++log4j.appender.test.Append=true
++log4j.appender.test.layout=org.apache.log4j.PatternLayout
++log4j.appender.test.layout.ConversionPattern=%d{ISO8601} %5p %20c{1}: %4L - %m%n
++log4j.rootLogger=ALL, test
++
+-- 
+1.7.0.4
+

@@ -1,0 +1,184 @@
+From f31443c43050d2736b548a428290e172bef0d3fe Mon Sep 17 00:00:00 2001
+From: Sandy Ryza <sandy@cloudera.com>
+Date: Sun, 23 Dec 2012 10:43:59 -0800
+Subject: [PATCH 1234/1357] MR1: CLOUDERA_BUILD. Fix TokenCache to compile after HADOOP-7967
+
+Reason: Fix compilation
+Ref: CDH-9617
+Author: Sandy Ryza
+---
+ .../hadoop/mapreduce/security/TokenCache.java      |  120 +++++++++-----------
+ .../hadoop/mapreduce/security/TestTokenCache.java  |    4 -
+ 2 files changed, 56 insertions(+), 68 deletions(-)
+
+diff --git a/src/mapred/org/apache/hadoop/mapreduce/security/TokenCache.java b/src/mapred/org/apache/hadoop/mapreduce/security/TokenCache.java
+index 7844688..dbc27af 100644
+--- a/src/mapred/org/apache/hadoop/mapreduce/security/TokenCache.java
++++ b/src/mapred/org/apache/hadoop/mapreduce/security/TokenCache.java
+@@ -20,7 +20,9 @@ package org.apache.hadoop.mapreduce.security;
+ 
+ import java.io.IOException;
+ import java.net.URI;
++import java.util.HashSet;
+ import java.util.List;
++import java.util.Set;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+@@ -93,60 +95,67 @@ public class TokenCache {
+     conf.unset(MAPREDUCE_JOB_CREDENTIALS_BINARY);
+   }
+ 
++  /**
++   * Obtain delegation tokens for the filesystems pointed to by the
++   * given paths.  Filesystems may have multiple tokens, so we cannot
++   * just check to see whether a token is available already, so we call
++   * addDelegationTokens on each one.
++   */
+   static void obtainTokensForNamenodesInternal(Credentials credentials,
+-                                               Path [] ps, 
+-                                               Configuration conf
+-                                               ) throws IOException {
+-    // get jobtracker principal id (for the renewer)
++      Path[] ps, Configuration conf) throws IOException {
++    Set<FileSystem> fsSet = new HashSet<FileSystem>();
++    for(Path p: ps) {
++      fsSet.add(p.getFileSystem(conf));
++    }
++    for (FileSystem fs : fsSet) {
++      obtainTokensForNamenodesInternal(fs, credentials, conf);
++    }
++  }
++
++  /**
++   * get delegation tokens for a specific FS
++   * @param fs
++   * @param credentials
++   * @param p
++   * @param conf
++   * @throws IOException
++   */
++  private static void obtainTokensForNamenodesInternal(FileSystem fs,
++      Credentials credentials, Configuration conf) throws IOException {
+     HadoopKerberosName jtKrbName = new HadoopKerberosName(conf.get(JobTracker.JT_USER_NAME, ""));
+     String delegTokenRenewer = jtKrbName.getShortName();
+-    boolean readFile = true;
+-    for(Path p: ps) {
+-      FileSystem fs = FileSystem.get(p.toUri(), conf);
+-      String fsName = fs.getCanonicalServiceName();
+-      if (TokenCache.getDelegationToken(credentials, fsName) == null) {
+-        //TODO: Need to come up with a better place to put
+-        //this block of code to do with reading the file
+-        if (readFile) {
+-          readFile = false;
+-          String binaryTokenFilename =
+-            conf.get(MAPREDUCE_JOB_CREDENTIALS_BINARY);
+-          if (binaryTokenFilename != null) {
+-            Credentials binary;
+-            try {
+-              binary = Credentials.readTokenStorageFile(new Path("file:///" +  
+-                  binaryTokenFilename), conf);
+-            } catch (IOException e) {
+-              throw new RuntimeException(e);
+-            }
+-            credentials.addAll(binary);
+-          }
+-          if (TokenCache.getDelegationToken(credentials, fsName) != null) {
+-            LOG.debug("DT for " + fsName  + " is already present");
+-            continue;
+-          }
+-        }
+-        List<Token<?>> tokens =
+-          fs.getDelegationTokens(delegTokenRenewer, credentials);
+-        if (tokens != null) {
+-          for (Token<?> token : tokens) {
+-            credentials.addToken(token.getService(), token);
+-            LOG.info("Got dt for " + fs.getUri() + ";uri="+ fsName + 
+-                ";t.service="+token.getService());
+-          }
+-        }
+-        //Call getDelegationToken as well for now - for FS implementations
+-        // which may not have implmented getDelegationTokens (hftp)
+-        Token<?> token = fs.getDelegationToken(delegTokenRenewer);
+-        if (token != null) {
+-          credentials.addToken(token.getService(), token);
+-          LOG.info("Got dt for " + p + ";uri="+ fsName + 
+-                   ";t.service="+token.getService());
+-        }
++
++    if (delegTokenRenewer == null || delegTokenRenewer.length() == 0) {
++      throw new IOException(
++          "Can't get JT Kerberos principal for use as renewer");
++    }
++    mergeBinaryTokens(credentials, conf);
++
++    final Token<?> tokens[] = fs.addDelegationTokens(delegTokenRenewer,
++                                                     credentials);
++    if (tokens != null) {
++      for (Token<?> token : tokens) {
++        LOG.info("Got dt for " + fs.getUri() + "; "+token);
+       }
+     }
+   }
+ 
++  private static void mergeBinaryTokens(Credentials creds, Configuration conf) {
++    String binaryTokenFilename =
++        conf.get(MAPREDUCE_JOB_CREDENTIALS_BINARY);
++    if (binaryTokenFilename != null) {
++      Credentials binary;
++      try {
++        binary = Credentials.readTokenStorageFile(
++            new Path("file:///" +  binaryTokenFilename), conf);
++      } catch (IOException e) {
++        throw new RuntimeException(e);
++      }
++      // supplement existing tokens with the tokens in the binary file
++      creds.mergeAll(binary);
++    }
++  }
++
+   /**
+    * file name used on HDFS for generated job token
+    */
+@@ -161,23 +170,6 @@ public class TokenCache {
+   private static final Text JOB_TOKEN = new Text("ShuffleAndJobToken");
+ 
+   /**
+-   * 
+-   * @param namenode
+-   * @return delegation token
+-   */
+-  @SuppressWarnings("unchecked")
+-  //@InterfaceAudience.Private
+-  public static Token<DelegationTokenIdentifier> 
+-  getDelegationToken(Credentials credentials, String namenode) {
+-    //No fs specific tokens issues by this fs. It may however issue tokens
+-    // for other filesystems - which would be keyed by that filesystems name.
+-    if (namenode == null)  
+-      return null;
+-    return (Token<DelegationTokenIdentifier>)
+-        credentials.getToken(new Text(namenode));
+-  }
+-
+-  /**
+    * load job token from a file
+    * @param conf
+    * @throws IOException
+diff --git a/src/test/org/apache/hadoop/mapreduce/security/TestTokenCache.java b/src/test/org/apache/hadoop/mapreduce/security/TestTokenCache.java
+index 057585f..0afa952 100644
+--- a/src/test/org/apache/hadoop/mapreduce/security/TestTokenCache.java
++++ b/src/test/org/apache/hadoop/mapreduce/security/TestTokenCache.java
+@@ -276,10 +276,6 @@ public class TestTokenCache {
+     // this token is keyed by hostname:port key.
+     String fs_addr = 
+       SecurityUtil.buildDTServiceName(p1.toUri(), NameNode.DEFAULT_PORT); 
+-    Token<DelegationTokenIdentifier> nnt =
+-      TokenCache.getDelegationToken(credentials, fs_addr);
+-
+-    assertNotNull("Token for nn is null", nnt);
+ 
+     // verify the size
+     Collection<Token<? extends TokenIdentifier>> tns =
+-- 
+1.7.0.4
+

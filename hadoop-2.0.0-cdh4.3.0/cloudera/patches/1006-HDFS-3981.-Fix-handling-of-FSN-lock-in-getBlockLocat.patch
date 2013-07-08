@@ -1,0 +1,143 @@
+From 8e585627db261d7149d846bd015a06d831ff2a8d Mon Sep 17 00:00:00 2001
+From: Todd Lipcon <todd@apache.org>
+Date: Mon, 8 Apr 2013 19:57:24 +0000
+Subject: [PATCH 1006/1357] HDFS-3981. Fix handling of FSN lock in getBlockLocations. Contributed by Xiaobo Peng and Todd Lipcon.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/branch-2@1465752 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit ad581734d581c2543ede06ea04497c875b7aaa9f)
+---
+ .../java/org/apache/hadoop/test/MockitoUtil.java   |   28 ++++++++++++++++
+ .../hadoop/hdfs/server/namenode/FSNamesystem.java  |    4 +-
+ .../java/org/apache/hadoop/hdfs/TestSetTimes.java  |   35 ++++++++++++++++++++
+ 3 files changed, 65 insertions(+), 2 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/test/MockitoUtil.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/test/MockitoUtil.java
+index 82abcad..32305b5 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/test/MockitoUtil.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/test/MockitoUtil.java
+@@ -20,6 +20,9 @@ package org.apache.hadoop.test;
+ import java.io.Closeable;
+ 
+ import org.mockito.Mockito;
++import org.mockito.invocation.InvocationOnMock;
++import org.mockito.stubbing.Answer;
++import org.mockito.stubbing.Stubber;
+ 
+ public abstract class MockitoUtil {
+ 
+@@ -33,4 +36,29 @@ public abstract class MockitoUtil {
+     return Mockito.mock(clazz,
+         Mockito.withSettings().extraInterfaces(Closeable.class));
+   }
++
++  /**
++   * Throw an exception from the mock/spy only in the case that the
++   * call stack at the time the method has a line which matches the given
++   * pattern.
++   *
++   * @param t the Throwable to throw
++   * @param pattern the pattern against which to match the call stack trace
++   * @return the stub in progress
++   */
++  public static Stubber doThrowWhenCallStackMatches(
++      final Throwable t, final String pattern) {
++    return Mockito.doAnswer(new Answer<Object>() {
++      @Override
++      public Object answer(InvocationOnMock invocation) throws Throwable {
++        t.setStackTrace(Thread.currentThread().getStackTrace());
++        for (StackTraceElement elem : t.getStackTrace()) {
++          if (elem.toString().matches(pattern)) {
++            throw t;
++          }
++        }
++        return invocation.callRealMethod();
++      }
++    });
++  }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+index f9a1b88..fa9f3d4 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+@@ -1346,14 +1346,14 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+         long now = now();
+         final INodeFile inode = INodeFile.valueOf(dir.getINode(src), src);
+         if (doAccessTime && isAccessTimeSupported()) {
+-          if (now <= inode.getAccessTime() + getAccessTimePrecision()) {
++          if (now > inode.getAccessTime() + getAccessTimePrecision()) {
+             // if we have to set access time but we only have the readlock, then
+             // restart this entire operation with the writeLock.
+             if (isReadOp) {
+               continue;
+             }
++            dir.setTimes(src, inode, -1, now, false);
+           }
+-          dir.setTimes(src, inode, -1, now, false);
+         }
+         return blockManager.createLocatedBlocks(inode.getBlocks(),
+             inode.computeFileSize(false), inode.isUnderConstruction(),
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestSetTimes.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestSetTimes.java
+index 18341ca..4e6091b 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestSetTimes.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestSetTimes.java
+@@ -27,6 +27,7 @@ import java.net.InetSocketAddress;
+ import java.text.SimpleDateFormat;
+ import java.util.Date;
+ import java.util.Random;
++import java.util.concurrent.locks.ReentrantReadWriteLock;
+ 
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.CommonConfigurationKeys;
+@@ -36,8 +37,11 @@ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
+ import org.apache.hadoop.hdfs.protocol.HdfsConstants.DatanodeReportType;
++import org.apache.hadoop.hdfs.server.namenode.NameNodeAdapter;
++import org.apache.hadoop.test.MockitoUtil;
+ import org.apache.hadoop.util.Time;
+ import org.junit.Test;
++import org.mockito.Mockito;
+ 
+ /**
+  * This class tests the access time on files.
+@@ -273,6 +277,37 @@ public class TestSetTimes {
+       cluster.shutdown();
+     }
+   }
++  
++  /**
++   * Test that when access time updates are not needed, the FSNamesystem
++   * write lock is not taken by getBlockLocations.
++   * Regression test for HDFS-3981.
++   */
++  @Test(timeout=60000)
++  public void testGetBlockLocationsOnlyUsesReadLock() throws IOException {
++    Configuration conf = new HdfsConfiguration();
++    conf.setInt(DFSConfigKeys.DFS_NAMENODE_ACCESSTIME_PRECISION_KEY, 100*1000);
++    MiniDFSCluster cluster = new MiniDFSCluster.Builder(conf)
++      .numDataNodes(0)
++      .build();
++    ReentrantReadWriteLock spyLock = NameNodeAdapter.spyOnFsLock(cluster.getNamesystem());
++    try {
++      // Create empty file in the FSN.
++      Path p = new Path("/empty-file");
++      DFSTestUtil.createFile(cluster.getFileSystem(), p, 0, (short)1, 0L);
++      
++      // getBlockLocations() should not need the write lock, since we just created
++      // the file (and thus its access time is already within the 100-second
++      // accesstime precision configured above). 
++      MockitoUtil.doThrowWhenCallStackMatches(
++          new AssertionError("Should not need write lock"),
++          ".*getBlockLocations.*")
++          .when(spyLock).writeLock();
++      cluster.getFileSystem().getFileBlockLocations(p, 0, 100);
++    } finally {
++      cluster.shutdown();
++    }
++  }
+ 
+   public static void main(String[] args) throws Exception {
+     new TestSetTimes().testTimes();
+-- 
+1.7.0.4
+

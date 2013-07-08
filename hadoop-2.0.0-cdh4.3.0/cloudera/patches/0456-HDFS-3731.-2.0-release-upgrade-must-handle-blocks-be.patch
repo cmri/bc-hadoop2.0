@@ -1,0 +1,454 @@
+From 306bc6cf9e2b0432a4d297b0aea230e15d3fb215 Mon Sep 17 00:00:00 2001
+From: Eli Collins <eli@apache.org>
+Date: Fri, 24 Aug 2012 22:10:38 +0000
+Subject: [PATCH 0456/1357] HDFS-3731. 2.0 release upgrade must handle blocks being written from 1.0. Contributed by Colin Patrick McCabe
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1377137 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit cac709fb2a32960c74196510dae41b6fbc475a35)
+---
+ .../apache/hadoop/hdfs/server/common/Storage.java  |    6 +
+ .../hadoop/hdfs/server/datanode/DataStorage.java   |   35 +++++-
+ .../hadoop/hdfs/TestDFSUpgradeFromImage.java       |  123 +++++++++++++++-----
+ .../hadoop-hdfs/src/test/resources/hadoop1-bbw.tgz |  Bin 0 -> 40234 bytes
+ 4 files changed, 129 insertions(+), 35 deletions(-)
+ create mode 100644 hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop1-bbw.tgz
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/common/Storage.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/common/Storage.java
+index 6150c1a..4833aec 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/common/Storage.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/common/Storage.java
+@@ -88,6 +88,12 @@ public abstract class Storage extends StorageInfo {
+   public    static final String STORAGE_TMP_LAST_CKPT = "lastcheckpoint.tmp";
+   public    static final String STORAGE_PREVIOUS_CKPT = "previous.checkpoint";
+   
++  /**
++   * The blocksBeingWritten directory which was used in some 1.x and earlier
++   * releases.
++   */
++  public static final String STORAGE_1_BBW = "blocksBeingWritten";
++  
+   public enum StorageState {
+     NON_EXISTENT,
+     NOT_FORMATTED,
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataStorage.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataStorage.java
+index 88ee89f..c7f085b 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataStorage.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataStorage.java
+@@ -455,6 +455,8 @@ public class DataStorage extends Storage {
+     
+     File curDir = sd.getCurrentDir();
+     File prevDir = sd.getPreviousDir();
++    File bbwDir = new File(sd.getRoot(), Storage.STORAGE_1_BBW);
++
+     assert curDir.exists() : "Data node current directory must exist.";
+     // Cleanup directory "detach"
+     cleanupDetachDir(new File(curDir, STORAGE_DIR_DETACHED));
+@@ -475,7 +477,7 @@ public class DataStorage extends Storage {
+     BlockPoolSliceStorage bpStorage = new BlockPoolSliceStorage(nsInfo.getNamespaceID(), 
+         nsInfo.getBlockPoolID(), nsInfo.getCTime(), nsInfo.getClusterID());
+     bpStorage.format(curDir, nsInfo);
+-    linkAllBlocks(tmpDir, new File(curBpDir, STORAGE_DIR_CURRENT));
++    linkAllBlocks(tmpDir, bbwDir, new File(curBpDir, STORAGE_DIR_CURRENT));
+     
+     // 4. Write version file under <SD>/current
+     layoutVersion = HdfsConstants.LAYOUT_VERSION;
+@@ -582,15 +584,21 @@ public class DataStorage extends Storage {
+              + "; cur CTime = " + this.getCTime());
+     assert sd.getCurrentDir().exists() : "Current directory must exist.";
+     final File tmpDir = sd.getFinalizedTmp();//finalized.tmp directory
++    final File bbwDir = new File(sd.getRoot(), Storage.STORAGE_1_BBW);
+     // 1. rename previous to finalized.tmp
+     rename(prevDir, tmpDir);
+ 
+     // 2. delete finalized.tmp dir in a separate thread
++    // Also delete the blocksBeingWritten from HDFS 1.x and earlier, if
++    // it exists.
+     new Daemon(new Runnable() {
+         @Override
+         public void run() {
+           try {
+             deleteDir(tmpDir);
++            if (bbwDir.exists()) {
++              deleteDir(bbwDir);
++            }
+           } catch(IOException ex) {
+             LOG.error("Finalize upgrade for " + dataDirPath + " failed.", ex);
+           }
+@@ -624,11 +632,16 @@ public class DataStorage extends Storage {
+ 
+   /**
+    * Hardlink all finalized and RBW blocks in fromDir to toDir
+-   * @param fromDir directory where the snapshot is stored
+-   * @param toDir the current data directory
+-   * @throws IOException if error occurs during hardlink
++   *
++   * @param fromDir      The directory where the 'from' snapshot is stored
++   * @param fromBbwDir   In HDFS 1.x, the directory where blocks
++   *                     that are under construction are stored.
++   * @param toDir        The current data directory
++   *
++   * @throws IOException If error occurs during hardlink
+    */
+-  private void linkAllBlocks(File fromDir, File toDir) throws IOException {
++  private void linkAllBlocks(File fromDir, File fromBbwDir, File toDir)
++      throws IOException {
+     HardLink hardLink = new HardLink();
+     // do the link
+     int diskLayoutVersion = this.getLayoutVersion();
+@@ -636,13 +649,23 @@ public class DataStorage extends Storage {
+       // hardlink finalized blocks in tmpDir/finalized
+       linkBlocks(new File(fromDir, STORAGE_DIR_FINALIZED), 
+           new File(toDir, STORAGE_DIR_FINALIZED), diskLayoutVersion, hardLink);
+-      // hardlink rbw blocks in tmpDir/finalized
++      // hardlink rbw blocks in tmpDir/rbw
+       linkBlocks(new File(fromDir, STORAGE_DIR_RBW), 
+           new File(toDir, STORAGE_DIR_RBW), diskLayoutVersion, hardLink);
+     } else { // pre-RBW version
+       // hardlink finalized blocks in tmpDir
+       linkBlocks(fromDir, new File(toDir, STORAGE_DIR_FINALIZED), 
+           diskLayoutVersion, hardLink);      
++      if (fromBbwDir.exists()) {
++        /*
++         * We need to put the 'blocksBeingWritten' from HDFS 1.x into the rbw
++         * directory.  It's a little messy, because the blocksBeingWriten was
++         * NOT underneath the 'current' directory in those releases.  See
++         * HDFS-3731 for details.
++         */
++        linkBlocks(fromBbwDir,
++            new File(toDir, STORAGE_DIR_RBW), diskLayoutVersion, hardLink);
++      }
+     } 
+     LOG.info( hardLink.linkStats.report() );
+   }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSUpgradeFromImage.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSUpgradeFromImage.java
+index 8db1741..8d71791 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSUpgradeFromImage.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSUpgradeFromImage.java
+@@ -39,7 +39,9 @@ import org.apache.hadoop.fs.FSInputStream;
+ import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.fs.FileUtil;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hdfs.protocol.DirectoryListing;
+ import org.apache.hadoop.hdfs.protocol.HdfsConstants;
++import org.apache.hadoop.hdfs.protocol.HdfsFileStatus;
+ import org.apache.hadoop.hdfs.server.common.HdfsServerConstants.StartupOption;
+ import org.apache.hadoop.hdfs.server.namenode.FSImageTestUtil;
+ import org.apache.hadoop.util.StringUtils;
+@@ -49,8 +51,9 @@ import org.junit.Test;
+  * This tests data transfer protocol handling in the Datanode. It sends
+  * various forms of wrong data and verifies that Datanode handles it well.
+  * 
+- * This test uses the following two file from src/test/.../dfs directory :
+- *   1) hadoop-version-dfs-dir.tgz : contains DFS directories.
++ * This test uses the following items from src/test/.../dfs directory :
++ *   1) hadoop-22-dfs-dir.tgz and other tarred pre-upgrade NN / DN 
++ *      directory images
+  *   2) hadoop-dfs-dir.txt : checksums that are compared in this test.
+  * Please read hadoop-dfs-dir.txt for more information.  
+  */
+@@ -62,14 +65,23 @@ public class TestDFSUpgradeFromImage {
+                       new File(MiniDFSCluster.getBaseDirectory());
+   private static final String HADOOP_DFS_DIR_TXT = "hadoop-dfs-dir.txt";
+   private static final String HADOOP22_IMAGE = "hadoop-22-dfs-dir.tgz";
+-  
+-  public int numDataNodes = 4;
+-  
++  private static final String HADOOP1_BBW_IMAGE = "hadoop1-bbw.tgz";
++
+   private static class ReferenceFileInfo {
+     String path;
+     long checksum;
+   }
+   
++  private static final Configuration upgradeConf;
++  
++  static {
++    upgradeConf = new HdfsConfiguration();
++    upgradeConf.setInt(DFSConfigKeys.DFS_DATANODE_SCAN_PERIOD_HOURS_KEY, -1); // block scanning off
++    if (System.getProperty("test.build.data") == null) { // to allow test to be run outside of Maven
++      System.setProperty("test.build.data", "build/test/data");
++    }
++  }
++  
+   LinkedList<ReferenceFileInfo> refList = new LinkedList<ReferenceFileInfo>();
+   Iterator<ReferenceFileInfo> refIter;
+   
+@@ -137,11 +149,33 @@ public class TestDFSUpgradeFromImage {
+     }
+   }
+   
+-  CRC32 overallChecksum = new CRC32();
++  /**
++   * Try to open a file for reading several times.
++   * 
++   * If we fail because lease recovery hasn't completed, retry the open.
++   */
++  private static FSInputStream dfsOpenFileWithRetries(DistributedFileSystem dfs,
++      String pathName) throws IOException {
++    IOException exc = null;
++    for (int tries = 0; tries < 10; tries++) {
++      try {
++        return dfs.dfs.open(pathName);
++      } catch (IOException e) {
++        exc = e;
++      }
++      if (!exc.getMessage().contains("Cannot obtain " +
++          "block length for LocatedBlock")) {
++        throw exc;
++      }
++      try {
++        Thread.sleep(1000);
++      } catch (InterruptedException ignored) {}
++    }
++    throw exc;
++  }
+   
+-  private void verifyDir(DistributedFileSystem dfs, Path dir) 
+-                                           throws IOException {
+-    
++  private void verifyDir(DistributedFileSystem dfs, Path dir,
++      CRC32 overallChecksum) throws IOException {
+     FileStatus[] fileArr = dfs.listStatus(dir);
+     TreeMap<Path, Boolean> fileMap = new TreeMap<Path, Boolean>();
+     
+@@ -157,11 +191,11 @@ public class TestDFSUpgradeFromImage {
+       overallChecksum.update(pathName.getBytes());
+       
+       if ( isDir ) {
+-        verifyDir(dfs, path);
++        verifyDir(dfs, path, overallChecksum);
+       } else {
+         // this is not a directory. Checksum the file data.
+         CRC32 fileCRC = new CRC32();
+-        FSInputStream in = dfs.dfs.open(pathName);
++        FSInputStream in = dfsOpenFileWithRetries(dfs, pathName);
+         byte[] buf = new byte[4096];
+         int nRead = 0;
+         while ( (nRead = in.read(buf, 0, buf.length)) > 0 ) {
+@@ -175,7 +209,8 @@ public class TestDFSUpgradeFromImage {
+   
+   private void verifyFileSystem(DistributedFileSystem dfs) throws IOException {
+   
+-    verifyDir(dfs, new Path("/"));
++    CRC32 overallChecksum = new CRC32();
++    verifyDir(dfs, new Path("/"), overallChecksum);
+     
+     verifyChecksum("overallCRC", overallChecksum.getValue());
+     
+@@ -237,7 +272,8 @@ public class TestDFSUpgradeFromImage {
+   @Test
+   public void testUpgradeFromRel22Image() throws IOException {
+     unpackStorage(HADOOP22_IMAGE);
+-    upgradeAndVerify();
++    upgradeAndVerify(new MiniDFSCluster.Builder(upgradeConf).
++        numDataNodes(4));
+   }
+   
+   /**
+@@ -259,7 +295,8 @@ public class TestDFSUpgradeFromImage {
+     
+     // Upgrade should now fail
+     try {
+-      upgradeAndVerify();
++      upgradeAndVerify(new MiniDFSCluster.Builder(upgradeConf).
++          numDataNodes(4));
+       fail("Upgrade did not fail with bad MD5");
+     } catch (IOException ioe) {
+       String msg = StringUtils.stringifyException(ioe);
+@@ -268,21 +305,34 @@ public class TestDFSUpgradeFromImage {
+       }
+     }
+   }
+-
+-  private void upgradeAndVerify() throws IOException {
++    
++  static void recoverAllLeases(DFSClient dfs, 
++      Path path) throws IOException {
++    String pathStr = path.toString();
++    HdfsFileStatus status = dfs.getFileInfo(pathStr);
++    if (!status.isDir()) {
++      dfs.recoverLease(pathStr);
++      return;
++    }
++    byte prev[] = HdfsFileStatus.EMPTY_NAME;
++    DirectoryListing dirList;
++    do {
++      dirList = dfs.listPaths(pathStr, prev);
++      HdfsFileStatus files[] = dirList.getPartialListing();
++      for (HdfsFileStatus f : files) {
++        recoverAllLeases(dfs, f.getFullPath(path));
++      }
++      prev = dirList.getLastName();
++    } while (dirList.hasMore());
++  }
++  
++  private void upgradeAndVerify(MiniDFSCluster.Builder bld)
++      throws IOException {
+     MiniDFSCluster cluster = null;
+     try {
+-      Configuration conf = new HdfsConfiguration();
+-      if (System.getProperty("test.build.data") == null) { // to allow test to be run outside of Ant
+-        System.setProperty("test.build.data", "build/test/data");
+-      }
+-      conf.setInt(DFSConfigKeys.DFS_DATANODE_SCAN_PERIOD_HOURS_KEY, -1); // block scanning off
+-      cluster = new MiniDFSCluster.Builder(conf)
+-                                  .numDataNodes(numDataNodes)
+-                                  .format(false)
+-                                  .startupOption(StartupOption.UPGRADE)
+-                                  .clusterId("testClusterId")
+-                                  .build();
++      bld.format(false).startupOption(StartupOption.UPGRADE)
++        .clusterId("testClusterId");
++      cluster = bld.build();
+       cluster.waitActive();
+       DistributedFileSystem dfs = (DistributedFileSystem)cluster.getFileSystem();
+       DFSClient dfsClient = dfs.dfs;
+@@ -293,12 +343,27 @@ public class TestDFSUpgradeFromImage {
+           Thread.sleep(1000);
+         } catch (InterruptedException ignored) {}
+       }
+-
++      recoverAllLeases(dfsClient, new Path("/"));
+       verifyFileSystem(dfs);
+     } finally {
+       if (cluster != null) { cluster.shutdown(); }
+     } 
+   }
+ 
+-
++  /**
++   * Test upgrade from a 1.x image with some blocksBeingWritten
++   */
++  @Test
++  public void testUpgradeFromRel1BBWImage() throws IOException {
++    unpackStorage(HADOOP1_BBW_IMAGE);
++    Configuration conf = new Configuration(upgradeConf);
++    conf.set(DFSConfigKeys.DFS_DATANODE_DATA_DIR_KEY, 
++        System.getProperty("test.build.data") + File.separator + 
++        "dfs" + File.separator + 
++        "data" + File.separator + 
++        "data1");
++    upgradeAndVerify(new MiniDFSCluster.Builder(conf).
++          numDataNodes(1).enableManagedDfsDirsRedundancy(false).
++          manageDataDfsDirs(false));
++  }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop1-bbw.tgz b/hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop1-bbw.tgz
+new file mode 100644
+index 0000000000000000000000000000000000000000..2574f8b7d1307901b1cf95e2fbaa4b3acd88c90e
+GIT binary patch
+literal 40234
+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
+
+literal 0
+HcmV?d00001
+
+-- 
+1.7.0.4
+

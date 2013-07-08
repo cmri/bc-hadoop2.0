@@ -1,0 +1,212 @@
+From f7b3364af90e8312332c3cd01821d38deba52bcf Mon Sep 17 00:00:00 2001
+From: Alejandro Abdelnur <tucu@apache.org>
+Date: Mon, 13 Aug 2012 21:56:31 +0000
+Subject: [PATCH 1171/1357] MR1: HADOOP-8581. add support for HTTPS to the web UIs. (tucu)
+
+  Reason: This is a functionality backport as MR1 is based on JT/TT services
+  Author: Alejandro Abdelnur
+  Ref: CDH-6709
+
+ git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/branch-2@1372642 13f79535-47bb-0310-9956-ffa450edef68
+---
+ src/mapred/mapred-default.xml                      |    2 +-
+ .../org/apache/hadoop/mapred/TaskLogServlet.java   |   14 +++++++++-
+ .../org/apache/hadoop/mapred/TaskTracker.java      |   28 +++++++++++--------
+ src/webapps/job/jobfailures.jsp                    |    9 +++---
+ src/webapps/job/machines.jsp                       |    3 +-
+ src/webapps/job/taskdetails.jsp                    |    8 +++---
+ 6 files changed, 41 insertions(+), 23 deletions(-)
+
+diff --git a/src/mapred/mapred-default.xml b/src/mapred/mapred-default.xml
+index 1f9f266..b4b57fc 100644
+--- a/src/mapred/mapred-default.xml
++++ b/src/mapred/mapred-default.xml
+@@ -1257,7 +1257,7 @@
+ 
+ <property>
+   <name>mapreduce.shuffle.ssl.enabled</name>
+-  <value>false</value>
++  <value>${hadoop.ssl.enabled}</value>
+   <description>
+     Whether to use SSL for for the Shuffle HTTP endpoints.
+   </description>
+diff --git a/src/mapred/org/apache/hadoop/mapred/TaskLogServlet.java b/src/mapred/org/apache/hadoop/mapred/TaskLogServlet.java
+index e811cd3..6bddb7d 100644
+--- a/src/mapred/org/apache/hadoop/mapred/TaskLogServlet.java
++++ b/src/mapred/org/apache/hadoop/mapred/TaskLogServlet.java
+@@ -38,6 +38,7 @@ import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.security.authorize.AccessControlList;
+ import org.apache.hadoop.http.HtmlQuoting;
+ import org.apache.hadoop.util.StringUtils;
++import org.apache.hadoop.http.HttpConfig;
+ 
+ /**
+  * A servlet that is run by the TaskTrackers to provide the task logs via http.
+@@ -63,10 +64,21 @@ public class TaskLogServlet extends HttpServlet {
+    */
+   public static String getTaskLogUrl(String taskTrackerHostName,
+       String httpPort, String taskAttemptID) {
+-    return ("http://" + taskTrackerHostName + ":" + httpPort
++    return (HttpConfig.getSchemePrefix() + taskTrackerHostName + ":" + httpPort
+         + "/tasklog?attemptid=" + taskAttemptID);
+   }
+ 
++  /**
++   * Construct the taskLogUrl
++   * @param status
++   * @param taskAttemptID
++   * @return the taskLogUrl
++   */
++  public static String getTaskLogUrl(TaskTrackerStatus status, String taskAttemptID) {
++    return getTaskLogUrl(status.getHost(),
++        String.valueOf(status.getHttpPort()), taskAttemptID);
++  }
++
+   private void printTaskLog(HttpServletResponse response,
+                             OutputStream out, TaskAttemptID taskId, 
+                             long start, long end, boolean plainText, 
+diff --git a/src/mapred/org/apache/hadoop/mapred/TaskTracker.java b/src/mapred/org/apache/hadoop/mapred/TaskTracker.java
+index 4706163..c2be642 100644
+--- a/src/mapred/org/apache/hadoop/mapred/TaskTracker.java
++++ b/src/mapred/org/apache/hadoop/mapred/TaskTracker.java
+@@ -73,6 +73,7 @@ import org.apache.hadoop.fs.LocalFileSystem;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.permission.FsPermission;
+ import org.apache.hadoop.http.HttpServer;
++import org.apache.hadoop.http.HttpConfig;
+ import org.apache.hadoop.io.IntWritable;
+ import org.apache.hadoop.io.nativeio.NativeIO;
+ import org.apache.hadoop.io.ReadaheadPool;
+@@ -1715,19 +1716,22 @@ public class TaskTracker implements MRConstants, TaskUmbilicalProtocol,
+     shuffleScheme = (shuffleSsl) ? "https" : "http";
+     server.setAttribute(JobTracker.SHUFFLE_SSL_ENABLED_KEY, shuffleSsl);
+     if (shuffleSsl) {
+-      sslFactory = new SSLFactory(SSLFactory.Mode.SERVER, conf);
+-      try {
+-        sslFactory.init();
+-      } catch (GeneralSecurityException ex) {
+-        throw new RuntimeException(ex);
++      //if web UI is secure, no need ot use a second SSL listener for shuffle
++      if (!HttpConfig.isSecure()) {
++        sslFactory = new SSLFactory(SSLFactory.Mode.SERVER, conf);
++        try {
++          sslFactory.init();
++        } catch (GeneralSecurityException ex) {
++          throw new RuntimeException(ex);
++        }
++        String sslHostname = conf.get(JobTracker.SHUFFLE_SSL_ADDRESS_KEY,
++                                      JobTracker.SHUFFLE_SSL_ADDRESS_DEFAULT);
++        int sslPort = conf.getInt(
++          JobTracker.SHUFFLE_SSL_PORT_KEY, JobTracker.SHUFFLE_SSL_PORT_DEFAULT);
++        InetSocketAddress sslAddr = new InetSocketAddress(sslHostname, sslPort);
++        server.addSslListener(sslAddr, sslFactory);
++        shufflePort = sslPort;
+       }
+-      String sslHostname = conf.get(JobTracker.SHUFFLE_SSL_ADDRESS_KEY,
+-                                    JobTracker.SHUFFLE_SSL_ADDRESS_DEFAULT);
+-      int sslPort = conf.getInt(
+-        JobTracker.SHUFFLE_SSL_PORT_KEY, JobTracker.SHUFFLE_SSL_PORT_DEFAULT);
+-      InetSocketAddress sslAddr = new InetSocketAddress(sslHostname, sslPort);
+-      server.addSslListener(sslAddr, sslFactory);
+-      shufflePort = sslPort;
+     }
+ 
+     server.start();
+diff --git a/src/webapps/job/jobfailures.jsp b/src/webapps/job/jobfailures.jsp
+index 643edc2..5e39f67 100644
+--- a/src/webapps/job/jobfailures.jsp
++++ b/src/webapps/job/jobfailures.jsp
+@@ -9,6 +9,7 @@
+   import="org.apache.hadoop.mapred.JSPUtil.JobWithViewAccessCheck"
+   import="org.apache.hadoop.mapreduce.TaskType"
+   import="org.apache.hadoop.util.*"
++  import="org.apache.hadoop.http.HttpConfig"
+ %>
+ 
+ <%!	private static final long serialVersionUID = 1L;
+@@ -38,7 +39,8 @@
+         if (taskTracker == null) {
+           out.print("<td>" + taskTrackerName + "</td>");
+         } else {
+-          out.print("<td><a href=\"http://" + taskTracker.getHost() + ":" +
++          out.print("<td><a href=\"" + HttpConfig.getSchemePrefix() +
++                    "" + taskTracker.getHost() + ":" +
+                     taskTracker.getHttpPort() + "\">" +  taskTracker.getHost() + 
+                     "</a></td>");
+         }
+@@ -61,9 +63,8 @@
+         out.print("<td>");
+         String taskLogUrl = null;
+         if (taskTracker != null) {
+-          taskLogUrl = TaskLogServlet.getTaskLogUrl(taskTracker.getHost(),
+-                                String.valueOf(taskTracker.getHttpPort()),
+-                                statuses[i].getTaskID().toString());
++          taskLogUrl = TaskLogServlet.getTaskLogUrl(taskTracker,
++                statuses[i].getTaskID().toString());
+         }
+         if (taskLogUrl != null) {
+           String tailFourKBUrl = taskLogUrl + "&start=-4097";
+diff --git a/src/webapps/job/machines.jsp b/src/webapps/job/machines.jsp
+index 5f413ec..f4d9776 100644
+--- a/src/webapps/job/machines.jsp
++++ b/src/webapps/job/machines.jsp
+@@ -7,6 +7,7 @@
+   import="java.text.DecimalFormat"
+   import="org.apache.hadoop.mapred.*"
+   import="org.apache.hadoop.util.*"
++  import="org.apache.hadoop.http.HttpConfig"
+ %>
+ <%!	private static final long serialVersionUID = 1L;
+ %>
+@@ -91,7 +92,7 @@
+           failureKing = tt.getTrackerName();
+         }
+         int numDirFailures = tt.getDirFailures();
+-        out.print("<tr><td><a href=\"http://");
++        out.print("<tr><td><a href=\"" + HttpConfig.getSchemePrefix());
+         out.print(tt.getHost() + ":" + tt.getHttpPort() + "/\">");
+         out.print(tt.getTrackerName() + "</a></td><td>");
+         out.print(tt.getHost() + "</td><td>" + numCurTasks +
+diff --git a/src/webapps/job/taskdetails.jsp b/src/webapps/job/taskdetails.jsp
+index baa1617..f4e3e58 100644
+--- a/src/webapps/job/taskdetails.jsp
++++ b/src/webapps/job/taskdetails.jsp
+@@ -13,6 +13,7 @@
+   import="org.apache.hadoop.security.UserGroupInformation"
+   import="java.security.PrivilegedExceptionAction"
+   import="org.apache.hadoop.security.AccessControlException"
++  import="org.apache.hadoop.http.HttpConfig"
+ %>
+ <%!static SimpleDateFormat dateFormat = new SimpleDateFormat(
+       "d-MMM-yyyy HH:mm:ss"); %>
+@@ -192,7 +193,7 @@
+         cleanupTrackerName = tip.machineWhereCleanupRan(status.getTaskID());
+         cleanupTracker = tracker.getTaskTrackerStatus(cleanupTrackerName);
+         if (cleanupTracker != null) {
+-          cleanupAttemptTracker = "http://" + cleanupTracker.getHost() + ":"
++          cleanupAttemptTracker = HttpConfig.getSchemePrefix() + cleanupTracker.getHost() + ":"
+             + cleanupTracker.getHttpPort();
+         }
+         hasCleanupAttempt = true;
+@@ -204,7 +205,7 @@
+       if (taskTracker == null) {
+         out.print(taskTrackerName);
+       } else {
+-        taskAttemptTracker = "http://" + taskTracker.getHost() + ":"
++        taskAttemptTracker = HttpConfig.getSchemePrefix() + taskTracker.getHost() + ":"
+           + taskTracker.getHttpPort();
+         out.print("<a href=\"" + taskAttemptTracker + "\">"
+           + tracker.getNode(taskTracker.getHost()) + "</a>");
+@@ -254,8 +255,7 @@
+         out.print("<td>");
+         String taskLogUrl = null;
+         if (taskTracker != null ) {
+-        	taskLogUrl = TaskLogServlet.getTaskLogUrl(taskTracker.getHost(),
+-        						String.valueOf(taskTracker.getHttpPort()),
++            taskLogUrl = TaskLogServlet.getTaskLogUrl(taskTracker,
+         						status.getTaskID().toString());
+       	}
+         if (hasCleanupAttempt) {
+-- 
+1.7.0.4
+

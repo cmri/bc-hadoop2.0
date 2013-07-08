@@ -1,0 +1,399 @@
+From 32004e6dcb44935a5c61c1a9b3db73a78b26af58 Mon Sep 17 00:00:00 2001
+From: Alejandro Abdelnur <tucu@apache.org>
+Date: Tue, 12 Jun 2012 21:52:46 +0000
+Subject: [PATCH 0165/1357] HDFS-3428. Move DelegationTokenRenewer to common (tucu)
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1349555 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 418b50cd2a1d7fd960b31c67e03fe39642fe18cc)
+---
+ .../apache/hadoop/fs/DelegationTokenRenewer.java   |  163 +++++++++++++++++++
+ .../org/apache/hadoop/hdfs/HftpFileSystem.java     |    2 +-
+ .../token/delegation/DelegationTokenRenewer.java   |  164 --------------------
+ .../apache/hadoop/hdfs/web/WebHdfsFileSystem.java  |    2 +-
+ 4 files changed, 165 insertions(+), 166 deletions(-)
+ create mode 100644 hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/DelegationTokenRenewer.java
+ delete mode 100644 hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/security/token/delegation/DelegationTokenRenewer.java
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/DelegationTokenRenewer.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/DelegationTokenRenewer.java
+new file mode 100644
+index 0000000..2d49759
+--- /dev/null
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/DelegationTokenRenewer.java
+@@ -0,0 +1,163 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.fs;
++
++import java.io.IOException;
++import java.lang.ref.WeakReference;
++import java.util.concurrent.DelayQueue;
++import java.util.concurrent.Delayed;
++import java.util.concurrent.TimeUnit;
++
++import org.apache.hadoop.classification.InterfaceAudience;
++import org.apache.hadoop.security.token.Token;
++import org.apache.hadoop.security.token.TokenIdentifier;
++
++/**
++ * A daemon thread that waits for the next file system to renew.
++ */
++@InterfaceAudience.Private
++public class DelegationTokenRenewer<T extends FileSystem & DelegationTokenRenewer.Renewable>
++    extends Thread {
++  /** The renewable interface used by the renewer. */
++  public interface Renewable {
++    /** @return the renew token. */
++    public Token<?> getRenewToken();
++
++    /** Set delegation token. */
++    public <T extends TokenIdentifier> void setDelegationToken(Token<T> token);
++  }
++
++  /**
++   * An action that will renew and replace the file system's delegation 
++   * tokens automatically.
++   */
++  private static class RenewAction<T extends FileSystem & Renewable>
++      implements Delayed {
++    /** when should the renew happen */
++    private long renewalTime;
++    /** a weak reference to the file system so that it can be garbage collected */
++    private final WeakReference<T> weakFs;
++
++    private RenewAction(final T fs) {
++      this.weakFs = new WeakReference<T>(fs);
++      updateRenewalTime();
++    }
++ 
++    /** Get the delay until this event should happen. */
++    @Override
++    public long getDelay(final TimeUnit unit) {
++      final long millisLeft = renewalTime - System.currentTimeMillis();
++      return unit.convert(millisLeft, TimeUnit.MILLISECONDS);
++    }
++
++    @Override
++    public int compareTo(final Delayed delayed) {
++      final RenewAction<?> that = (RenewAction<?>)delayed;
++      return this.renewalTime < that.renewalTime? -1
++          : this.renewalTime == that.renewalTime? 0: 1;
++    }
++
++    @Override
++    public int hashCode() {
++      return (int)renewalTime ^ (int)(renewalTime >>> 32);
++    }
++
++    @Override
++    public boolean equals(final Object that) {
++      if (that == null || !(that instanceof RenewAction)) {
++        return false;
++      }
++      return compareTo((Delayed)that) == 0;
++    }
++
++    /**
++     * Set a new time for the renewal.
++     * It can only be called when the action is not in the queue.
++     * @param newTime the new time
++     */
++    private void updateRenewalTime() {
++      renewalTime = RENEW_CYCLE + System.currentTimeMillis();
++    }
++
++    /**
++     * Renew or replace the delegation token for this file system.
++     * @return
++     * @throws IOException
++     */
++    private boolean renew() throws IOException, InterruptedException {
++      final T fs = weakFs.get();
++      final boolean b = fs != null;
++      if (b) {
++        synchronized(fs) {
++          try {
++            fs.getRenewToken().renew(fs.getConf());
++          } catch (IOException ie) {
++            try {
++              fs.setDelegationToken(fs.getDelegationTokens(null).get(0));
++            } catch (IOException ie2) {
++              throw new IOException("Can't renew or get new delegation token ", ie);
++            }
++          }
++        }
++      }
++      return b;
++    }
++
++    @Override
++    public String toString() {
++      Renewable fs = weakFs.get();
++      return fs == null? "evaporated token renew"
++          : "The token will be renewed in " + getDelay(TimeUnit.SECONDS)
++            + " secs, renewToken=" + fs.getRenewToken();
++    }
++  }
++
++  /** Wait for 95% of a day between renewals */
++  private static final int RENEW_CYCLE = 24 * 60 * 60 * 950;
++
++  private DelayQueue<RenewAction<T>> queue = new DelayQueue<RenewAction<T>>();
++
++  public DelegationTokenRenewer(final Class<T> clazz) {
++    super(clazz.getSimpleName() + "-" + DelegationTokenRenewer.class.getSimpleName());
++    setDaemon(true);
++  }
++
++  /** Add a renew action to the queue. */
++  public void addRenewAction(final T fs) {
++    queue.add(new RenewAction<T>(fs));
++  }
++
++  @Override
++  public void run() {
++    for(;;) {
++      RenewAction<T> action = null;
++      try {
++        action = queue.take();
++        if (action.renew()) {
++          action.updateRenewalTime();
++          queue.add(action);
++        }
++      } catch (InterruptedException ie) {
++        return;
++      } catch (Exception ie) {
++        T.LOG.warn("Failed to renew token, action=" + action, ie);
++      }
++    }
++  }
++}
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/HftpFileSystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/HftpFileSystem.java
+index 989fc12..cd6601b 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/HftpFileSystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/HftpFileSystem.java
+@@ -37,6 +37,7 @@ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.classification.InterfaceStability;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.ContentSummary;
++import org.apache.hadoop.fs.DelegationTokenRenewer;
+ import org.apache.hadoop.fs.FSDataInputStream;
+ import org.apache.hadoop.fs.FSDataOutputStream;
+ import org.apache.hadoop.fs.FileChecksum;
+@@ -46,7 +47,6 @@ import org.apache.hadoop.fs.MD5MD5CRC32FileChecksum;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.permission.FsPermission;
+ import org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenIdentifier;
+-import org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenRenewer;
+ import org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenSelector;
+ import org.apache.hadoop.hdfs.server.common.JspHelper;
+ import org.apache.hadoop.hdfs.tools.DelegationTokenFetcher;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/security/token/delegation/DelegationTokenRenewer.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/security/token/delegation/DelegationTokenRenewer.java
+deleted file mode 100644
+index 349d71b..0000000
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/security/token/delegation/DelegationTokenRenewer.java
++++ /dev/null
+@@ -1,164 +0,0 @@
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package org.apache.hadoop.hdfs.security.token.delegation;
+-
+-import java.io.IOException;
+-import java.lang.ref.WeakReference;
+-import java.util.concurrent.DelayQueue;
+-import java.util.concurrent.Delayed;
+-import java.util.concurrent.TimeUnit;
+-
+-import org.apache.hadoop.classification.InterfaceAudience;
+-import org.apache.hadoop.fs.FileSystem;
+-import org.apache.hadoop.security.token.Token;
+-import org.apache.hadoop.security.token.TokenIdentifier;
+-
+-/**
+- * A daemon thread that waits for the next file system to renew.
+- */
+-@InterfaceAudience.Private
+-public class DelegationTokenRenewer<T extends FileSystem & DelegationTokenRenewer.Renewable>
+-    extends Thread {
+-  /** The renewable interface used by the renewer. */
+-  public interface Renewable {
+-    /** @return the renew token. */
+-    public Token<?> getRenewToken();
+-
+-    /** Set delegation token. */
+-    public <T extends TokenIdentifier> void setDelegationToken(Token<T> token);
+-  }
+-
+-  /**
+-   * An action that will renew and replace the file system's delegation 
+-   * tokens automatically.
+-   */
+-  private static class RenewAction<T extends FileSystem & Renewable>
+-      implements Delayed {
+-    /** when should the renew happen */
+-    private long renewalTime;
+-    /** a weak reference to the file system so that it can be garbage collected */
+-    private final WeakReference<T> weakFs;
+-
+-    private RenewAction(final T fs) {
+-      this.weakFs = new WeakReference<T>(fs);
+-      updateRenewalTime();
+-    }
+- 
+-    /** Get the delay until this event should happen. */
+-    @Override
+-    public long getDelay(final TimeUnit unit) {
+-      final long millisLeft = renewalTime - System.currentTimeMillis();
+-      return unit.convert(millisLeft, TimeUnit.MILLISECONDS);
+-    }
+-
+-    @Override
+-    public int compareTo(final Delayed delayed) {
+-      final RenewAction<?> that = (RenewAction<?>)delayed;
+-      return this.renewalTime < that.renewalTime? -1
+-          : this.renewalTime == that.renewalTime? 0: 1;
+-    }
+-
+-    @Override
+-    public int hashCode() {
+-      return (int)renewalTime ^ (int)(renewalTime >>> 32);
+-    }
+-
+-    @Override
+-    public boolean equals(final Object that) {
+-      if (that == null || !(that instanceof RenewAction)) {
+-        return false;
+-      }
+-      return compareTo((Delayed)that) == 0;
+-    }
+-
+-    /**
+-     * Set a new time for the renewal.
+-     * It can only be called when the action is not in the queue.
+-     * @param newTime the new time
+-     */
+-    private void updateRenewalTime() {
+-      renewalTime = RENEW_CYCLE + System.currentTimeMillis();
+-    }
+-
+-    /**
+-     * Renew or replace the delegation token for this file system.
+-     * @return
+-     * @throws IOException
+-     */
+-    private boolean renew() throws IOException, InterruptedException {
+-      final T fs = weakFs.get();
+-      final boolean b = fs != null;
+-      if (b) {
+-        synchronized(fs) {
+-          try {
+-            fs.getRenewToken().renew(fs.getConf());
+-          } catch (IOException ie) {
+-            try {
+-              fs.setDelegationToken(fs.getDelegationTokens(null).get(0));
+-            } catch (IOException ie2) {
+-              throw new IOException("Can't renew or get new delegation token ", ie);
+-            }
+-          }
+-        }
+-      }
+-      return b;
+-    }
+-
+-    @Override
+-    public String toString() {
+-      Renewable fs = weakFs.get();
+-      return fs == null? "evaporated token renew"
+-          : "The token will be renewed in " + getDelay(TimeUnit.SECONDS)
+-            + " secs, renewToken=" + fs.getRenewToken();
+-    }
+-  }
+-
+-  /** Wait for 95% of a day between renewals */
+-  private static final int RENEW_CYCLE = 24 * 60 * 60 * 950;
+-
+-  private DelayQueue<RenewAction<T>> queue = new DelayQueue<RenewAction<T>>();
+-
+-  public DelegationTokenRenewer(final Class<T> clazz) {
+-    super(clazz.getSimpleName() + "-" + DelegationTokenRenewer.class.getSimpleName());
+-    setDaemon(true);
+-  }
+-
+-  /** Add a renew action to the queue. */
+-  public void addRenewAction(final T fs) {
+-    queue.add(new RenewAction<T>(fs));
+-  }
+-
+-  @Override
+-  public void run() {
+-    for(;;) {
+-      RenewAction<T> action = null;
+-      try {
+-        action = queue.take();
+-        if (action.renew()) {
+-          action.updateRenewalTime();
+-          queue.add(action);
+-        }
+-      } catch (InterruptedException ie) {
+-        return;
+-      } catch (Exception ie) {
+-        T.LOG.warn("Failed to renew token, action=" + action, ie);
+-      }
+-    }
+-  }
+-}
+\ No newline at end of file
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/web/WebHdfsFileSystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/web/WebHdfsFileSystem.java
+index 0b355cc..7dbaded 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/web/WebHdfsFileSystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/web/WebHdfsFileSystem.java
+@@ -39,6 +39,7 @@ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.BlockLocation;
+ import org.apache.hadoop.fs.ContentSummary;
++import org.apache.hadoop.fs.DelegationTokenRenewer;
+ import org.apache.hadoop.fs.FSDataInputStream;
+ import org.apache.hadoop.fs.FSDataOutputStream;
+ import org.apache.hadoop.fs.FileAlreadyExistsException;
+@@ -57,7 +58,6 @@ import org.apache.hadoop.hdfs.protocol.HdfsFileStatus;
+ import org.apache.hadoop.hdfs.protocol.NSQuotaExceededException;
+ import org.apache.hadoop.hdfs.protocol.UnresolvedPathException;
+ import org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenIdentifier;
+-import org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenRenewer;
+ import org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenSelector;
+ import org.apache.hadoop.hdfs.server.common.JspHelper;
+ import org.apache.hadoop.hdfs.server.namenode.SafeModeException;
+-- 
+1.7.0.4
+

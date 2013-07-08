@@ -1,0 +1,283 @@
+From f9879682766a0222a2a436f47e87c3b224b96773 Mon Sep 17 00:00:00 2001
+From: Daryn Sharp <daryn@apache.org>
+Date: Fri, 9 Nov 2012 00:53:11 +0000
+Subject: [PATCH 0973/1357] HDFS-3990.  NN's health report has severe performance problems (daryn)
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1407333 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 5f5cbc2d11fbc0b56d287a3912e63d78f2724497)
+
+Conflicts:
+
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeManager.java
+---
+ .../apache/hadoop/hdfs/protocol/DatanodeID.java    |   16 ++++-
+ .../server/blockmanagement/DatanodeManager.java    |   78 ++++++++++----------
+ .../hadoop/hdfs/TestDatanodeRegistration.java      |   63 +++++++++++++++-
+ 3 files changed, 115 insertions(+), 42 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/DatanodeID.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/DatanodeID.java
+index ad1567f..2a0578c 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/DatanodeID.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/DatanodeID.java
+@@ -38,7 +38,8 @@ public class DatanodeID implements Comparable<DatanodeID> {
+   public static final DatanodeID[] EMPTY_ARRAY = {};
+ 
+   private String ipAddr;     // IP address
+-  private String hostName;   // hostname
++  private String hostName;   // hostname claimed by datanode
++  private String peerHostName; // hostname from the actual connection
+   private String storageID;  // unique per cluster storageID
+   private int xferPort;      // data streaming port
+   private int infoPort;      // info server port
+@@ -51,6 +52,7 @@ public class DatanodeID implements Comparable<DatanodeID> {
+         from.getXferPort(),
+         from.getInfoPort(),
+         from.getIpcPort());
++    this.peerHostName = from.getPeerHostName();
+   }
+   
+   /**
+@@ -76,6 +78,10 @@ public class DatanodeID implements Comparable<DatanodeID> {
+     this.ipAddr = ipAddr;
+   }
+ 
++  public void setPeerHostName(String peerHostName) {
++    this.peerHostName = peerHostName;
++  }
++  
+   public void setStorageID(String storageID) {
+     this.storageID = storageID;
+   }
+@@ -95,6 +101,13 @@ public class DatanodeID implements Comparable<DatanodeID> {
+   }
+ 
+   /**
++   * @return hostname from the actual connection 
++   */
++  public String getPeerHostName() {
++    return peerHostName;
++  }
++  
++  /**
+    * @return IP:xferPort string
+    */
+   public String getXferAddr() {
+@@ -202,6 +215,7 @@ public class DatanodeID implements Comparable<DatanodeID> {
+   public void updateRegInfo(DatanodeID nodeReg) {
+     ipAddr = nodeReg.getIpAddr();
+     hostName = nodeReg.getHostName();
++    peerHostName = nodeReg.getPeerHostName();
+     xferPort = nodeReg.getXferPort();
+     infoPort = nodeReg.getInfoPort();
+     ipcPort = nodeReg.getIpcPort();
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeManager.java
+index b4193df..f75bd06 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeManager.java
+@@ -466,28 +466,16 @@ public class DatanodeManager {
+   private static boolean checkInList(final DatanodeID node,
+       final Set<String> hostsList,
+       final boolean isExcludeList) {
+-    final InetAddress iaddr;
+-
+-    try {
+-      iaddr = InetAddress.getByName(node.getIpAddr());
+-    } catch (UnknownHostException e) {
+-      LOG.warn("Unknown IP: " + node.getIpAddr(), e);
+-      return isExcludeList;
+-    }
+-
+     // if include list is empty, host is in include list
+     if ( (!isExcludeList) && (hostsList.isEmpty()) ){
+       return true;
+     }
+-    return // compare ipaddress(:port)
+-    (hostsList.contains(iaddr.getHostAddress().toString()))
+-        || (hostsList.contains(iaddr.getHostAddress().toString() + ":"
+-            + node.getXferPort()))
+-        // compare hostname(:port)
+-        || (hostsList.contains(iaddr.getHostName()))
+-        || (hostsList.contains(iaddr.getHostName() + ":" + node.getXferPort()))
+-        || ((node instanceof DatanodeInfo) && hostsList
+-            .contains(((DatanodeInfo) node).getHostName()));
++    for (String name : getNodeNamesForHostFiltering(node)) {
++      if (hostsList.contains(name)) {
++        return true;
++      }
++    }
++    return false;
+   }
+ 
+   /**
+@@ -570,16 +558,20 @@ public class DatanodeManager {
+    */
+   public void registerDatanode(DatanodeRegistration nodeReg)
+       throws DisallowedDatanodeException {
+-    String dnAddress = Server.getRemoteAddress();
+-    if (dnAddress == null) {
+-      // Mostly called inside an RPC.
+-      // But if not, use address passed by the data-node.
+-      dnAddress = nodeReg.getIpAddr();
++    InetAddress dnAddress = Server.getRemoteIp();
++    if (dnAddress != null) {
++      // Mostly called inside an RPC, update ip and peer hostname
++      String hostname = dnAddress.getHostName();
++      String ip = dnAddress.getHostAddress();
++      if (hostname.equals(ip)) {
++        LOG.warn("Unresolved datanode registration from " + ip);
++        throw new DisallowedDatanodeException(nodeReg);
++      }
++      // update node registration with the ip and hostname from rpc request
++      nodeReg.setIpAddr(ip);
++      nodeReg.setPeerHostName(hostname);
+     }
+ 
+-    // Update the IP to the address of the RPC request that is
+-    // registering this datanode.
+-    nodeReg.setIpAddr(dnAddress);
+     nodeReg.setExportedKeys(blockManager.getBlockKeys());
+ 
+     // Checks if the node is not on the hosts list.  If it is not, then
+@@ -904,19 +896,8 @@ public class DatanodeManager {
+         if ( (isDead && listDeadNodes) || (!isDead && listLiveNodes) ) {
+           nodes.add(dn);
+         }
+-        // Remove any nodes we know about from the map
+-        try {
+-          InetAddress inet = InetAddress.getByName(dn.getIpAddr());
+-          // compare hostname(:port)
+-          mustList.remove(inet.getHostName());
+-          mustList.remove(inet.getHostName()+":"+dn.getXferPort());
+-          // compare ipaddress(:port)
+-          mustList.remove(inet.getHostAddress().toString());
+-          mustList.remove(inet.getHostAddress().toString()+ ":" +dn.getXferPort());
+-        } catch (UnknownHostException e) {
+-          mustList.remove(dn.getName());
+-          mustList.remove(dn.getIpAddr());
+-          LOG.warn(e);
++        for (String name : getNodeNamesForHostFiltering(dn)) {
++          mustList.remove(name);
+         }
+       }
+     }
+@@ -937,6 +918,25 @@ public class DatanodeManager {
+     return nodes;
+   }
+   
++  private static List<String> getNodeNamesForHostFiltering(DatanodeID node) {
++    String ip = node.getIpAddr();
++    String regHostName = node.getHostName();
++    int xferPort = node.getXferPort();
++    
++    List<String> names = new ArrayList<String>(); 
++    names.add(ip);
++    names.add(ip + ":" + xferPort);
++    names.add(regHostName);
++    names.add(regHostName + ":" + xferPort);
++
++    String peerHostName = node.getPeerHostName();
++    if (peerHostName != null) {
++      names.add(peerHostName);
++      names.add(peerHostName + ":" + xferPort);
++    }
++    return names;
++  }
++  
+   private void setDatanodeDead(DatanodeDescriptor node) throws IOException {
+     node.setLastUpdate(0);
+   }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDatanodeRegistration.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDatanodeRegistration.java
+index 6ebe0a4..2e7879e 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDatanodeRegistration.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDatanodeRegistration.java
+@@ -17,12 +17,12 @@
+  */
+ package org.apache.hadoop.hdfs;
+ 
+-import static org.junit.Assert.assertEquals;
+-import static org.junit.Assert.fail;
++import static org.junit.Assert.*;
+ import static org.mockito.Mockito.doReturn;
+ import static org.mockito.Mockito.mock;
+ 
+ import java.net.InetSocketAddress;
++import java.security.Permission;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+@@ -30,6 +30,7 @@ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
+ import org.apache.hadoop.hdfs.protocol.HdfsConstants;
+ import org.apache.hadoop.hdfs.protocol.HdfsConstants.DatanodeReportType;
++import org.apache.hadoop.hdfs.server.blockmanagement.DatanodeManager;
+ import org.apache.hadoop.hdfs.server.common.IncorrectVersionException;
+ import org.apache.hadoop.hdfs.server.common.StorageInfo;
+ import org.apache.hadoop.hdfs.server.protocol.DatanodeRegistration;
+@@ -46,6 +47,64 @@ public class TestDatanodeRegistration {
+   
+   public static final Log LOG = LogFactory.getLog(TestDatanodeRegistration.class);
+ 
++  private static class MonitorDNS extends SecurityManager {
++    int lookups = 0;
++    @Override
++    public void checkPermission(Permission perm) {}    
++    @Override
++    public void checkConnect(String host, int port) {
++      if (port == -1) {
++        lookups++;
++      }
++    }
++  }
++
++  /**
++   * Ensure the datanode manager does not do host lookup after registration,
++   * especially for node reports.
++   * @throws Exception
++   */
++  @Test
++  public void testDNSLookups() throws Exception {
++    MonitorDNS sm = new MonitorDNS();
++    System.setSecurityManager(sm);
++    
++    MiniDFSCluster cluster = null;
++    try {
++      HdfsConfiguration conf = new HdfsConfiguration();
++      cluster = new MiniDFSCluster.Builder(conf).numDataNodes(8).build();
++      cluster.waitActive();
++      
++      int initialLookups = sm.lookups;
++      assertTrue("dns security manager is active", initialLookups != 0);
++      
++      DatanodeManager dm =
++          cluster.getNamesystem().getBlockManager().getDatanodeManager();
++      
++      // make sure no lookups occur
++      dm.refreshNodes(conf);
++      assertEquals(initialLookups, sm.lookups);
++
++      dm.refreshNodes(conf);
++      assertEquals(initialLookups, sm.lookups);
++      
++      // ensure none of the reports trigger lookups
++      dm.getDatanodeListForReport(DatanodeReportType.ALL);
++      assertEquals(initialLookups, sm.lookups);
++      
++      dm.getDatanodeListForReport(DatanodeReportType.LIVE);
++      assertEquals(initialLookups, sm.lookups);
++      
++      dm.getDatanodeListForReport(DatanodeReportType.DEAD);
++      assertEquals(initialLookups, sm.lookups);
++    } finally {
++      if (cluster != null) {
++        cluster.shutdown();
++      }
++      System.setSecurityManager(null);
++    }
++  }
++  
+   /**
+    * Regression test for HDFS-894 ensures that, when datanodes
+    * are restarted, the new IPC port is registered with the
+-- 
+1.7.0.4
+

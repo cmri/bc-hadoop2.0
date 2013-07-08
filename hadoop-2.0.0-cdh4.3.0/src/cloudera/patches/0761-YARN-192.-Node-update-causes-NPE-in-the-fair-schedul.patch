@@ -1,0 +1,127 @@
+From 626d6e244a9f1f3a1919e5c719f5810e5e62ef4a Mon Sep 17 00:00:00 2001
+From: Thomas White <tomwhite@apache.org>
+Date: Thu, 3 Jan 2013 12:29:13 +0000
+Subject: [PATCH 0761/1357] YARN-192. Node update causes NPE in the fair scheduler. Contributed by Sandy Ryza
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1428314 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 12bf8447ccb4be21e9634dde97407c45edcdbb28)
+---
+ .../scheduler/fair/AppSchedulable.java             |   11 +++-
+ .../scheduler/fair/TestFairScheduler.java          |   56 ++++++++++++++++++++
+ 2 files changed, 65 insertions(+), 2 deletions(-)
+
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/AppSchedulable.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/AppSchedulable.java
+index 5614d36..5b65686 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/AppSchedulable.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/AppSchedulable.java
+@@ -18,6 +18,9 @@
+ 
+ package org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair;
+ 
++import java.util.Arrays;
++import java.util.Collection;
++
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.classification.InterfaceAudience.Private;
+@@ -293,12 +296,16 @@ public class AppSchedulable extends Schedulable {
+     } else {
+       // If this app is over quota, don't schedule anything
+       if (!(getRunnable())) { return Resources.none(); }
+-
+     }
++
++    Collection<Priority> prioritiesToTry = (reserved) ? 
++        Arrays.asList(node.getReservedContainer().getReservedPriority()) : 
++        app.getPriorities();
++    
+     // For each priority, see if we can schedule a node local, rack local
+     // or off-switch request. Rack of off-switch requests may be delayed
+     // (not scheduled) in order to promote better locality.
+-    for (Priority priority : app.getPriorities()) {
++    for (Priority priority : prioritiesToTry) {
+       app.addSchedulingOpportunity(priority);
+       NodeType allowedLocality = app.getAllowedLocalityLevel(priority,
+           scheduler.getNumClusterNodes(), scheduler.getNodeLocalityThreshold(),
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
+index 1ca96a1..dfe2af4 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
+@@ -26,6 +26,7 @@ import java.io.FileWriter;
+ import java.io.IOException;
+ import java.io.PrintWriter;
+ import java.util.ArrayList;
++import java.util.Arrays;
+ import java.util.Collection;
+ import java.util.LinkedList;
+ import java.util.List;
+@@ -55,6 +56,7 @@ import org.apache.hadoop.yarn.server.resourcemanager.recovery.Store;
+ import org.apache.hadoop.yarn.server.resourcemanager.recovery.StoreFactory;
+ import org.apache.hadoop.yarn.server.resourcemanager.resource.Resources;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptState;
++import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainer;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNode;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.ResourceScheduler;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.event.AppAddedSchedulerEvent;
+@@ -1189,4 +1191,58 @@ public class TestFairScheduler {
+     // Request should be fulfilled
+     assertEquals(2, scheduler.applications.get(attId1).getLiveContainers().size());
+   }
++  
++  @Test
++  public void testReservationWhileMultiplePriorities() {
++    // Add a node
++    RMNode node1 = MockNodes.newNodeInfo(1, Resources.createResource(1024));
++    NodeAddedSchedulerEvent nodeEvent1 = new NodeAddedSchedulerEvent(node1);
++    scheduler.handle(nodeEvent1);
++
++    ApplicationAttemptId attId = createSchedulingRequest(1024, "queue1",
++        "user1", 1, 2);
++    scheduler.update();
++    NodeUpdateSchedulerEvent updateEvent = new NodeUpdateSchedulerEvent(node1,
++      new ArrayList<ContainerStatus>(), new ArrayList<ContainerStatus>());
++    scheduler.handle(updateEvent);
++    
++    FSSchedulerApp app = scheduler.applications.get(attId);
++    assertEquals(1, app.getLiveContainers().size());
++    
++    ContainerId containerId = scheduler.applications.get(attId)
++        .getLiveContainers().iterator().next().getContainerId();
++
++    // Cause reservation to be created
++    createSchedulingRequestExistingApplication(1024, 2, attId);
++    scheduler.update();
++    scheduler.handle(updateEvent);
++
++    assertEquals(1, app.getLiveContainers().size());
++    
++    // Create request at higher priority
++    createSchedulingRequestExistingApplication(1024, 1, attId);
++    scheduler.update();
++    scheduler.handle(updateEvent);
++    
++    assertEquals(1, app.getLiveContainers().size());
++    // Reserved container should still be at lower priority
++    for (RMContainer container : app.getReservedContainers()) {
++      assertEquals(2, container.getReservedPriority().getPriority());
++    }
++    
++    // Complete container
++    scheduler.allocate(attId, new ArrayList<ResourceRequest>(),
++        Arrays.asList(containerId));
++    
++    // Schedule at opening
++    scheduler.update();
++    scheduler.handle(updateEvent);
++    
++    // Reserved container (at lower priority) should be run
++    Collection<RMContainer> liveContainers = app.getLiveContainers();
++    assertEquals(1, liveContainers.size());
++    for (RMContainer liveContainer : liveContainers) {
++      Assert.assertEquals(2, liveContainer.getContainer().getPriority().getPriority());
++    }
++  }
+ }
+-- 
+1.7.0.4
+

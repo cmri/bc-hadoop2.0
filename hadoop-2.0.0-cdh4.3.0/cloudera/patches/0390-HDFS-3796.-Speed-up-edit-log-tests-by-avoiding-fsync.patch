@@ -1,0 +1,169 @@
+From 9184efee703a05ba1def2d02aca8db244ed06df6 Mon Sep 17 00:00:00 2001
+From: Todd Lipcon <todd@cloudera.com>
+Date: Wed, 15 Aug 2012 17:42:16 -0700
+Subject: [PATCH 0390/1357] HDFS-3796. Speed up edit log tests by avoiding fsync(). Contributed by Todd Lipcon.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/branch-2@1373558 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit d3e5f101b731add6f460ed43633b849223fbcc91)
+
+Conflicts:
+
+	hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+(cherry picked from commit 572dc7f46f8dabf7a58bd0a6f920903bbefb2ea0)
+---
+ .../server/namenode/EditLogFileOutputStream.java   |   17 ++++++++++++++++-
+ .../hadoop/hdfs/server/namenode/TestEditLog.java   |    5 +++++
+ .../namenode/TestEditLogFileOutputStream.java      |    6 ++++++
+ .../server/namenode/TestFileJournalManager.java    |    6 ++++++
+ .../hdfs/server/namenode/TestNameNodeRecovery.java |    1 +
+ .../server/namenode/TestSecurityTokenEditLog.java  |    6 ++++++
+ .../namenode/ha/TestEditLogsDuringFailover.java    |    7 +++++++
+ 7 files changed, 47 insertions(+), 1 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogFileOutputStream.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogFileOutputStream.java
+index 08a560c..ee8afe2 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogFileOutputStream.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogFileOutputStream.java
+@@ -49,6 +49,8 @@ public class EditLogFileOutputStream extends EditLogOutputStream {
+   private EditsDoubleBuffer doubleBuf;
+   static ByteBuffer fill = ByteBuffer.allocateDirect(PREALLOCATION_LENGTH);
+ 
++  private static boolean shouldSkipFsyncForTests = false;
++
+   static {
+     fill.position(0);
+     for (int i = 0; i < fill.capacity(); i++) {
+@@ -184,7 +186,9 @@ public class EditLogFileOutputStream extends EditLogOutputStream {
+       return;
+     }
+     doubleBuf.flushTo(fp);
+-    fc.force(false); // metadata updates not needed
++    if (!shouldSkipFsyncForTests) {
++      fc.force(false); // metadata updates not needed
++    }
+     fc.position(fc.position() - 1); // skip back the end-of-file marker
+     preallocate(); // preallocate file if necessary
+   }
+@@ -242,4 +246,15 @@ public class EditLogFileOutputStream extends EditLogOutputStream {
+   public FileChannel getFileChannelForTesting() {
+     return fc;
+   }
++  
++  /**
++   * For the purposes of unit tests, we don't need to actually
++   * write durably to disk. So, we can skip the fsync() calls
++   * for a speed improvement.
++   * @param skip true if fsync should <em>not</em> be called
++   */
++  @VisibleForTesting
++  public static void setShouldSkipFsyncForTesting(boolean skip) {
++    shouldSkipFsyncForTests = skip;
++  }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestEditLog.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestEditLog.java
+index efbf09a..58f3f8b 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestEditLog.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestEditLog.java
+@@ -118,6 +118,11 @@ public class TestEditLog {
+         "a4ff 0000 0000 0000 0000 0000 0000 0000"
+     ).replace(" ",""));
+ 
++  static {
++    // No need to fsync for the purposes of tests. This makes
++    // the tests run much faster.
++    EditLogFileOutputStream.setShouldSkipFsyncForTesting(true);
++  }
+   
+   static final byte TRAILER_BYTE = FSEditLogOpCodes.OP_INVALID.getOpCode();
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestEditLogFileOutputStream.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestEditLogFileOutputStream.java
+index 9afa408..c61046b 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestEditLogFileOutputStream.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestEditLogFileOutputStream.java
+@@ -45,6 +45,12 @@ public class TestEditLogFileOutputStream {
+     new File(System.getProperty("test.build.data","/tmp"),
+              "editLogStream.dat");
+ 
++  static {
++    // No need to fsync for the purposes of tests. This makes
++    // the tests run much faster.
++    EditLogFileOutputStream.setShouldSkipFsyncForTesting(true);
++  }
++
+   @Before
+   public void deleteEditsFile() {
+     TEST_EDITS.delete();
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFileJournalManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFileJournalManager.java
+index cd1756c..bb52ebc 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFileJournalManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFileJournalManager.java
+@@ -52,6 +52,12 @@ import com.google.common.collect.TreeMultiset;
+ public class TestFileJournalManager {
+   static final Log LOG = LogFactory.getLog(TestFileJournalManager.class);
+ 
++  static {
++    // No need to fsync for the purposes of tests. This makes
++    // the tests run much faster.
++    EditLogFileOutputStream.setShouldSkipFsyncForTesting(true);
++  }
++
+   /**
+    * Find out how many transactions we can read from a
+    * FileJournalManager, starting at a given transaction ID.
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestNameNodeRecovery.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestNameNodeRecovery.java
+index 0df7041..742e84f 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestNameNodeRecovery.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestNameNodeRecovery.java
+@@ -57,6 +57,7 @@ public class TestNameNodeRecovery {
+ 
+   static {
+     recoverStartOpt.setForce(MetaRecoveryContext.FORCE_ALL);
++    EditLogFileOutputStream.setShouldSkipFsyncForTesting(true);
+   }
+ 
+   static void runEditLogTest(EditLogTestSetup elts) throws IOException {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestSecurityTokenEditLog.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestSecurityTokenEditLog.java
+index e3056e9..dd679d1 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestSecurityTokenEditLog.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestSecurityTokenEditLog.java
+@@ -49,6 +49,12 @@ public class TestSecurityTokenEditLog {
+   static final int NUM_THREADS = 100;
+   static final int opsPerTrans = 3;
+ 
++  static {
++    // No need to fsync for the purposes of tests. This makes
++    // the tests run much faster.
++    EditLogFileOutputStream.setShouldSkipFsyncForTesting(true);
++  }
++
+   //
+   // an object that does a bunch of transactions
+   //
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestEditLogsDuringFailover.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestEditLogsDuringFailover.java
+index dd5c1ba..5e18381 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestEditLogsDuringFailover.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestEditLogsDuringFailover.java
+@@ -34,6 +34,7 @@ import org.apache.hadoop.fs.permission.FsPermission;
+ import org.apache.hadoop.hdfs.HAUtil;
+ import org.apache.hadoop.hdfs.MiniDFSCluster;
+ import org.apache.hadoop.hdfs.MiniDFSNNTopology;
++import org.apache.hadoop.hdfs.server.namenode.EditLogFileOutputStream;
+ import org.apache.hadoop.hdfs.server.namenode.FSImageTestUtil;
+ import org.apache.hadoop.hdfs.server.namenode.NNStorage;
+ import org.apache.hadoop.hdfs.server.namenode.NameNodeAdapter;
+@@ -52,6 +53,12 @@ public class TestEditLogsDuringFailover {
+   private static final Log LOG =
+     LogFactory.getLog(TestEditLogsDuringFailover.class);
+   private static final int NUM_DIRS_IN_LOG = 5;
++
++  static {
++    // No need to fsync for the purposes of tests. This makes
++    // the tests run much faster.
++    EditLogFileOutputStream.setShouldSkipFsyncForTesting(true);
++  }
+   
+   @Test
+   public void testStartup() throws Exception {
+-- 
+1.7.0.4
+

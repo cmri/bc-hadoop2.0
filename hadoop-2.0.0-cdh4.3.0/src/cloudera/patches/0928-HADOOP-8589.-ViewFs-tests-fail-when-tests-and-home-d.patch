@@ -1,0 +1,463 @@
+From 123ac7f2a69bbf03f7dae1802c543cd82c8d2b3e Mon Sep 17 00:00:00 2001
+From: David S. Wang <dsw@cloudera.com>
+Date: Thu, 14 Feb 2013 11:03:03 -0800
+Subject: [PATCH 0928/1357] HADOOP-8589. ViewFs tests fail when tests and home dirs are nested. Contributed by Sanjay Radia
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/branch-2@1433601 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit d93602975649ab79bc675bd3f8c002f244d6469e)
+---
+ .../org/apache/hadoop/fs/DelegateToFileSystem.java |    5 +
+ .../hadoop/fs/viewfs/ChRootedFileSystem.java       |    6 --
+ .../apache/hadoop/fs/viewfs/ViewFileSystem.java    |    5 +-
+ .../java/org/apache/hadoop/fs/viewfs/ViewFs.java   |    5 +-
+ .../org/apache/hadoop/fs/FileSystemTestHelper.java |   13 +++-
+ .../hadoop/fs/viewfs/TestChRootedFileSystem.java   |    4 +-
+ .../apache/hadoop/fs/viewfs/TestChRootedFs.java    |    4 +-
+ .../fs/viewfs/TestFcMainOperationsLocalFs.java     |   43 +---------
+ .../hadoop/fs/viewfs/ViewFileSystemTestSetup.java  |   75 +++++++++++++----
+ .../apache/hadoop/fs/viewfs/ViewFsTestSetup.java   |   88 ++++++++++++++-----
+ 10 files changed, 151 insertions(+), 97 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/DelegateToFileSystem.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/DelegateToFileSystem.java
+index 9628471..1293448 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/DelegateToFileSystem.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/DelegateToFileSystem.java
+@@ -125,6 +125,11 @@ public abstract class DelegateToFileSystem extends AbstractFileSystem {
+   public FsServerDefaults getServerDefaults() throws IOException {
+     return fsImpl.getServerDefaults();
+   }
++  
++  @Override
++  public Path getHomeDirectory() {
++    return fsImpl.getHomeDirectory();
++  }
+ 
+   @Override
+   public int getUriDefaultPort() {
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ChRootedFileSystem.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ChRootedFileSystem.java
+index 11ac8e4..3a5ca9a 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ChRootedFileSystem.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ChRootedFileSystem.java
+@@ -155,12 +155,6 @@ class ChRootedFileSystem extends FilterFileSystem {
+     return makeQualified(
+         new Path(chRootPathPartString + f.toUri().toString()));
+   }
+-  
+-  @Override
+-  public Path getHomeDirectory() {
+-    return  new Path("/user/"+System.getProperty("user.name")).makeQualified(
+-          getUri(), null);
+-  }
+ 
+   @Override
+   public Path getWorkingDirectory() {
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFileSystem.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFileSystem.java
+index 39e9ceb..67d4804 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFileSystem.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFileSystem.java
+@@ -257,8 +257,9 @@ public class ViewFileSystem extends FileSystem {
+       if (base == null) {
+         base = "/user";
+       }
+-      homeDir = 
+-        this.makeQualified(new Path(base + "/" + ugi.getShortUserName()));
++      homeDir = (base.equals("/") ? 
++          this.makeQualified(new Path(base + ugi.getShortUserName())):
++          this.makeQualified(new Path(base + "/" + ugi.getShortUserName())));
+     }
+     return homeDir;
+   }
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFs.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFs.java
+index c1939e3..4a1cd25 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFs.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/viewfs/ViewFs.java
+@@ -248,8 +248,9 @@ public class ViewFs extends AbstractFileSystem {
+       if (base == null) {
+         base = "/user";
+       }
+-      homeDir = 
+-        this.makeQualified(new Path(base + "/" + ugi.getShortUserName()));
++      homeDir = (base.equals("/") ? 
++        this.makeQualified(new Path(base + ugi.getShortUserName())):
++        this.makeQualified(new Path(base + "/" + ugi.getShortUserName())));
+     }
+     return homeDir;
+   }
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/FileSystemTestHelper.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/FileSystemTestHelper.java
+index 38e07d8..2c058ca 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/FileSystemTestHelper.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/FileSystemTestHelper.java
+@@ -61,19 +61,28 @@ public final class FileSystemTestHelper {
+     return data;
+   }
+   
++  
++  /*
++   * get testRootPath qualified for fSys
++   */
+   public static Path getTestRootPath(FileSystem fSys) {
+     return fSys.makeQualified(new Path(TEST_ROOT_DIR));
+   }
+ 
++  /*
++   * get testRootPath + pathString qualified for fSys
++   */
+   public static Path getTestRootPath(FileSystem fSys, String pathString) {
+     return fSys.makeQualified(new Path(TEST_ROOT_DIR, pathString));
+   }
+   
+   
+   // the getAbsolutexxx method is needed because the root test dir
+-  // can be messed up by changing the working dir.
++  // can be messed up by changing the working dir since the TEST_ROOT_PATH
++  // is often relative to the working directory of process
++  // running the unit tests.
+ 
+-  public static String getAbsoluteTestRootDir(FileSystem fSys)
++  static String getAbsoluteTestRootDir(FileSystem fSys)
+       throws IOException {
+     // NOTE: can't cache because of different filesystems!
+     //if (absTestRootDir == null) 
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/viewfs/TestChRootedFileSystem.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/viewfs/TestChRootedFileSystem.java
+index 3ac0206..bbc0de3 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/viewfs/TestChRootedFileSystem.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/viewfs/TestChRootedFileSystem.java
+@@ -73,10 +73,10 @@ public class TestChRootedFileSystem {
+     URI uri = fSys.getUri();
+     Assert.assertEquals(chrootedTo.toUri(), uri);
+     Assert.assertEquals(fSys.makeQualified(
+-        new Path("/user/" + System.getProperty("user.name"))),
++        new Path(System.getProperty("user.home"))),
+         fSys.getWorkingDirectory());
+     Assert.assertEquals(fSys.makeQualified(
+-        new Path("/user/" + System.getProperty("user.name"))),
++        new Path(System.getProperty("user.home"))),
+         fSys.getHomeDirectory());
+     /*
+      * ChRootedFs as its uri like file:///chrootRoot.
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/viewfs/TestChRootedFs.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/viewfs/TestChRootedFs.java
+index c47308f..c522801 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/viewfs/TestChRootedFs.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/viewfs/TestChRootedFs.java
+@@ -70,10 +70,10 @@ public class TestChRootedFs {
+     URI uri = fc.getDefaultFileSystem().getUri();
+     Assert.assertEquals(chrootedTo.toUri(), uri);
+     Assert.assertEquals(fc.makeQualified(
+-        new Path("/user/" + System.getProperty("user.name"))),
++        new Path(System.getProperty("user.home"))),
+         fc.getWorkingDirectory());
+     Assert.assertEquals(fc.makeQualified(
+-        new Path("/user/" + System.getProperty("user.name"))),
++        new Path(System.getProperty("user.home"))),
+         fc.getHomeDirectory());
+     /*
+      * ChRootedFs as its uri like file:///chrootRoot.
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/viewfs/TestFcMainOperationsLocalFs.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/viewfs/TestFcMainOperationsLocalFs.java
+index 235a182..adde906 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/viewfs/TestFcMainOperationsLocalFs.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/viewfs/TestFcMainOperationsLocalFs.java
+@@ -38,50 +38,13 @@ public class TestFcMainOperationsLocalFs  extends
+ 
+   @Before
+   public void setUp() throws Exception {
+-    /**
+-     * create the test root on local_fs - the  mount table will point here
+-     */
+-    fclocal = FileContext.getLocalFSFileContext();
+-    targetOfTests = FileContextTestHelper.getTestRootPath(fclocal);
+-    // In case previous test was killed before cleanup
+-    fclocal.delete(targetOfTests, true);
+-    
+-    fclocal.mkdir(targetOfTests, FileContext.DEFAULT_PERM, true);
+-
+-    
+-    
+-    
+-    // We create mount table so that the test root on the viewFs points to 
+-    // to the test root on the target.
+-    // DOing this helps verify the FileStatus.path.
+-    //
+-    // The test root by default when running eclipse 
+-    // is a test dir below the working directory. 
+-    // (see FileContextTestHelper).
+-    // Since viewFs has no built-in wd, its wd is /user/<username>.
+-    // If this test launched via ant (build.xml) the test root is absolute path
+-    
+-    String srcTestRoot;
+-    if (FileContextTestHelper.TEST_ROOT_DIR.startsWith("/")) {
+-      srcTestRoot = FileContextTestHelper.TEST_ROOT_DIR;
+-    } else {
+-      srcTestRoot = "/user/"  + System.getProperty("user.name") + "/" +
+-      FileContextTestHelper.TEST_ROOT_DIR;
+-    }
+-
+-    Configuration conf = new Configuration();
+-    ConfigUtil.addLink(conf, srcTestRoot,
+-        targetOfTests.toUri());
+-    
+-    fc = FileContext.getFileContext(FsConstants.VIEWFS_URI, conf);
+-    //System.out.println("SRCOfTests = "+ FileContextTestHelper.getTestRootPath(fc, "test"));
+-    //System.out.println("TargetOfTests = "+ targetOfTests.toUri());
++    fc = ViewFsTestSetup.setupForViewFsLocalFs();
+     super.setUp();
+   }
+   
+   @After
+   public void tearDown() throws Exception {
+     super.tearDown();
+-    fclocal.delete(targetOfTests, true);
++    ViewFsTestSetup.tearDownForViewFsLocalFs();
+   }
+-}
+\ No newline at end of file
++}
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/viewfs/ViewFileSystemTestSetup.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/viewfs/ViewFileSystemTestSetup.java
+index 525f28b..446b38e 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/viewfs/ViewFileSystemTestSetup.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/viewfs/ViewFileSystemTestSetup.java
+@@ -17,7 +17,10 @@
+  */
+ package org.apache.hadoop.fs.viewfs;
+ 
++import java.net.URI;
++
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileContext;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.FileSystemTestHelper;
+ import org.apache.hadoop.fs.FsConstants;
+@@ -32,14 +35,19 @@ import org.mortbay.log.Log;
+  * 
+  * If tests launched via ant (build.xml) the test root is absolute path
+  * If tests launched via eclipse, the test root is 
+- * is a test dir below the working directory. (see FileSystemTestHelper).
+- * Since viewFs has no built-in wd, its wd is /user/<username> 
+- *          (or /User/<username> on mac)
++ * is a test dir below the working directory. (see FileContextTestHelper)
++ * 
++ * We set a viewFileSystems with 3 mount points: 
++ * 1) /<firstComponent>" of testdir  pointing to same in  target fs
++ * 2)   /<firstComponent>" of home  pointing to same in  target fs 
++ * 3)  /<firstComponent>" of wd  pointing to same in  target fs
++ * (note in many cases the link may be the same - viewFileSytem handles this)
+  * 
+- * We set a viewFileSystems with mount point for 
+- * /<firstComponent>" pointing to the target fs's  testdir 
++ * We also set the view file system's wd to point to the wd. 
+  */
+ public class ViewFileSystemTestSetup {
++  
++  static public String ViewFSTestDir = "/testDir";
+ 
+   /**
+    * 
+@@ -56,24 +64,26 @@ public class ViewFileSystemTestSetup {
+     fsTarget.delete(targetOfTests, true);
+     fsTarget.mkdirs(targetOfTests);
+ 
+-    // Setup a link from viewfs to targetfs for the first component of
+-    // path of testdir.
++
++    // Set up viewfs link for test dir as described above
+     String testDir = FileSystemTestHelper.getTestRootPath(fsTarget).toUri()
+         .getPath();
+-    int indexOf2ndSlash = testDir.indexOf('/', 1);
+-    String testDirFirstComponent = testDir.substring(0, indexOf2ndSlash);
+-    ConfigUtil.addLink(conf, testDirFirstComponent, fsTarget.makeQualified(
+-        new Path(testDirFirstComponent)).toUri());
++    linkUpFirstComponents(conf, testDir, fsTarget, "test dir");
++    
++    
++    // Set up viewfs link for home dir as described above
++    setUpHomeDir(conf, fsTarget);
++    
++    
++    // the test path may be relative to working dir - we need to make that work:
++    // Set up viewfs link for wd as described above
++    String wdDir = fsTarget.getWorkingDirectory().toUri().getPath();
++    linkUpFirstComponents(conf, wdDir, fsTarget, "working dir");
+ 
+-    // viewFs://home => fsTarget://home
+-    String homeDirRoot = fsTarget.getHomeDirectory()
+-        .getParent().toUri().getPath();
+-    ConfigUtil.addLink(conf, homeDirRoot,
+-        fsTarget.makeQualified(new Path(homeDirRoot)).toUri());
+-    ConfigUtil.setHomeDirConf(conf, homeDirRoot);
+-    Log.info("Home dir base " + homeDirRoot);
+ 
+     FileSystem fsView = FileSystem.get(FsConstants.VIEWFS_URI, conf);
++    fsView.setWorkingDirectory(new Path(wdDir)); // in case testdir relative to wd.
++    Log.info("Working dir is: " + fsView.getWorkingDirectory());
+     return fsView;
+   }
+ 
+@@ -91,4 +101,33 @@ public class ViewFileSystemTestSetup {
+     conf.set("fs.viewfs.impl", ViewFileSystem.class.getName());
+     return conf; 
+   }
++  
++  static void setUpHomeDir(Configuration conf, FileSystem fsTarget) {
++    String homeDir = fsTarget.getHomeDirectory().toUri().getPath();
++    int indexOf2ndSlash = homeDir.indexOf('/', 1);
++    if (indexOf2ndSlash >0) {
++      linkUpFirstComponents(conf, homeDir, fsTarget, "home dir");
++    } else { // home dir is at root. Just link the home dir itse
++      URI linkTarget = fsTarget.makeQualified(new Path(homeDir)).toUri();
++      ConfigUtil.addLink(conf, homeDir, linkTarget);
++      Log.info("Added link for home dir " + homeDir + "->" + linkTarget);
++    }
++    // Now set the root of the home dir for viewfs
++    String homeDirRoot = fsTarget.getHomeDirectory().getParent().toUri().getPath();
++    ConfigUtil.setHomeDirConf(conf, homeDirRoot);
++    Log.info("Home dir base for viewfs" + homeDirRoot);  
++  }
++  
++  /*
++   * Set up link in config for first component of path to the same
++   * in the target file system.
++   */
++  static void linkUpFirstComponents(Configuration conf, String path, FileSystem fsTarget, String info) {
++    int indexOf2ndSlash = path.indexOf('/', 1);
++    String firstComponent = path.substring(0, indexOf2ndSlash);
++    URI linkTarget = fsTarget.makeQualified(new Path(firstComponent)).toUri();
++    ConfigUtil.addLink(conf, firstComponent, linkTarget);
++    Log.info("Added link for " + info + " " 
++        + firstComponent + "->" + linkTarget);    
++  }
+ }
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/viewfs/ViewFsTestSetup.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/viewfs/ViewFsTestSetup.java
+index 4ab9115..ac63217 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/viewfs/ViewFsTestSetup.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/viewfs/ViewFsTestSetup.java
+@@ -17,12 +17,15 @@
+  */
+ package org.apache.hadoop.fs.viewfs;
+ 
++import java.net.URI;
++
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileContext;
+ import org.apache.hadoop.fs.FileContextTestHelper;
+ import org.apache.hadoop.fs.FsConstants;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.viewfs.ConfigUtil;
++import org.mortbay.log.Log;
+ 
+ 
+ /**
+@@ -31,13 +34,20 @@ import org.apache.hadoop.fs.viewfs.ConfigUtil;
+  * 
+  * If tests launched via ant (build.xml) the test root is absolute path
+  * If tests launched via eclipse, the test root is 
+- * is a test dir below the working directory. (see FileContextTestHelper).
+- * Since viewFs has no built-in wd, its wd is /user/<username>.
++ * is a test dir below the working directory. (see FileContextTestHelper)
++ * 
++ * We set a viewfs with 3 mount points: 
++ * 1) /<firstComponent>" of testdir  pointing to same in  target fs
++ * 2)   /<firstComponent>" of home  pointing to same in  target fs 
++ * 3)  /<firstComponent>" of wd  pointing to same in  target fs
++ * (note in many cases the link may be the same - viewfs handles this)
+  * 
+- * We set up fc to be the viewFs with mount point for 
+- * /<firstComponent>" pointing to the local file system's testdir 
++ * We also set the view file system's wd to point to the wd.  
+  */
++
+ public class ViewFsTestSetup {
++  
++  static public String ViewFSTestDir = "/testDir";
+ 
+ 
+    /* 
+@@ -47,30 +57,31 @@ public class ViewFsTestSetup {
+     /**
+      * create the test root on local_fs - the  mount table will point here
+      */
+-    FileContext fclocal = FileContext.getLocalFSFileContext();
+-    Path targetOfTests = FileContextTestHelper.getTestRootPath(fclocal);
++    FileContext fsTarget = FileContext.getLocalFSFileContext();
++    Path targetOfTests = FileContextTestHelper.getTestRootPath(fsTarget);
+     // In case previous test was killed before cleanup
+-    fclocal.delete(targetOfTests, true);
++    fsTarget.delete(targetOfTests, true);
+     
+-    fclocal.mkdir(targetOfTests, FileContext.DEFAULT_PERM, true);
+-  
+-    String srcTestFirstDir;
+-    if (FileContextTestHelper.TEST_ROOT_DIR.startsWith("/")) {
+-      int indexOf2ndSlash = FileContextTestHelper.TEST_ROOT_DIR.indexOf('/', 1);
+-      srcTestFirstDir = FileContextTestHelper.TEST_ROOT_DIR.substring(0, indexOf2ndSlash);
+-    } else {
+-      srcTestFirstDir = "/user"; 
+-  
+-    }
+-    //System.out.println("srcTestFirstDir=" + srcTestFirstDir);
+-  
+-    // Set up the defaultMT in the config with mount point links
+-    // The test dir is root is below  /user/<userid>
++    fsTarget.mkdir(targetOfTests, FileContext.DEFAULT_PERM, true);
+     Configuration conf = new Configuration();
+-    ConfigUtil.addLink(conf, srcTestFirstDir,
+-        targetOfTests.toUri());
++    
++    // Set up viewfs link for test dir as described above
++    String testDir = FileContextTestHelper.getTestRootPath(fsTarget).toUri()
++        .getPath();
++    linkUpFirstComponents(conf, testDir, fsTarget, "test dir");
++    
++    
++    // Set up viewfs link for home dir as described above
++    setUpHomeDir(conf, fsTarget);
++      
++    // the test path may be relative to working dir - we need to make that work:
++    // Set up viewfs link for wd as described above
++    String wdDir = fsTarget.getWorkingDirectory().toUri().getPath();
++    linkUpFirstComponents(conf, wdDir, fsTarget, "working dir");
+     
+     FileContext fc = FileContext.getFileContext(FsConstants.VIEWFS_URI, conf);
++    fc.setWorkingDirectory(new Path(wdDir)); // in case testdir relative to wd.
++    Log.info("Working dir is: " + fc.getWorkingDirectory());
+     //System.out.println("SRCOfTests = "+ getTestRootPath(fc, "test"));
+     //System.out.println("TargetOfTests = "+ targetOfTests.toUri());
+     return fc;
+@@ -85,5 +96,36 @@ public class ViewFsTestSetup {
+     Path targetOfTests = FileContextTestHelper.getTestRootPath(fclocal);
+     fclocal.delete(targetOfTests, true);
+   }
++  
++  
++  static void setUpHomeDir(Configuration conf, FileContext fsTarget) {
++    String homeDir = fsTarget.getHomeDirectory().toUri().getPath();
++    int indexOf2ndSlash = homeDir.indexOf('/', 1);
++    if (indexOf2ndSlash >0) {
++      linkUpFirstComponents(conf, homeDir, fsTarget, "home dir");
++    } else { // home dir is at root. Just link the home dir itse
++      URI linkTarget = fsTarget.makeQualified(new Path(homeDir)).toUri();
++      ConfigUtil.addLink(conf, homeDir, linkTarget);
++      Log.info("Added link for home dir " + homeDir + "->" + linkTarget);
++    }
++    // Now set the root of the home dir for viewfs
++    String homeDirRoot = fsTarget.getHomeDirectory().getParent().toUri().getPath();
++    ConfigUtil.setHomeDirConf(conf, homeDirRoot);
++    Log.info("Home dir base for viewfs" + homeDirRoot);  
++  }
++  
++  /*
++   * Set up link in config for first component of path to the same
++   * in the target file system.
++   */
++  static void linkUpFirstComponents(Configuration conf, String path,
++      FileContext fsTarget, String info) {
++    int indexOf2ndSlash = path.indexOf('/', 1);
++    String firstComponent = path.substring(0, indexOf2ndSlash);
++    URI linkTarget = fsTarget.makeQualified(new Path(firstComponent)).toUri();
++    ConfigUtil.addLink(conf, firstComponent, linkTarget);
++    Log.info("Added link for " + info + " " 
++        + firstComponent + "->" + linkTarget);    
++  }
+ 
+ }
+-- 
+1.7.0.4
+

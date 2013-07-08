@@ -1,0 +1,392 @@
+From c52c9812a52d58d98ae35fbb98e87e0b49a79a40 Mon Sep 17 00:00:00 2001
+From: Matthew J. Foley <mattf@apache.org>
+Date: Sun, 19 Feb 2012 23:41:18 +0000
+Subject: [PATCH 1355/1357] MR1: MAPREDUCE-3824. Distributed caches are not removed properly. Contributed by Thomas Graves.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/branch-1@1291093 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 7673e6d191a6cf1bbd12a4402c28333cce602243)
+
+Conflicts:
+	src/test/org/apache/hadoop/filecache/TestTrackerDistributedCacheManager.java
+(cherry picked from commit d2cd046c85766f9ef3ad3488bdffcfce056068ee)
+(cherry picked from commit b23d60d08e0d34c984d4fb224921061c4b1d95d0)
+(cherry picked from commit 2724f3b40b58758fe6b6795120a13a19f37b96b7)
+(cherry picked from commit 77367205d49cd0d0816c0ff10dd7317eb0d64aef)
+---
+ .../filecache/TaskDistributedCacheManager.java     |    6 +-
+ .../filecache/TrackerDistributedCacheManager.java  |   40 ++++++--
+ .../org/apache/hadoop/mapred/JobLocalizer.java     |   11 ++-
+ .../hadoop/mapred/TaskUmbilicalProtocol.java       |    2 +-
+ .../TestTrackerDistributedCacheManager.java        |  101 +++++++++++++++++---
+ 5 files changed, 130 insertions(+), 30 deletions(-)
+
+diff --git a/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/filecache/TaskDistributedCacheManager.java b/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/filecache/TaskDistributedCacheManager.java
+index 9a2af8d..959832a 100644
+--- a/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/filecache/TaskDistributedCacheManager.java
++++ b/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/filecache/TaskDistributedCacheManager.java
+@@ -260,10 +260,10 @@ public class TaskDistributedCacheManager {
+   public void setSizes(long[] sizes) throws IOException {
+     int i = 0;
+     for (CacheFile c: cacheFiles) {
+-      if (!c.isPublic && c.type == CacheFile.FileType.ARCHIVE && 
+-    	  c.status != null) {
+-        distributedCacheManager.setSize(c.status, sizes[i++]);
++      if (!c.isPublic && c.status != null) {
++        distributedCacheManager.setSize(c.status, sizes[i]);
+       }
++      i++;
+     }
+   }
+ 
+diff --git a/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/filecache/TrackerDistributedCacheManager.java b/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/filecache/TrackerDistributedCacheManager.java
+index 1609118..fbd500b 100644
+--- a/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/filecache/TrackerDistributedCacheManager.java
++++ b/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/filecache/TrackerDistributedCacheManager.java
+@@ -34,6 +34,7 @@ import java.util.Map;
+ import java.util.Random;
+ import java.util.Set;
+ import java.util.TreeMap;
++import java.util.concurrent.atomic.AtomicInteger;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+@@ -580,7 +581,7 @@ public class TrackerDistributedCacheManager {
+     //
+     // This field should be accessed under global cachedArchives lock.
+     //
+-    private int refcount;    // number of instances using this cache
++    private AtomicInteger refcount;    // number of instances using this cache
+ 
+     //
+     // The following two fields should be accessed under
+@@ -611,7 +612,7 @@ public class TrackerDistributedCacheManager {
+                        String uniqueString, String user, String key) {
+       super();
+       this.localizedLoadPath = localLoadPath;
+-      this.refcount = 0;
++      this.refcount = new AtomicInteger();
+       this.localizedBaseDir = baseDir;
+       this.size = 0;
+       this.subDir = subDir;
+@@ -621,14 +622,16 @@ public class TrackerDistributedCacheManager {
+     }
+     
+     public synchronized void incRefCount() {
+-      refcount += 1;
++      refcount.incrementAndGet() ;
++      LOG.debug(localizedLoadPath + ": refcount=" + refcount.get());
+     }
+ 
+     public void decRefCount() {
+       synchronized (cachedArchives) {
+         synchronized (this) {
+-          refcount -= 1;
+-          if(refcount <= 0) {
++          refcount.decrementAndGet() ;
++          LOG.debug(localizedLoadPath + ": refcount=" + refcount.get());
++          if(refcount.get() <= 0) {
+             String key = this.key;
+             cachedArchives.remove(key);
+             cachedArchives.put(key, this);
+@@ -638,11 +641,12 @@ public class TrackerDistributedCacheManager {
+     }
+ 
+     public int getRefCount() {
+-      return refcount;
++      return refcount.get();
+     }
+ 
+     public synchronized boolean isUsed() {
+-      return refcount > 0;
++      LOG.debug(localizedLoadPath + ": refcount=" + refcount.get());
++      return refcount.get() > 0;
+     }
+ 
+     Path getBaseDir(){
+@@ -676,7 +680,8 @@ public class TrackerDistributedCacheManager {
+           localFs.delete(f.getValue().localizedLoadPath, true);
+           localFs.delete(f.getValue().localizedLoadPath, true);
+         } catch (IOException ie) {
+-          LOG.debug("Error cleaning up cache", ie);
++          LOG.debug("Error cleaning up cache (" + 
++              f.getValue().localizedLoadPath + ")", ie);
+         }
+       }
+       cachedArchives.clear();
+@@ -692,6 +697,10 @@ public class TrackerDistributedCacheManager {
+     return result;
+   }
+ 
++  /**
++   * Set the sizes for any archives, files, or directories in the private
++   * distributed cache.
++   */
+   public void setArchiveSizes(JobID jobId, long[] sizes) throws IOException {
+     TaskDistributedCacheManager mgr = jobArchives.get(jobId);
+     if (mgr != null) {
+@@ -1059,8 +1068,13 @@ public class TrackerDistributedCacheManager {
+       HashMap<Path, CacheDir> toBeCleanedBaseDir = 
+         new HashMap<Path, CacheDir>();
+       synchronized (properties) {
++        LOG.debug("checkAndCleanup: Allowed Cache Size test");
+         for (Map.Entry<Path, CacheDir> baseDir : properties.entrySet()) {
+           CacheDir baseDirCounts = baseDir.getValue();
++          LOG.debug(baseDir.getKey() + ": allowedCacheSize=" + allowedCacheSize +
++              ",baseDirCounts.size=" + baseDirCounts.size +
++              ",allowedCacheSubdirs=" + allowedCacheSubdirs + 
++              ",baseDirCounts.subdirs=" + baseDirCounts.subdirs);
+           if (allowedCacheSize < baseDirCounts.size ||
+               allowedCacheSubdirs < baseDirCounts.subdirs) {
+             CacheDir tcc = new CacheDir();
+@@ -1072,6 +1086,7 @@ public class TrackerDistributedCacheManager {
+       }
+       // try deleting cache Status with refcount of zero
+       synchronized (cachedArchives) {
++        LOG.debug("checkAndCleanup: Global Cache Size Check");
+         for(
+             Iterator<Map.Entry<String, CacheStatus>> it 
+             = cachedArchives.entrySet().iterator();
+@@ -1080,11 +1095,16 @@ public class TrackerDistributedCacheManager {
+           String cacheId = entry.getKey();
+           CacheStatus cacheStatus = cachedArchives.get(cacheId);
+           CacheDir leftToClean = toBeCleanedBaseDir.get(cacheStatus.getBaseDir());
++
+           if (leftToClean != null && (leftToClean.size > 0 || leftToClean.subdirs > 0)) {
+             synchronized (cacheStatus) {
+               // if reference count is zero mark the cache for deletion
+-              if (!cacheStatus.isUsed()) {
+-                leftToClean.size -= cacheStatus.size;
++              boolean isUsed = cacheStatus.isUsed();
++              long cacheSize = cacheStatus.size; 
++              LOG.debug(cacheStatus.getLocalizedUniqueDir() + ": isUsed=" + isUsed + 
++                  " size=" + cacheSize + " leftToClean.size=" + leftToClean.size);
++              if (!isUsed) {
++                leftToClean.size -= cacheSize;
+                 leftToClean.subdirs--;
+                 // delete this cache entry from the global list 
+                 // and mark the localized file for deletion
+diff --git a/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/JobLocalizer.java b/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/JobLocalizer.java
+index 5a7ea52..2072fd3 100644
+--- a/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/JobLocalizer.java
++++ b/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/JobLocalizer.java
+@@ -28,6 +28,7 @@ import java.util.Collections;
+ import java.util.List;
+ import java.security.PrivilegedExceptionAction;
+ 
++import org.apache.commons.lang.ArrayUtils;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ 
+@@ -348,21 +349,25 @@ public class JobLocalizer {
+    * @return the size of the archive objects
+    */
+   public static long[] downloadPrivateCache(Configuration conf) throws IOException {
+-    downloadPrivateCacheObjects(conf,
++    long[] fileSizes = downloadPrivateCacheObjects(conf,
+                                 DistributedCache.getCacheFiles(conf),
+                                 DistributedCache.getLocalCacheFiles(conf),
+                                 DistributedCache.getFileTimestamps(conf),
+                                 TrackerDistributedCacheManager.
+                                   getFileVisibilities(conf),
+                                 false);
+-    return 
+-      downloadPrivateCacheObjects(conf,
++
++    long[] archiveSizes = downloadPrivateCacheObjects(conf,
+                                   DistributedCache.getCacheArchives(conf),
+                                   DistributedCache.getLocalCacheArchives(conf),
+                                   DistributedCache.getArchiveTimestamps(conf),
+                                   TrackerDistributedCacheManager.
+                                     getArchiveVisibilities(conf),
+                                   true);
++
++    // The order here matters - it has to match order of cache files
++    // in TaskDistributedCacheManager.
++    return ArrayUtils.addAll(fileSizes, archiveSizes);
+   }
+ 
+   public void localizeJobFiles(JobID jobid, JobConf jConf,
+diff --git a/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/TaskUmbilicalProtocol.java b/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/TaskUmbilicalProtocol.java
+index 591defe..ad683ee 100644
+--- a/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/TaskUmbilicalProtocol.java
++++ b/hadoop-mapreduce1-project/src/mapred/org/apache/hadoop/mapred/TaskUmbilicalProtocol.java
+@@ -175,7 +175,7 @@ public interface TaskUmbilicalProtocol extends VersionedProtocol {
+ 
+   /**
+    * The job initializer needs to report the sizes of the archive
+-   * objects in the private distributed cache.
++   * objects and directories in the private distributed cache.
+    * @param jobId the job to update
+    * @param sizes the array of sizes that were computed
+    * @throws IOException
+diff --git a/hadoop-mapreduce1-project/src/test/org/apache/hadoop/filecache/TestTrackerDistributedCacheManager.java b/hadoop-mapreduce1-project/src/test/org/apache/hadoop/filecache/TestTrackerDistributedCacheManager.java
+index d8d7bbe..d7e8f0b 100644
+--- a/hadoop-mapreduce1-project/src/test/org/apache/hadoop/filecache/TestTrackerDistributedCacheManager.java
++++ b/hadoop-mapreduce1-project/src/test/org/apache/hadoop/filecache/TestTrackerDistributedCacheManager.java
+@@ -79,6 +79,10 @@ public class TestTrackerDistributedCacheManager extends TestCase {
+   protected Path firstCacheFilePublic;
+   protected Path secondCacheFile;
+   protected Path secondCacheFilePublic;
++  protected Path firstCacheDirPublic;
++  protected Path firstCacheDirPrivate;
++  protected Path firstCacheFileInDirPublic;
++  protected Path firstCacheFileInDirPrivate;
+   private FileSystem fs;
+ 
+   protected LocalDirAllocator localDirAllocator = 
+@@ -138,6 +142,15 @@ public class TestTrackerDistributedCacheManager extends TestCase {
+     createPublicTempFile(secondCacheFilePublic);
+     createPrivateTempFile(firstCacheFile);
+     createPrivateTempFile(secondCacheFile);
++
++    firstCacheDirPublic = new Path(TEST_ROOT_DIR, "firstcachedirPublic");
++    firstCacheDirPrivate = new Path(TEST_ROOT_DIR, "firstcachedirPrivate");
++    firstCacheFileInDirPublic = new Path(firstCacheDirPublic, "firstcacheFileinDirPublic.txt");
++    firstCacheFileInDirPrivate = new Path(firstCacheDirPrivate, "firstcacheFileinDirPrivate.txt");
++    createPublicTempDir(firstCacheDirPublic);
++    createPrivateTempDir(firstCacheDirPrivate);
++    createPublicTempFile(firstCacheFileInDirPublic);
++    createPrivateTempFile(firstCacheFileInDirPrivate);
+   }
+   
+   protected void refreshConf(Configuration conf) throws IOException {
+@@ -267,41 +280,78 @@ public class TestTrackerDistributedCacheManager extends TestCase {
+     TrackerDistributedCacheManager.determineTimestampsAndCacheVisibilities(conf1);
+ 
+     // Task localizing for first job
++    JobID jobId = new JobID("jt", 1);
+     TaskDistributedCacheManager handle = manager
+-        .newTaskDistributedCacheManager(new JobID("jt", 1), conf1);
++        .newTaskDistributedCacheManager(jobId, conf1);
+     handle.setupCache(conf1, TaskTracker.getPublicDistributedCacheDir(), 
+         TaskTracker.getPrivateDistributedCacheDir(userName));
+-    JobLocalizer.downloadPrivateCache(conf1);
++    long[] sizes = JobLocalizer.downloadPrivateCache(conf1);
++    if (sizes != null) {
++      manager.setArchiveSizes(jobId, sizes);
++    }
++    handle.release();
++    for (TaskDistributedCacheManager.CacheFile c : handle.getCacheFiles()) {
++      assertEquals(0, manager.getReferenceCount(c.getStatus()));
++      long filesize = FileUtil.getDU(new File(c.getStatus().localizedLoadPath.getParent().toString()));
++      assertTrue("filesize is not greater than 0", filesize > 0);
++      assertEquals(filesize, c.getStatus().size);
++    }
++
++    // Test specifying directories to go into distributed cache and make
++    // their sizes are calculated properly.
++    Job job2 = new Job(conf);
++    Configuration conf2 = job2.getConfiguration();
++    conf1.set("user.name", userName);
++    DistributedCache.addCacheFile(firstCacheDirPublic.toUri(), conf2);
++    DistributedCache.addCacheFile(firstCacheDirPrivate.toUri(), conf2);
+ 
++    TrackerDistributedCacheManager
++        .determineTimestampsAndCacheVisibilities(conf2);
++
++    // Task localizing for second job
++    JobID job2Id = new JobID("jt", 2);
++    handle = manager.newTaskDistributedCacheManager(job2Id, conf2);
++    handle.setupCache(conf2, TaskTracker.getPublicDistributedCacheDir(),
++        TaskTracker.getPrivateDistributedCacheDir(userName));
++    long[] sizes2 = JobLocalizer.downloadPrivateCache(conf2);
++    for (int j=0; j > sizes2.length; j++) {
++      LOG.info("size is: " + sizes2[j]);
++    }
++    if (sizes2 != null) {
++      manager.setArchiveSizes(job2Id, sizes2);
++    }
+     handle.release();
+     for (TaskDistributedCacheManager.CacheFile c : handle.getCacheFiles()) {
+       assertEquals(0, manager.getReferenceCount(c.getStatus()));
++      long filesize = FileUtil.getDU(new File(c.getStatus().localizedLoadPath.getParent().toString()));
++      assertTrue("filesize is not greater than 0", filesize > 0);
++      assertEquals(filesize, c.getStatus().size);
+     }
+     
+     Path thirdCacheFile = new Path(TEST_ROOT_DIR, "thirdcachefile");
+     createPrivateTempFile(thirdCacheFile);
+     
+     // Configures another job with three regular files.
+-    Job job2 = new Job(conf);
+-    Configuration conf2 = job2.getConfiguration();
+-    conf2.set("user.name", userName);
++    Job job3 = new Job(conf);
++    Configuration conf3 = job3.getConfiguration();
++    conf3.set("user.name", userName);
+     // add a file that would get failed to localize
+-    DistributedCache.addCacheFile(firstCacheFilePublic.toUri(), conf2);
++    DistributedCache.addCacheFile(firstCacheFilePublic.toUri(), conf3);
+     // add a file that is already localized by different job
+-    DistributedCache.addCacheFile(secondCacheFile.toUri(), conf2);
++    DistributedCache.addCacheFile(secondCacheFile.toUri(), conf3);
+     // add a file that is never localized
+-    DistributedCache.addCacheFile(thirdCacheFile.toUri(), conf2);
++    DistributedCache.addCacheFile(thirdCacheFile.toUri(), conf3);
+     
+-    TrackerDistributedCacheManager.determineTimestampsAndCacheVisibilities(conf2);
++    TrackerDistributedCacheManager.determineTimestampsAndCacheVisibilities(conf3);
+ 
+-    // Task localizing for second job
++    // Task localizing for third job
+     // localization for the "firstCacheFile" will fail.
+-    handle = manager.newTaskDistributedCacheManager(new JobID("jt", 2), conf2);
++    handle = manager.newTaskDistributedCacheManager(new JobID("jt", 3), conf3);
+     Throwable th = null;
+     try {
+-      handle.setupCache(conf2, TaskTracker.getPublicDistributedCacheDir(),
++      handle.setupCache(conf3, TaskTracker.getPublicDistributedCacheDir(),
+           TaskTracker.getPrivateDistributedCacheDir(userName));
+-      JobLocalizer.downloadPrivateCache(conf2);
++      JobLocalizer.downloadPrivateCache(conf3);
+     } catch (IOException e) {
+       th = e;
+       LOG.info("Exception during setup", e);
+@@ -951,6 +1001,13 @@ public class TestTrackerDistributedCacheManager extends TestCase {
+     createTempFile(p, TEST_FILE_SIZE);
+   }
+   
++  static void createTempDir(Path p) throws IOException {
++    File dir = new File(p.toString());
++    dir.mkdirs();
++    FileSystem.LOG.info("created temp directory: " + p);
++
++  }
++
+   static void createTempFile(Path p, int size) throws IOException {
+     File f = new File(p.toString());
+     FileOutputStream os = new FileOutputStream(f);
+@@ -973,12 +1030,30 @@ public class TestTrackerDistributedCacheManager extends TestCase {
+     FileUtil.chmod(p.toString(), "0770",true);
+   }
+ 
++  static void createPublicTempDir(Path p)
++  throws IOException, InterruptedException {
++    createTempDir(p);
++    FileUtil.chmod(p.toString(), "0777",true);
++  }
++
++  static void createPrivateTempDir(Path p)
++  throws IOException, InterruptedException {
++    createTempDir(p);
++    FileUtil.chmod(p.toString(), "0770",true);
++  }
++
+   @Override
+   protected void tearDown() throws IOException {
+     new File(firstCacheFile.toString()).delete();
+     new File(secondCacheFile.toString()).delete();
+     new File(firstCacheFilePublic.toString()).delete();
+     new File(secondCacheFilePublic.toString()).delete();
++
++    new File(firstCacheFileInDirPublic.toString()).delete();
++    new File(firstCacheFileInDirPrivate.toString()).delete();
++    new File(firstCacheDirPrivate.toString()).delete();
++    new File(firstCacheDirPublic.toString()).delete();
++
+     FileUtil.fullyDelete(new File(TEST_ROOT_DIR));
+   }
+ 
+-- 
+1.7.0.4
+

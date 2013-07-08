@@ -1,0 +1,764 @@
+From 4b73555224e1e42448935d59ce930634dfb115e6 Mon Sep 17 00:00:00 2001
+From: Tom White <tom@cloudera.com>
+Date: Tue, 4 Dec 2012 14:38:57 +0000
+Subject: [PATCH 1222/1357] MR1: CLOUDERA_BUILD. Implement software fencing for JT HA.
+
+Reason: New feature
+Ref: CDH-8916
+Author: Tom White
+---
+ ivy/libraries.properties                           |    2 +-
+ src/mapred/org/apache/hadoop/mapred/HAUtil.java    |    2 +
+ .../org/apache/hadoop/mapred/JobInProgress.java    |   14 ++-
+ .../org/apache/hadoop/mapred/JobTracker.java       |   15 ++-
+ .../hadoop/mapred/JobTrackerHAServiceProtocol.java |  149 ++++++++++++++++++--
+ .../org/apache/hadoop/mapred/MiniMRHACluster.java  |    2 +-
+ .../mapred/TestHAStateTransitionFailure.java       |   28 +++-
+ .../hadoop/mapred/TestHAStateTransitions.java      |  111 +++++++++++++--
+ .../mapred/TestJobTrackerHAServiceProtocol.java    |  100 +++++++++++++
+ 9 files changed, 390 insertions(+), 33 deletions(-)
+ create mode 100644 src/test/org/apache/hadoop/mapred/TestJobTrackerHAServiceProtocol.java
+
+diff --git a/ivy/libraries.properties b/ivy/libraries.properties
+index dd851b9..10b5fa5 100644
+--- a/ivy/libraries.properties
++++ b/ivy/libraries.properties
+@@ -82,4 +82,4 @@ wagon-http.version=1.0-beta-2
+ xmlenc.version=0.52
+ xerces.version=1.4.4
+ 
+-zookeeper.version=3.4.2
++zookeeper.version=3.4.4
+diff --git a/src/mapred/org/apache/hadoop/mapred/HAUtil.java b/src/mapred/org/apache/hadoop/mapred/HAUtil.java
+index 255de2c..cfa2847 100644
+--- a/src/mapred/org/apache/hadoop/mapred/HAUtil.java
++++ b/src/mapred/org/apache/hadoop/mapred/HAUtil.java
+@@ -56,6 +56,8 @@ public class HAUtil {
+   public static final boolean MR_HA_AUTO_FAILOVER_ENABLED_DEFAULT = false;
+   public static final String  MR_HA_ZKFC_PORT_KEY = "mapred.ha.zkfc.port";
+   public static final int     MR_HA_ZKFC_PORT_DEFAULT = 8019;
++  public static final String  MR_HA_ACTIVE_CHECK_MILLIS = "mapred.ha.jobtracker.active-check.millis";
++  public static final int     MR_HA_ACTIVE_CHECK_MILLIS_DEFAULT = 1000;
+ 
+   // Failover configuration
+   public static final String  MR_CLIENT_FAILOVER_PROXY_PROVIDER_KEY_PREFIX = "mapred.client.failover.proxy.provider";
+diff --git a/src/mapred/org/apache/hadoop/mapred/JobInProgress.java b/src/mapred/org/apache/hadoop/mapred/JobInProgress.java
+index b3897e1..ef5c16a 100644
+--- a/src/mapred/org/apache/hadoop/mapred/JobInProgress.java
++++ b/src/mapred/org/apache/hadoop/mapred/JobInProgress.java
+@@ -40,10 +40,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.fs.FSDataOutputStream;
+ import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.LocalFileSystem;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.io.IOUtils;
+ import org.apache.hadoop.io.Text;
+ import org.apache.hadoop.mapred.CleanupQueue.PathDeletionContext;
+ import org.apache.hadoop.mapred.AuditLogger;
+@@ -3471,7 +3473,17 @@ public class JobInProgress {
+     TokenCache.setJobToken(token, tokenStorage);
+         
+     // write TokenStorage out
+-    tokenStorage.writeTokenStorageFile(keysFile, jobtracker.getConf());
++    FileSystem fs = keysFile.getFileSystem(jobtracker.getConf());
++    FSDataOutputStream os = null;
++    try {
++      os = fs.createNonRecursive(keysFile, true,
++          jobtracker.getConf().getInt("io.file.buffer.size", 4096),
++          fs.getDefaultReplication(keysFile),
++          fs.getDefaultBlockSize(keysFile), null);
++      tokenStorage.writeTokenStorageToStream(os);
++    } finally {
++      IOUtils.closeStream(os);
++    }
+     LOG.info("jobToken generated and stored with users keys in "
+         + keysFile.toUri().getPath());
+   }
+diff --git a/src/mapred/org/apache/hadoop/mapred/JobTracker.java b/src/mapred/org/apache/hadoop/mapred/JobTracker.java
+index 1651d40..0edf566 100644
+--- a/src/mapred/org/apache/hadoop/mapred/JobTracker.java
++++ b/src/mapred/org/apache/hadoop/mapred/JobTracker.java
+@@ -39,6 +39,7 @@ import java.util.Collection;
+ import java.util.Collections;
+ import java.util.Comparator;
+ import java.util.Date;
++import java.util.EnumSet;
+ import java.util.HashMap;
+ import java.util.HashSet;
+ import java.util.Iterator;
+@@ -58,12 +59,15 @@ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.CommonConfigurationKeys;
++import org.apache.hadoop.fs.CreateFlag;
+ import org.apache.hadoop.fs.FSDataInputStream;
+ import org.apache.hadoop.fs.FSDataOutputStream;
++import org.apache.hadoop.fs.FileContext;
+ import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.LocalFileSystem;
+ import org.apache.hadoop.fs.LocalDirAllocator;
++import org.apache.hadoop.fs.Options;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.permission.FsPermission;
+ import org.apache.hadoop.mapred.JobSubmissionProtocol;
+@@ -1706,6 +1710,7 @@ public class JobTracker implements MRConstants, JTProtocols, JobTrackerMXBean {
+   static final String SUBDIR = "jobTracker";
+   final LocalFileSystem localFs;
+   FileSystem fs = null;
++  FileContext fc = null;
+   Path systemDir = null;
+   JobConf conf;
+ 
+@@ -1918,6 +1923,10 @@ public class JobTracker implements MRConstants, JTProtocols, JobTrackerMXBean {
+             public FileSystem run() throws IOException {
+               return FileSystem.get(conf);
+           }});
++          fc = getMROwner().doAs(new PrivilegedExceptionAction<FileContext>() {
++            public FileContext run() throws IOException {
++              return FileContext.getFileContext(conf);
++          }});
+         }
+         // clean up the system dir, which will only work if hdfs is out of 
+         // safe mode
+@@ -3531,8 +3540,10 @@ public class JobTracker implements MRConstants, JTProtocols, JobTrackerMXBean {
+         // Store the information in a file so that the job can be recovered
+         // later (if at all)
+         Path jobDir = getSystemDirectoryForJob(jobId);
+-        FileSystem.mkdirs(fs, jobDir, new FsPermission(SYSTEM_DIR_PERMISSION));
+-        FSDataOutputStream out = fs.create(getSystemFileForJob(jobId));
++        fc.mkdir(jobDir, new FsPermission(SYSTEM_DIR_PERMISSION), false);
++        FSDataOutputStream out = fc.create(getSystemFileForJob(jobId),
++            EnumSet.of(CreateFlag.CREATE),
++            Options.CreateOpts.donotCreateParent());
+         jobInfo.write(out);
+         out.close();
+       }
+diff --git a/src/mapred/org/apache/hadoop/mapred/JobTrackerHAServiceProtocol.java b/src/mapred/org/apache/hadoop/mapred/JobTrackerHAServiceProtocol.java
+index d53dad2..8641a8b 100644
+--- a/src/mapred/org/apache/hadoop/mapred/JobTrackerHAServiceProtocol.java
++++ b/src/mapred/org/apache/hadoop/mapred/JobTrackerHAServiceProtocol.java
+@@ -22,11 +22,22 @@ import static org.apache.hadoop.util.ExitUtil.terminate;
+ 
+ import com.google.common.annotations.VisibleForTesting;
+ 
++import java.io.FileNotFoundException;
+ import java.io.IOException;
++import java.security.PrivilegedExceptionAction;
++import java.util.Arrays;
++import java.util.concurrent.Executors;
++import java.util.concurrent.ScheduledExecutorService;
++import java.util.concurrent.TimeUnit;
+ 
++import com.google.common.base.Strings;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileStatus;
++import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.fs.PathFilter;
+ import org.apache.hadoop.ha.HAServiceProtocol;
+ import org.apache.hadoop.ha.HAServiceStatus;
+ import org.apache.hadoop.ha.HealthCheckFailedException;
+@@ -39,22 +50,40 @@ public class JobTrackerHAServiceProtocol implements HAServiceProtocol {
+   private static final Log LOG =
+     LogFactory.getLog(JobTrackerHAServiceProtocol.class);
+ 
++  public static final String SYSTEM_DIR_SEQUENCE_PREFIX = "seq-";
++  
+   private Configuration conf;
+   private HAServiceState haState = HAServiceState.STANDBY;
++  private FileSystem fs;
+   private JobTracker jt;
++  private Path currentSysDir;
+   private Thread jtThread;
++  private ScheduledExecutorService sysDirMonitorExecutor;
+   private JobTrackerHAHttpRedirector httpRedirector;
+   
+   public JobTrackerHAServiceProtocol(Configuration conf) {
+     this.conf = conf;
+     this.httpRedirector = new JobTrackerHAHttpRedirector(conf);
+     try {
++      this.fs = createFileSystem(conf);
+       httpRedirector.start();
+     } catch (Throwable t) {
+       doImmediateShutdown(t);
+     }
+   }
+   
++  private FileSystem createFileSystem(final Configuration conf)
++      throws IOException, InterruptedException {
++    ACLsManager aclsManager = new ACLsManager(conf, null, null);
++    return aclsManager.getMROwner().doAs(
++      new PrivilegedExceptionAction<FileSystem>() {
++        public FileSystem run() throws IOException {
++          return FileSystem.get(conf);
++        }
++      }
++    );
++  }
++  
+   public JobTracker getJobTracker() {
+     return jt;
+   }
+@@ -63,6 +92,31 @@ public class JobTrackerHAServiceProtocol implements HAServiceProtocol {
+   Thread getJobTrackerThread() {
+     return jtThread;
+   }
++  
++  private class JobTrackerRunner implements Runnable {
++    @Override
++    public void run() {
++      try {
++        jt.offerService();
++      } catch (Throwable t) {
++        doImmediateShutdown(t);
++      }
++    }
++  }
++  
++  private class SystemDirectoryMonitor implements Runnable {
++    @Override
++    public void run() {
++      try {
++        if (!fs.exists(currentSysDir)) {
++          throw new IOException("System directory " + currentSysDir +
++              " no longer exists. New active has started.");
++        }
++      } catch (Throwable t) {
++        doImmediateShutdown(t);
++      }
++    }
++  }
+ 
+   @Override
+   public HAServiceStatus getServiceStatus() throws AccessControlException,
+@@ -98,27 +152,92 @@ public class JobTrackerHAServiceProtocol implements HAServiceProtocol {
+     try {
+       httpRedirector.stop();
+       JobConf jtConf = new JobConf(conf);
++      currentSysDir = rollSystemDirectory(jtConf);
+       // Update the conf for the JT so the address is resolved
+       HAUtil.setJtRpcAddress(jtConf);
+       jt = JobTracker.startTracker(jtConf);
+     } catch (Throwable t) {
+       doImmediateShutdown(t);
+     }
+-    jtThread = new Thread(new Runnable() {
+-      @Override
+-      public void run() {
+-        try {
+-          jt.offerService();
+-        } catch (Throwable t) {
+-          doImmediateShutdown(t);
+-        }
+-      }
+-    });
++    jtThread = new Thread(new JobTrackerRunner(),
++        JobTrackerRunner.class.getSimpleName());
+     jtThread.start();
++    long activeCheckMillis = conf.getLong(HAUtil.MR_HA_ACTIVE_CHECK_MILLIS,
++        HAUtil.MR_HA_ACTIVE_CHECK_MILLIS_DEFAULT);
++    sysDirMonitorExecutor = Executors.newSingleThreadScheduledExecutor();
++    sysDirMonitorExecutor.scheduleWithFixedDelay(new SystemDirectoryMonitor(),
++        activeCheckMillis, activeCheckMillis, TimeUnit.MILLISECONDS);
+     haState = HAServiceState.ACTIVE;
+     LOG.info("Transitioned to active");
+   }
+ 
++  /**
++   * <p>
++   * The system directory (mapred.system.dir) is modified so that it has a
++   * strictly increasing sequence number as a part of its path. E.g. if it
++   * is set to "/mapred/system" then this method will change it to
++   * "/mapred/system/seq-&gt;counter&lt;", where the (zero-padded) counter is
++   * one more than the counter for the previous system directory, or zero if
++   * none existed before. In the first case the previous system directory is
++   * renamed to the new one. If the old active JT is still active, then
++   * it will notice that its system directory no longer exists and will
++   * shut itself down.
++   * </p>
++   * @param jtConf
++   * @return the new system directory
++   * @throws IOException
++   */
++  @VisibleForTesting
++  Path rollSystemDirectory(JobConf jtConf) throws IOException {
++    // Find most recent system dir
++    Path sysDir = new Path(jtConf.get("mapred.system.dir",
++        "/tmp/hadoop/mapred/system"));
++    Path qualifiedSysDir = fs.makeQualified(sysDir);
++    FileStatus[] subDirectories;
++    try {
++      subDirectories = fs.listStatus(sysDir, new PathFilter() {
++        @Override public boolean accept(Path p) {
++          return p.getName().matches(SYSTEM_DIR_SEQUENCE_PREFIX + "\\d+");
++        }
++      });
++    } catch (FileNotFoundException e) {
++      subDirectories = null;
++    }
++    // Find the next system directory by looking for the previous one and
++    // incrementing its sequence number
++    Path prevSysDir = null;
++    if (subDirectories != null && subDirectories.length > 0) {
++      Arrays.sort(subDirectories);
++      prevSysDir = subDirectories[subDirectories.length - 1].getPath();
++    }
++    Path nextSysDir;
++    if (prevSysDir == null) {
++      LOG.info("No previous system directory found");
++      nextSysDir = new Path(qualifiedSysDir, createSysDirName(0));
++    } else {
++      long previous = Long.parseLong(
++          prevSysDir.getName().substring(SYSTEM_DIR_SEQUENCE_PREFIX.length()));
++      nextSysDir = new Path(qualifiedSysDir, createSysDirName(previous + 1));
++      LOG.info("Renaming previous system directory " + prevSysDir +
++          " to " + nextSysDir);
++      if (!fs.rename(prevSysDir, nextSysDir)) {
++        throw new IOException("Could not rename " + prevSysDir +
++            " to " + nextSysDir);
++      }
++    }
++    // set nextSysDir on the configuration passed to the JT
++    jtConf.set("mapred.system.dir", nextSysDir.toString());
++    return nextSysDir;
++  }
++
++  /**
++   * @return zero padded counter with sys dir prefix
++   */
++  private String createSysDirName(long counter) {
++    String paddedCounter = Strings.padStart("" + counter, 12, '0');
++    return SYSTEM_DIR_SEQUENCE_PREFIX + paddedCounter;
++  }
++
+   @Override
+   public void transitionToStandby(StateChangeRequestInfo reqInfo)
+       throws ServiceFailedException, AccessControlException, IOException {
+@@ -128,6 +247,9 @@ public class JobTrackerHAServiceProtocol implements HAServiceProtocol {
+     }
+     LOG.info("Transitioning to standby");
+     try {
++      if (sysDirMonitorExecutor != null) {
++        sysDirMonitorExecutor.shutdownNow();
++      }
+       if (jt != null) {
+         jt.close();
+       }
+@@ -138,6 +260,8 @@ public class JobTrackerHAServiceProtocol implements HAServiceProtocol {
+     } catch (Throwable t) {
+       doImmediateShutdown(t);
+     }
++    sysDirMonitorExecutor = null;
++    currentSysDir = null;
+     jt = null;
+     jtThread = null;
+     haState = HAServiceState.STANDBY;
+@@ -147,6 +271,9 @@ public class JobTrackerHAServiceProtocol implements HAServiceProtocol {
+   public void stop() {
+     LOG.info("Stopping");
+     try {
++      if (sysDirMonitorExecutor != null) {
++        sysDirMonitorExecutor.shutdownNow();
++      }
+       if (jt != null) {
+         jt.close();
+       }
+@@ -157,6 +284,8 @@ public class JobTrackerHAServiceProtocol implements HAServiceProtocol {
+     } catch (Throwable t) {
+       doImmediateShutdown(t);
+     }
++    sysDirMonitorExecutor = null;
++    currentSysDir = null;
+     jt = null;
+     jtThread = null;
+     haState = HAServiceState.STANDBY;
+diff --git a/src/test/org/apache/hadoop/mapred/MiniMRHACluster.java b/src/test/org/apache/hadoop/mapred/MiniMRHACluster.java
+index 26f3c3d..23ef4fb 100644
+--- a/src/test/org/apache/hadoop/mapred/MiniMRHACluster.java
++++ b/src/test/org/apache/hadoop/mapred/MiniMRHACluster.java
+@@ -77,7 +77,7 @@ public class MiniMRHACluster {
+     return new JobTrackerHADaemon(c);
+   }
+   
+-  private static void configureLogicalName(Configuration conf) {
++  public static void configureLogicalName(Configuration conf) {
+     String logicalName = "logicaljt";
+     String jt1Id = "jt1";
+     String jt2Id = "jt2";
+diff --git a/src/test/org/apache/hadoop/mapred/TestHAStateTransitionFailure.java b/src/test/org/apache/hadoop/mapred/TestHAStateTransitionFailure.java
+index 19395ce..35b7f22 100644
+--- a/src/test/org/apache/hadoop/mapred/TestHAStateTransitionFailure.java
++++ b/src/test/org/apache/hadoop/mapred/TestHAStateTransitionFailure.java
+@@ -18,17 +18,25 @@
+ package org.apache.hadoop.mapred;
+ 
+ import static org.apache.hadoop.test.GenericTestUtils.assertExceptionContains;
++import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.fail;
+ 
+ import java.io.IOException;
+ 
++import java.security.PrivilegedExceptionAction;
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.examples.SleepJob;
++import org.apache.hadoop.ha.HAServiceProtocol;
++import org.apache.hadoop.ha.TestNodeFencer;
+ import org.apache.hadoop.hdfs.MiniDFSCluster;
+ import org.apache.hadoop.fs.CommonConfigurationKeys;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.permission.FsPermission;
+ import org.apache.hadoop.security.AccessControlException;
++import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.util.ExitUtil.ExitException;
+ import org.junit.Test;
+ 
+@@ -37,11 +45,13 @@ import org.junit.Test;
+  */
+ public class TestHAStateTransitionFailure {
+ 
++  private static final Log LOG =
++      LogFactory.getLog(TestHAStateTransitionFailure.class);
+   /**
+    * Ensure that a failure to fully transition to the active state causes a
+    * shutdown of the jobtracker.
+    */
+-  @Test
++  @Test(timeout=60000)
+   public void testFailureToTransitionCausesShutdown() throws Exception {
+     MiniDFSCluster dfs = null;
+     MiniMRHACluster cluster = null;
+@@ -52,21 +62,31 @@ public class TestHAStateTransitionFailure {
+           .format(true)
+           .checkExitOnShutdown(false)
+           .build();
+-      
++
+       // Set the owner of the system directory to a different user to the one
+       // that starts the JT. This will cause the JT to fail to transition to
+       // the active state.
+       FileSystem fs = dfs.getFileSystem();
+       Path mapredSysDir = new Path(conf.get("mapred.system.dir"));
+-      fs.mkdirs(mapredSysDir);
++      fs.mkdirs(mapredSysDir, new FsPermission((short) 700));
+       fs.setOwner(mapredSysDir, "mr", "mrgroup");
+ 
+       cluster = new MiniMRHACluster(fs.getConf());
++      final MiniMRHACluster finalCluster = cluster;
+       try {
++        UserGroupInformation ugi = UserGroupInformation.createUserForTesting(
++            "notmr", new String[]{"notmrgroup"});
++        ugi.doAs(new PrivilegedExceptionAction<Object>() {
++          @Override
++          public Object run() throws Exception {
++            finalCluster.getJobTrackerHaDaemon(0).makeActive();
++            return null;
++          }
++        });
+         cluster.getJobTrackerHaDaemon(0).makeActive();
+         fail("Transitioned to active but should not have been able to.");
+       } catch (ExitException ee) {
+-        assertExceptionContains("is not owned by", ee);
++        assertExceptionContains("Permission denied", ee);
+       }
+     } finally {
+       if (cluster != null) {
+diff --git a/src/test/org/apache/hadoop/mapred/TestHAStateTransitions.java b/src/test/org/apache/hadoop/mapred/TestHAStateTransitions.java
+index f192519..3a58857 100644
+--- a/src/test/org/apache/hadoop/mapred/TestHAStateTransitions.java
++++ b/src/test/org/apache/hadoop/mapred/TestHAStateTransitions.java
+@@ -18,24 +18,28 @@
+ 
+ package org.apache.hadoop.mapred;
+ 
+-import static org.junit.Assert.*;
+-
+ import java.io.File;
+-import java.io.IOException;
+-
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.examples.SleepJob;
+ import org.apache.hadoop.fs.FileSystem;
+-import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.FileUtil;
++import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.ha.FailoverController;
+ import org.apache.hadoop.ha.HAServiceProtocol.RequestSource;
+ import org.apache.hadoop.ha.HAServiceProtocol.StateChangeRequestInfo;
+ import org.apache.hadoop.ha.TestNodeFencer.AlwaysSucceedFencer;
+-import org.apache.hadoop.mapred.ConfiguredFailoverProxyProvider;
+ import org.apache.hadoop.mapreduce.Cluster.JobTrackerStatus;
+-import org.junit.*;
++import org.apache.hadoop.util.ExitUtil;
++import org.junit.After;
++import org.junit.Test;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertNull;
++import static org.junit.Assert.assertSame;
++import static org.junit.Assert.assertTrue;
++import static org.junit.Assert.fail;
+ 
+ /**
+  * Tests state transition from active->standby, and manual failover
+@@ -58,16 +62,20 @@ public class TestHAStateTransitions {
+   private JobTrackerHAServiceTarget target2;
+   private Configuration conf;
+   
+-  @Before
+-  public void setUp() throws Exception {
+-    conf = new Configuration();
++  private void startCluster() throws Exception {
++    startCluster(new Configuration());
++  }
++  private void startCluster(Configuration conf) throws Exception {
++    FileUtil.fullyDelete(new File("/tmp/tst"));
++    ExitUtil.disableSystemExit();
++    this.conf = conf;
+     conf.set(HAUtil.MR_HA_FENCING_METHODS_KEY,
+         AlwaysSucceedFencer.class.getName());
+     cluster = new MiniMRHACluster(conf);
+     cluster.getJobTrackerHaDaemon(0).makeActive();
+     cluster.startTaskTracker(0, 1);
+     cluster.waitActive();
+-    
++
+     jt1 = cluster.getJobTrackerHaDaemon(0);
+     jt2 = cluster.getJobTrackerHaDaemon(1);
+     target1 = new JobTrackerHAServiceTarget(jt1.getConf());
+@@ -76,12 +84,15 @@ public class TestHAStateTransitions {
+   
+   @After
+   public void tearDown() throws Exception {
+-    cluster.shutdown();
++    if (cluster != null) {
++      cluster.shutdown();
++    }
+   }
+   
+   @Test(timeout=60000)
+   public void testClientFailover() throws Exception {
+     LOG.info("Running testClientFailover");
++    startCluster();
+ 
+     // Test with client. c.f. HATestUtil.setFailoverConfigurations
+     JobClient jc = new JobClient(conf);
+@@ -106,11 +117,10 @@ public class TestHAStateTransitions {
+   @Test(timeout=60000)
+   public void testFailoverWhileRunningJob() throws Exception {
+     LOG.info("Running testFailoverWhileRunningJob");
++    startCluster();
+ 
+     // Inspired by TestRecoveryManager#testJobResubmission
+     
+-    FileUtil.fullyDelete(new File("/tmp/tst"));
+-    
+     // start a job on jt1
+     JobConf job1 = new JobConf(conf);
+     String signalFile = new Path(TEST_DIR, "signal").toString();
+@@ -146,6 +156,7 @@ public class TestHAStateTransitions {
+   @Test(timeout=60000)
+   public void testTransitionToCurrentStateIsANop() throws Exception {
+     LOG.info("Running testTransitionToCurrentStateIsANop");
++    startCluster();
+ 
+     JobTracker existingJt = jt1.getJobTracker();
+     jt1.getJobTrackerHAServiceProtocol().transitionToActive(REQ_INFO);
+@@ -155,5 +166,77 @@ public class TestHAStateTransitions {
+     // Transitioning to standby for a second time should not throw an exception
+     jt1.getJobTrackerHAServiceProtocol().transitionToStandby(REQ_INFO);
+   }
++  
++  @Test(timeout=60000)
++  public void testSecondActiveFencesFirst() throws Exception {
++    LOG.info("Running testSecondActiveFencesFirst");
++    startCluster();
++    
++    // start a job on jt1
++    JobConf job1 = new JobConf(conf);
++    String signalFile = new Path(TEST_DIR, "signal").toString();
++    UtilsForTests.configureWaitingJobConf(job1, new Path(TEST_DIR, "input"),
++        new Path(TEST_DIR, "output3"), 2, 0, "test-resubmission", signalFile,
++        signalFile);
++    JobClient jc = new JobClient(job1);
++    RunningJob rJob1 = jc.submitJob(job1);
++    while (rJob1.mapProgress() < 0.5f) {
++      LOG.info("Waiting for job " + rJob1.getID() + " to be 50% done: " +
++          rJob1.mapProgress());
++      UtilsForTests.waitFor(500);
++    }
++    LOG.info("Waiting for job " + rJob1.getID() + " to be 50% done: " +
++        rJob1.mapProgress());
++    
++    // force jt2 to become active, even though jt1 is still active
++    jt2.getJobTrackerHAServiceProtocol().transitionToActive(REQ_INFO);
++    
++    // wait for jt1 to detect that it is no longer active and fence itself
++    UtilsForTests.waitFor(1500);
++    
++    // jt1 should have exited
++    assertTrue(ExitUtil.terminateCalled());
++    jt1.getJobTracker().close(); // shut it down manually
++    
++    // allow job1 to complete
++    FileSystem fs = FileSystem.getLocal(conf);
++    fs.create(new Path(TEST_DIR, "signal"));
++    while (!rJob1.isComplete()) {
++      LOG.info("Waiting for job " + rJob1.getID() + " to be successful: " +
++          rJob1.mapProgress());
++      UtilsForTests.waitFor(500);
++    }
++    assertTrue("Job should be successful", rJob1.isSuccessful());
++  }
++
++  @Test(timeout=60000)
++  public void testSecondActiveCausesFirstToRejectJob() throws Exception {
++    Configuration conf = new Configuration();
++    conf.setLong(HAUtil.MR_HA_ACTIVE_CHECK_MILLIS, Long.MAX_VALUE); // never check
++    startCluster(conf);
++
++    // Ensure client always uses jt1
++    conf.set("mapred.job.tracker",
++        jt1.getJobTracker().getConf().get("mapred.job.tracker"));
++
++    // run a job on jt1
++    SleepJob job = new SleepJob();
++    job.setConf(conf);
++    assertEquals("Job succeeded", 0, job.run(1, 0, 1, 1, 1, 1));
+ 
++    // force jt2 to become active, even though jt1 is still active
++    jt2.getJobTrackerHAServiceProtocol().transitionToActive(REQ_INFO);
++
++    // try to submit a job to jt1, which should fail even though still running
++    job = new SleepJob();
++    job.setConf(conf);
++    JobConf jobConf = job.setupJobConf(1, 0, 1, 1, 1, 1);
++    JobClient jc = new JobClient(jobConf);
++    try {
++      jc.submitJob(jobConf);
++      fail("Job submission should fail");
++    } catch (Exception e) {
++      // expected
++    }
++  }
+ }
+diff --git a/src/test/org/apache/hadoop/mapred/TestJobTrackerHAServiceProtocol.java b/src/test/org/apache/hadoop/mapred/TestJobTrackerHAServiceProtocol.java
+new file mode 100644
+index 0000000..bc951f2
+--- /dev/null
++++ b/src/test/org/apache/hadoop/mapred/TestJobTrackerHAServiceProtocol.java
+@@ -0,0 +1,100 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.mapred;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.fs.Path;
++import org.junit.Before;
++import org.junit.Test;
++
++import java.io.IOException;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++
++public class TestJobTrackerHAServiceProtocol {
++
++  private static final Path TEST_DIR = new Path("/tmp/tst");
++
++  private Configuration conf;
++  private FileSystem fs;
++
++  @Before
++  public void setUp() throws Exception {
++    conf = new Configuration();
++    MiniMRHACluster.configureLogicalName(conf);
++    conf.set(HAUtil.MR_HA_JOBTRACKER_ID_KEY, "jt1");
++    conf.set("mapred.system.dir", TEST_DIR.toString());
++
++    fs = FileSystem.getLocal(conf);
++    fs.delete(TEST_DIR, true);
++  }
++
++  @Test
++  public void testRollSystemDirectory() throws IOException {
++    JobTrackerHAServiceProtocol jt = new JobTrackerHAServiceProtocol(conf);
++
++    JobConf jobConf = new JobConf(conf);
++    Path sysDir = jt.rollSystemDirectory(jobConf);
++    Path sysDir0 = sysDirPath("000000000000");
++    assertEquals(sysDir0.toString(), jobConf.get("mapred.system.dir"));
++    assertEquals(sysDir0.toString(), sysDir.toString());
++    assertFalse("New sys dir 0 should not exist", fs.exists(sysDir0));
++    fs.mkdirs(sysDir0);
++    assertTrue("New sys dir 0 should now exist", fs.exists(sysDir0));
++
++    jobConf = new JobConf(conf);
++    sysDir = jt.rollSystemDirectory(jobConf);
++    Path sysDir1 = sysDirPath("000000000001");
++    assertEquals(sysDir1.toString(), jobConf.get("mapred.system.dir"));
++    assertEquals(sysDir1.toString(), sysDir.toString());
++    assertFalse("Old sys dir 0 should no longer exist", fs.exists(sysDir0));
++    assertTrue("New sys dir 1 should exist", fs.exists(sysDir1));
++
++    // Create a new sys dir later in the sequence and check it is picked up
++    Path sysDir10 = sysDirPath("000000000010");
++    fs.mkdirs(sysDir10);
++    jobConf = new JobConf(conf);
++    sysDir = jt.rollSystemDirectory(jobConf);
++    Path sysDir11 = sysDirPath("000000000011");
++    assertEquals(sysDir11.toString(), jobConf.get("mapred.system.dir"));
++    assertEquals(sysDir11.toString(), sysDir.toString());
++    assertTrue("Old sys dir 1 should still exist", fs.exists(sysDir1));
++    assertFalse("Old sys dir 10 should no longer exist", fs.exists(sysDir10));
++    assertTrue("New sys dir 11 should exist", fs.exists(sysDir11));
++
++    // Create junk and check it is ignored
++    fs.mkdirs(new Path(TEST_DIR, "zzz"));
++    jobConf = new JobConf(conf);
++    sysDir = jt.rollSystemDirectory(jobConf);
++    Path sysDir12 = sysDirPath("000000000012");
++    assertEquals(sysDir12.toString(), jobConf.get("mapred.system.dir"));
++    assertEquals(sysDir12.toString(), sysDir.toString());
++    assertFalse("Old sys dir 11 should no longer exist", fs.exists(sysDir11));
++    assertTrue("New sys dir 12 should exist", fs.exists(sysDir12));
++  }
++
++  private Path sysDirPath(String counter) {
++    Path sysDir = new Path(TEST_DIR,
++        JobTrackerHAServiceProtocol.SYSTEM_DIR_SEQUENCE_PREFIX + counter);
++    sysDir = fs.makeQualified(sysDir);
++    return sysDir;
++  }
++}
+-- 
+1.7.0.4
+

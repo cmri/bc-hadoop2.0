@@ -1,0 +1,1014 @@
+From f75234c7a3ebe0ca17d39103e7f82a2dbce5d265 Mon Sep 17 00:00:00 2001
+From: Alejandro Abdelnur <tucu@cloudera.com>
+Date: Mon, 13 Aug 2012 15:12:37 -0700
+Subject: [PATCH 0322/1357] HADOOP-8581. add support for HTTPS to the web UIs. (tucu)
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/branch-2@1372642 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit bbb2d973e8409ad804dbfe7fbac3b0b630faa3d6)
+
+Conflicts:
+
+	hadoop-common-project/hadoop-common/CHANGES.txt
+---
+ .../hadoop/fs/CommonConfigurationKeysPublic.java   |    3 +
+ .../java/org/apache/hadoop/http/HttpConfig.java    |   48 ++++++++
+ .../java/org/apache/hadoop/http/HttpServer.java    |   32 ++++++-
+ .../org/apache/hadoop/security/SecurityUtil.java   |   19 +++-
+ .../src/main/resources/core-default.xml            |   10 ++
+ .../org/apache/hadoop/http/TestSSLHttpServer.java  |  114 ++++++++++++++++++++
+ .../hdfs/server/datanode/DatanodeJspHelper.java    |   23 ++--
+ .../hdfs/server/namenode/ClusterJspHelper.java     |    5 +-
+ .../hdfs/server/namenode/NamenodeJspHelper.java    |    6 +-
+ .../hdfs/server/namenode/TransferFsImage.java      |    5 +-
+ .../java/org/apache/hadoop/hdfs/tools/DFSck.java   |    3 +-
+ .../hadoop/mapreduce/v2/app/webapp/JobBlock.java   |    7 +-
+ .../hadoop/mapreduce/v2/app/webapp/NavBlock.java   |    4 +-
+ .../hadoop/mapreduce/v2/app/webapp/TaskPage.java   |    7 +-
+ .../mapreduce/v2/app/webapp/dao/AMAttemptInfo.java |    3 +-
+ .../org/apache/hadoop/mapreduce/util/HostUtil.java |    7 +-
+ .../hadoop/mapreduce/v2/hs/webapp/HsJobBlock.java  |   15 +--
+ .../hadoop/mapreduce/v2/hs/webapp/HsTaskPage.java  |    3 +-
+ .../hadoop/mapred/ClientServiceDelegate.java       |    3 +-
+ .../rmapp/attempt/RMAppAttemptImpl.java            |    7 +-
+ .../server/resourcemanager/webapp/AppBlock.java    |    4 +-
+ .../server/resourcemanager/webapp/NodesPage.java   |    4 +-
+ .../resourcemanager/webapp/dao/AppAttemptInfo.java |    4 +-
+ .../server/resourcemanager/webapp/dao/AppInfo.java |    9 +-
+ .../hadoop/yarn/server/webproxy/ProxyUriUtils.java |    5 +-
+ .../webproxy/amfilter/AmFilterInitializer.java     |    4 +-
+ 26 files changed, 293 insertions(+), 61 deletions(-)
+ create mode 100644 hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/http/HttpConfig.java
+ create mode 100644 hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/http/TestSSLHttpServer.java
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/CommonConfigurationKeysPublic.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/CommonConfigurationKeysPublic.java
+index b431664..dade590 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/CommonConfigurationKeysPublic.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/CommonConfigurationKeysPublic.java
+@@ -237,5 +237,8 @@ public class CommonConfigurationKeysPublic {
+   public static final String  HADOOP_SECURITY_AUTH_TO_LOCAL =
+     "hadoop.security.auth_to_local";
+ 
++  public static final String HADOOP_SSL_ENABLED_KEY = "hadoop.ssl.enabled";
++  public static final boolean HADOOP_SSL_ENABLED_DEFAULT = false;
++
+ }
+ 
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/http/HttpConfig.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/http/HttpConfig.java
+new file mode 100644
+index 0000000..4ee2f55
+--- /dev/null
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/http/HttpConfig.java
+@@ -0,0 +1,48 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.http;
++
++import org.apache.hadoop.classification.InterfaceAudience;
++import org.apache.hadoop.classification.InterfaceStability;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.CommonConfigurationKeysPublic;
++
++/**
++ * Singleton to get access to Http related configuration.
++ */
++@InterfaceAudience.Private
++@InterfaceStability.Unstable
++public class HttpConfig {
++  private static boolean sslEnabled;
++
++  static {
++    Configuration conf = new Configuration();
++    sslEnabled = conf.getBoolean(
++        CommonConfigurationKeysPublic.HADOOP_SSL_ENABLED_KEY,
++        CommonConfigurationKeysPublic.HADOOP_SSL_ENABLED_DEFAULT);
++  }
++
++  public static boolean isSecure() {
++    return sslEnabled;
++  }
++
++  public static String getSchemePrefix() {
++    return (isSecure()) ? "https://" : "http://";
++  }
++
++}
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/http/HttpServer.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/http/HttpServer.java
+index c75c4cb..c83eef1 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/http/HttpServer.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/http/HttpServer.java
+@@ -23,12 +23,14 @@ import java.io.PrintWriter;
+ import java.net.BindException;
+ import java.net.InetSocketAddress;
+ import java.net.URL;
++import java.security.GeneralSecurityException;
+ import java.util.ArrayList;
+ import java.util.Enumeration;
+ import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
+ 
++import javax.net.ssl.SSLServerSocketFactory;
+ import javax.servlet.Filter;
+ import javax.servlet.FilterChain;
+ import javax.servlet.FilterConfig;
+@@ -55,6 +57,7 @@ import org.apache.hadoop.security.SecurityUtil;
+ import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.security.authentication.server.AuthenticationFilter;
+ import org.apache.hadoop.security.authorize.AccessControlList;
++import org.apache.hadoop.security.ssl.SSLFactory;
+ import org.apache.hadoop.util.ReflectionUtils;
+ import org.mortbay.io.Buffer;
+ import org.mortbay.jetty.Connector;
+@@ -104,6 +107,7 @@ public class HttpServer implements FilterContainer {
+ 
+   private AccessControlList adminsAcl;
+ 
++  private SSLFactory sslFactory;
+   protected final Server webServer;
+   protected final Connector listener;
+   protected final WebAppContext webAppContext;
+@@ -207,7 +211,23 @@ public class HttpServer implements FilterContainer {
+     
+     if(connector == null) {
+       listenerStartedExternally = false;
+-      listener = createBaseListener(conf);
++      if (HttpConfig.isSecure()) {
++        sslFactory = new SSLFactory(SSLFactory.Mode.SERVER, conf);
++        try {
++          sslFactory.init();
++        } catch (GeneralSecurityException ex) {
++          throw new IOException(ex);
++        }
++        SslSocketConnector sslListener = new SslSocketConnector() {
++          @Override
++          protected SSLServerSocketFactory createFactory() throws Exception {
++            return sslFactory.createSSLServerSocketFactory();
++          }
++        };
++        listener = sslListener;
++      } else {
++        listener = createBaseListener(conf);
++      }
+       listener.setHost(bindAddress);
+       listener.setPort(port);
+     } else {
+@@ -709,6 +729,16 @@ public class HttpServer implements FilterContainer {
+     }
+ 
+     try {
++      if (sslFactory != null) {
++          sslFactory.destroy();
++      }
++    } catch (Exception e) {
++      LOG.error("Error while destroying the SSLFactory"
++          + webAppContext.getDisplayName(), e);
++      exception = addMultiException(exception, e);
++    }
++
++    try {
+       // clear & stop webAppContext attributes to avoid memory leaks.
+       webAppContext.clearAttributes();
+       webAppContext.stop();
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/SecurityUtil.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/SecurityUtil.java
+index 8189cfd..2f65892 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/SecurityUtil.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/SecurityUtil.java
+@@ -40,10 +40,12 @@ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.classification.InterfaceStability;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.CommonConfigurationKeys;
++import org.apache.hadoop.http.HttpConfig;
+ import org.apache.hadoop.io.Text;
+ import org.apache.hadoop.net.NetUtils;
+ import org.apache.hadoop.security.authentication.client.AuthenticatedURL;
+ import org.apache.hadoop.security.authentication.client.AuthenticationException;
++import org.apache.hadoop.security.ssl.SSLFactory;
+ import org.apache.hadoop.security.token.Token;
+ import org.apache.hadoop.security.token.TokenInfo;
+ 
+@@ -65,12 +67,23 @@ public class SecurityUtil {
+   static boolean useIpForTokenService;
+   @VisibleForTesting
+   static HostResolver hostResolver;
+-  
++
++  private static SSLFactory sslFactory;
++
+   static {
+-    boolean useIp = new Configuration().getBoolean(
++    Configuration conf = new Configuration();
++    boolean useIp = conf.getBoolean(
+       CommonConfigurationKeys.HADOOP_SECURITY_TOKEN_SERVICE_USE_IP,
+       CommonConfigurationKeys.HADOOP_SECURITY_TOKEN_SERVICE_USE_IP_DEFAULT);
+     setTokenServiceUseIp(useIp);
++    if (HttpConfig.isSecure()) {
++      sslFactory = new SSLFactory(SSLFactory.Mode.CLIENT, conf);
++      try {
++        sslFactory.init();
++      } catch (Exception ex) {
++        throw new RuntimeException(ex);
++      }
++    }
+   }
+   
+   /**
+@@ -456,7 +469,7 @@ public class SecurityUtil {
+ 
+     AuthenticatedURL.Token token = new AuthenticatedURL.Token();
+     try {
+-      return new AuthenticatedURL().openConnection(url, token);
++      return new AuthenticatedURL(null, sslFactory).openConnection(url, token);
+     } catch (AuthenticationException e) {
+       throw new IOException("Exception trying to open authenticated connection to "
+               + url, e);
+diff --git a/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml b/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml
+index 7d95237..b5b7a72 100644
+--- a/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml
++++ b/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml
+@@ -1067,4 +1067,14 @@
+   </description>
+ </property>
+ 
++<property>
++  <name>hadoop.ssl.enabled</name>
++  <value>false</value>
++  <description>
++    Whether to use SSL for the HTTP endpoints. If set to true, the
++    NameNode, DataNode, ResourceManager, NodeManager, HistoryServer and
++    MapReduceAppMaster web UIs will be served over HTTPS instead HTTP.
++  </description>
++</property>
++
+ </configuration>
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/http/TestSSLHttpServer.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/http/TestSSLHttpServer.java
+new file mode 100644
+index 0000000..f5ab957
+--- /dev/null
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/http/TestSSLHttpServer.java
+@@ -0,0 +1,114 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.http;
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.CommonConfigurationKeysPublic;
++import org.apache.hadoop.fs.FileUtil;
++import org.apache.hadoop.security.ssl.KeyStoreTestUtil;
++import org.apache.hadoop.security.ssl.SSLFactory;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Test;
++
++import javax.net.ssl.HttpsURLConnection;
++import java.io.File;
++import java.io.FileWriter;
++import java.io.InputStream;
++import java.io.Writer;
++import java.net.URL;
++
++/**
++ * This testcase issues SSL certificates configures the HttpServer to serve
++ * HTTPS using the created certficates and calls an echo servlet using the
++ * corresponding HTTPS URL.
++ */
++public class TestSSLHttpServer extends HttpServerFunctionalTest {
++  private static final String BASEDIR =
++      System.getProperty("test.build.dir", "target/test-dir") + "/" +
++      TestSSLHttpServer.class.getSimpleName();
++
++  static final Log LOG = LogFactory.getLog(TestSSLHttpServer.class);
++  private static HttpServer server;
++  private static URL baseUrl;
++
++  @Before
++  public void setup() throws Exception {
++    File base = new File(BASEDIR);
++    FileUtil.fullyDelete(base);
++    base.mkdirs();
++    String classpathDir =
++        KeyStoreTestUtil.getClasspathDir(TestSSLHttpServer.class);
++    Configuration conf = new Configuration();
++    String keystoresDir = new File(BASEDIR).getAbsolutePath();
++    String sslConfsDir =
++        KeyStoreTestUtil.getClasspathDir(TestSSLHttpServer.class);
++    KeyStoreTestUtil.setupSSLConfig(keystoresDir, sslConfsDir, conf, false);
++    conf.setBoolean(CommonConfigurationKeysPublic.HADOOP_SSL_ENABLED_KEY, true);
++
++    //we do this trick because the MR AppMaster is started in another VM and
++    //the HttpServer configuration is not loaded from the job.xml but from the
++    //site.xml files in the classpath
++    Writer writer = new FileWriter(classpathDir + "/core-site.xml");
++    conf.writeXml(writer);
++    writer.close();
++
++    conf.setInt(HttpServer.HTTP_MAX_THREADS, 10);
++    server = createServer("test", conf);
++    server.addServlet("echo", "/echo", TestHttpServer.EchoServlet.class);
++    server.start();
++    baseUrl = new URL("https://localhost:" + server.getPort() + "/");
++    LOG.info("HTTP server started: "+ baseUrl);
++  }
++
++  @After
++  public void cleanup() throws Exception {
++    server.stop();
++    String classpathDir =
++        KeyStoreTestUtil.getClasspathDir(TestSSLHttpServer.class);
++    new File(classpathDir + "/core-site.xml").delete();
++  }
++  
++
++  @Test
++  public void testEcho() throws Exception {
++    assertEquals("a:b\nc:d\n", 
++        readOut(new URL(baseUrl, "/echo?a=b&c=d")));
++    assertEquals("a:b\nc&lt;:d\ne:&gt;\n", 
++        readOut(new URL(baseUrl, "/echo?a=b&c<=d&e=>")));
++  }
++
++  private static String readOut(URL url) throws Exception {
++    StringBuilder out = new StringBuilder();
++    HttpsURLConnection conn = (HttpsURLConnection) url.openConnection();
++    SSLFactory sslf = new SSLFactory(SSLFactory.Mode.CLIENT, new Configuration());
++    sslf.init();
++    conn.setSSLSocketFactory(sslf.createSSLSocketFactory());
++    InputStream in = conn.getInputStream();
++    byte[] buffer = new byte[64 * 1024];
++    int len = in.read(buffer);
++    while (len > 0) {
++      out.append(new String(buffer, 0, len));
++      len = in.read(buffer);
++    }
++    return out.toString();
++  }
++
++}
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DatanodeJspHelper.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DatanodeJspHelper.java
+index e09440e..d19e54e 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DatanodeJspHelper.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DatanodeJspHelper.java
+@@ -19,7 +19,6 @@ package org.apache.hadoop.hdfs.server.datanode;
+ 
+ import java.io.File;
+ import java.io.IOException;
+-import java.net.InetAddress;
+ import java.net.InetSocketAddress;
+ import java.net.URL;
+ import java.net.URLEncoder;
+@@ -37,7 +36,6 @@ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hdfs.DFSClient;
+ import org.apache.hadoop.hdfs.DFSConfigKeys;
+-import org.apache.hadoop.hdfs.DFSUtil;
+ import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
+ import org.apache.hadoop.hdfs.protocol.DirectoryListing;
+ import org.apache.hadoop.hdfs.protocol.HdfsFileStatus;
+@@ -45,6 +43,7 @@ import org.apache.hadoop.hdfs.protocol.LocatedBlock;
+ import org.apache.hadoop.hdfs.security.token.block.BlockTokenIdentifier;
+ import org.apache.hadoop.hdfs.security.token.block.BlockTokenSecretManager;
+ import org.apache.hadoop.hdfs.server.common.JspHelper;
++import org.apache.hadoop.http.HttpConfig;
+ import org.apache.hadoop.net.NetUtils;
+ import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.security.token.Token;
+@@ -140,7 +139,7 @@ public class DatanodeJspHelper {
+           DatanodeInfo chosenNode = JspHelper.bestNode(firstBlock, conf);
+           String fqdn = canonicalize(chosenNode.getIpAddr());
+           int datanodePort = chosenNode.getXferPort();
+-          String redirectLocation = "http://" + fqdn + ":"
++          String redirectLocation = HttpConfig.getSchemePrefix() + fqdn + ":"
+               + chosenNode.getInfoPort() + "/browseBlock.jsp?blockId="
+               + firstBlock.getBlock().getBlockId() + "&blockSize="
+               + firstBlock.getBlock().getNumBytes() + "&genstamp="
+@@ -220,7 +219,7 @@ public class DatanodeJspHelper {
+         JspHelper.addTableFooter(out);
+       }
+     }
+-    out.print("<br><a href=\"http://"
++    out.print("<br><a href=\"" + HttpConfig.getSchemePrefix()
+         + canonicalize(nnAddr) + ":"
+         + namenodeInfoPort + "/dfshealth.jsp\">Go back to DFS home</a>");
+     dfs.close();
+@@ -296,7 +295,7 @@ public class DatanodeJspHelper {
+         Long.MAX_VALUE).getLocatedBlocks();
+     // Add the various links for looking at the file contents
+     // URL for downloading the full file
+-    String downloadUrl = "http://" + req.getServerName() + ":"
++    String downloadUrl = HttpConfig.getSchemePrefix() + req.getServerName() + ":"
+         + req.getServerPort() + "/streamFile" + ServletUtil.encodePath(filename)
+         + JspHelper.getUrlParam(JspHelper.NAMENODE_ADDRESS, nnAddr, true)
+         + JspHelper.getDelegationTokenUrlParam(tokenString);
+@@ -314,7 +313,7 @@ public class DatanodeJspHelper {
+       return;
+     }
+     String fqdn = canonicalize(chosenNode.getIpAddr());
+-    String tailUrl = "http://" + fqdn + ":" + chosenNode.getInfoPort()
++    String tailUrl = HttpConfig.getSchemePrefix() + fqdn + ":" + chosenNode.getInfoPort()
+         + "/tail.jsp?filename=" + URLEncoder.encode(filename, "UTF-8")
+         + "&namenodeInfoPort=" + namenodeInfoPort
+         + "&chunkSizeToView=" + chunkSizeToView
+@@ -363,7 +362,7 @@ public class DatanodeJspHelper {
+         String datanodeAddr = locs[j].getXferAddr();
+         datanodePort = locs[j].getXferPort();
+         fqdn = canonicalize(locs[j].getIpAddr());
+-        String blockUrl = "http://" + fqdn + ":" + locs[j].getInfoPort()
++        String blockUrl = HttpConfig.getSchemePrefix() + fqdn + ":" + locs[j].getInfoPort()
+             + "/browseBlock.jsp?blockId=" + blockidstring
+             + "&blockSize=" + blockSize
+             + "&filename=" + URLEncoder.encode(filename, "UTF-8")
+@@ -374,7 +373,7 @@ public class DatanodeJspHelper {
+             + JspHelper.getDelegationTokenUrlParam(tokenString)
+             + JspHelper.getUrlParam(JspHelper.NAMENODE_ADDRESS, nnAddr);
+ 
+-        String blockInfoUrl = "http://" + nnCanonicalName + ":"
++        String blockInfoUrl = HttpConfig.getSchemePrefix() + nnCanonicalName + ":"
+             + namenodeInfoPort
+             + "/block_info_xml.jsp?blockId=" + blockidstring;
+         out.print("<td>&nbsp</td><td><a href=\"" + blockUrl + "\">"
+@@ -385,7 +384,7 @@ public class DatanodeJspHelper {
+     }
+     out.println("</table>");
+     out.print("<hr>");
+-    out.print("<br><a href=\"http://"
++    out.print("<br><a href=\"" + HttpConfig.getSchemePrefix()
+         + nnCanonicalName + ":"
+         + namenodeInfoPort + "/dfshealth.jsp\">Go back to DFS home</a>");
+     dfs.close();
+@@ -485,7 +484,7 @@ public class DatanodeJspHelper {
+     String parent = new File(filename).getParent();
+     JspHelper.printGotoForm(out, namenodeInfoPort, tokenString, parent, nnAddr);
+     out.print("<hr>");
+-    out.print("<a href=\"http://"
++    out.print("<a href=\"" + HttpConfig.getSchemePrefix()
+         + req.getServerName() + ":" + req.getServerPort()
+         + "/browseDirectory.jsp?dir=" + URLEncoder.encode(parent, "UTF-8")
+         + "&namenodeInfoPort=" + namenodeInfoPort
+@@ -533,7 +532,7 @@ public class DatanodeJspHelper {
+     }
+     String nextUrl = null;
+     if (nextBlockIdStr != null) {
+-      nextUrl = "http://" + canonicalize(nextHost) + ":" + nextPort
++      nextUrl = HttpConfig.getSchemePrefix() + canonicalize(nextHost) + ":" + nextPort
+           + "/browseBlock.jsp?blockId=" + nextBlockIdStr
+           + "&blockSize=" + nextBlockSize
+           + "&startOffset=" + nextStartOffset
+@@ -588,7 +587,7 @@ public class DatanodeJspHelper {
+ 
+     String prevUrl = null;
+     if (prevBlockIdStr != null) {
+-      prevUrl = "http://" + canonicalize(prevHost) + ":" + prevPort
++      prevUrl = HttpConfig.getSchemePrefix() + canonicalize(prevHost) + ":" + prevPort
+           + "/browseBlock.jsp?blockId=" + prevBlockIdStr
+           + "&blockSize=" + prevBlockSize
+           + "&startOffset=" + prevStartOffset
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ClusterJspHelper.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ClusterJspHelper.java
+index 0aa465c..78fa3d6 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ClusterJspHelper.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ClusterJspHelper.java
+@@ -41,6 +41,7 @@ import org.apache.hadoop.hdfs.DFSConfigKeys;
+ import org.apache.hadoop.hdfs.DFSUtil;
+ import org.apache.hadoop.hdfs.DFSUtil.ConfiguredNNAddress;
+ import org.apache.hadoop.hdfs.protocol.DatanodeInfo.AdminStates;
++import org.apache.hadoop.http.HttpConfig;
+ import org.apache.hadoop.util.StringUtils;
+ import org.codehaus.jackson.JsonNode;
+ import org.codehaus.jackson.map.ObjectMapper;
+@@ -823,7 +824,7 @@ class ClusterJspHelper {
+     doc.startTag("item");
+     doc.attribute("label", label);
+     doc.attribute("value", value);
+-    doc.attribute("link", "http://" + url);
++    doc.attribute("link", HttpConfig.getSchemePrefix() + url);
+     doc.endTag(); // item
+   }
+ 
+@@ -883,7 +884,7 @@ class ClusterJspHelper {
+ 
+   private static String queryMbean(String httpAddress, Configuration conf) 
+     throws IOException {
+-    URL url = new URL("http://"+httpAddress+JMX_QRY);
++    URL url = new URL(HttpConfig.getSchemePrefix() + httpAddress+JMX_QRY);
+     return readOutput(url);
+   }
+   /**
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeJspHelper.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeJspHelper.java
+index 1b53085..a21bf29 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeJspHelper.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeJspHelper.java
+@@ -51,6 +51,7 @@ import org.apache.hadoop.hdfs.server.common.Storage;
+ import org.apache.hadoop.hdfs.server.common.Storage.StorageDirectory;
+ import org.apache.hadoop.hdfs.server.common.UpgradeStatusReport;
+ import org.apache.hadoop.hdfs.server.protocol.NamenodeProtocols;
++import org.apache.hadoop.http.HttpConfig;
+ import org.apache.hadoop.io.Text;
+ import org.apache.hadoop.net.NetUtils;
+ import org.apache.hadoop.net.NodeBase;
+@@ -413,7 +414,7 @@ class NamenodeJspHelper {
+     }
+     String addr = NetUtils.getHostPortString(nn.getNameNodeAddress());
+     String fqdn = InetAddress.getByName(nodeToRedirect).getCanonicalHostName();
+-    redirectLocation = "http://" + fqdn + ":" + redirectPort
++    redirectLocation = HttpConfig.getSchemePrefix() + fqdn + ":" + redirectPort
+         + "/browseDirectory.jsp?namenodeInfoPort="
+         + nn.getHttpAddress().getPort() + "&dir=/"
+         + (tokenString == null ? "" :
+@@ -462,7 +463,8 @@ class NamenodeJspHelper {
+         String suffix, boolean alive, int nnHttpPort, String nnaddr)
+         throws IOException {
+       // from nn_browsedfscontent.jsp:
+-      String url = "http://" + d.getHostName() + ":" + d.getInfoPort()
++      String url = HttpConfig.getSchemePrefix() + d.getHostName() + ":"
++          + d.getInfoPort()
+           + "/browseDirectory.jsp?namenodeInfoPort=" + nnHttpPort + "&dir="
+           + URLEncoder.encode("/", "UTF-8")
+           + JspHelper.getUrlParam(JspHelper.NAMENODE_ADDRESS, nnaddr);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/TransferFsImage.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/TransferFsImage.java
+index dd79139..5886059 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/TransferFsImage.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/TransferFsImage.java
+@@ -32,12 +32,12 @@ import javax.servlet.http.HttpServletResponse;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.classification.InterfaceAudience;
++import org.apache.hadoop.http.HttpConfig;
+ import org.apache.hadoop.security.SecurityUtil;
+ import org.apache.hadoop.util.Time;
+ import org.apache.hadoop.hdfs.protocol.HdfsConstants;
+ import org.apache.hadoop.hdfs.server.common.StorageErrorReporter;
+ import org.apache.hadoop.hdfs.server.common.Storage;
+-import org.apache.hadoop.hdfs.server.common.Util;
+ import org.apache.hadoop.hdfs.server.namenode.NNStorage.NameNodeDirType;
+ import org.apache.hadoop.hdfs.server.protocol.RemoteEditLog;
+ import org.apache.hadoop.hdfs.util.DataTransferThrottler;
+@@ -207,7 +207,8 @@ public class TransferFsImage {
+       Storage dstStorage, boolean getChecksum) throws IOException {
+     byte[] buf = new byte[HdfsConstants.IO_FILE_BUFFER_SIZE];
+ 
+-    String str = "http://" + nnHostPort + "/getimage?" + queryString;
++    String str = HttpConfig.getSchemePrefix() + nnHostPort + "/getimage?" +
++        queryString;
+     LOG.info("Opening connection to " + str);
+     //
+     // open connection to remote server
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/tools/DFSck.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/tools/DFSck.java
+index 7124876..566d77a 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/tools/DFSck.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/tools/DFSck.java
+@@ -36,6 +36,7 @@ import org.apache.hadoop.hdfs.DistributedFileSystem;
+ import org.apache.hadoop.hdfs.HAUtil;
+ import org.apache.hadoop.hdfs.HdfsConfiguration;
+ import org.apache.hadoop.hdfs.server.namenode.NamenodeFsck;
++import org.apache.hadoop.http.HttpConfig;
+ import org.apache.hadoop.security.SecurityUtil;
+ import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.util.StringUtils;
+@@ -226,7 +227,7 @@ public class DFSck extends Configured implements Tool {
+   }
+ 
+   private int doWork(final String[] args) throws IOException {
+-    final StringBuilder url = new StringBuilder("http://");
++    final StringBuilder url = new StringBuilder(HttpConfig.getSchemePrefix());
+     
+     String namenodeAddress = getCurrentNamenodeAddress();
+     if (namenodeAddress == null) {
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/webapp/JobBlock.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/webapp/JobBlock.java
+index c0d7de0..6b80c8c 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/webapp/JobBlock.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/webapp/JobBlock.java
+@@ -20,7 +20,6 @@ package org.apache.hadoop.mapreduce.v2.app.webapp;
+ 
+ import static org.apache.hadoop.mapreduce.v2.app.webapp.AMParams.JOB_ID;
+ import static org.apache.hadoop.yarn.util.StringHelper.join;
+-import static org.apache.hadoop.yarn.util.StringHelper.ujoin;
+ import static org.apache.hadoop.yarn.webapp.view.JQueryUI._EVEN;
+ import static org.apache.hadoop.yarn.webapp.view.JQueryUI._INFO_WRAP;
+ import static org.apache.hadoop.yarn.webapp.view.JQueryUI._ODD;
+@@ -31,6 +30,7 @@ import static org.apache.hadoop.yarn.webapp.view.JQueryUI._TH;
+ import java.util.Date;
+ import java.util.List;
+ 
++import org.apache.hadoop.http.HttpConfig;
+ import org.apache.hadoop.mapreduce.v2.api.records.AMInfo;
+ import org.apache.hadoop.mapreduce.v2.api.records.JobId;
+ import org.apache.hadoop.mapreduce.v2.app.AppContext;
+@@ -40,8 +40,6 @@ import org.apache.hadoop.mapreduce.v2.app.webapp.dao.JobInfo;
+ import org.apache.hadoop.mapreduce.v2.util.MRApps;
+ import org.apache.hadoop.mapreduce.v2.util.MRApps.TaskAttemptStateUI;
+ import org.apache.hadoop.util.StringUtils;
+-import org.apache.hadoop.yarn.api.records.NodeId;
+-import org.apache.hadoop.yarn.util.BuilderUtils;
+ import org.apache.hadoop.yarn.webapp.hamlet.Hamlet;
+ import org.apache.hadoop.yarn.webapp.hamlet.Hamlet.DIV;
+ import org.apache.hadoop.yarn.webapp.hamlet.Hamlet.TABLE;
+@@ -106,7 +104,8 @@ public class JobBlock extends HtmlBlock {
+       table.tr().
+         td(String.valueOf(attempt.getAttemptId())).
+         td(new Date(attempt.getStartTime()).toString()).
+-        td().a(".nodelink", url("http://", attempt.getNodeHttpAddress()), 
++        td().a(".nodelink", url(HttpConfig.getSchemePrefix(),
++            attempt.getNodeHttpAddress()),
+             attempt.getNodeHttpAddress())._().
+         td().a(".logslink", url(attempt.getLogsLink()), 
+             "logs")._().
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/webapp/NavBlock.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/webapp/NavBlock.java
+index 56a0a2f..941b7b0 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/webapp/NavBlock.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/webapp/NavBlock.java
+@@ -24,6 +24,7 @@ import com.google.inject.Inject;
+ 
+ import static org.apache.hadoop.mapreduce.v2.app.webapp.AMWebApp.*;
+ 
++import org.apache.hadoop.http.HttpConfig;
+ import org.apache.hadoop.mapreduce.v2.api.records.AMInfo;
+ import org.apache.hadoop.mapreduce.v2.util.MRApps;
+ import org.apache.hadoop.yarn.webapp.hamlet.Hamlet;
+@@ -62,7 +63,8 @@ public class NavBlock extends HtmlBlock {
+           li().a(url("conf", jobid), "Configuration")._().
+           li().a(url("tasks", jobid, "m"), "Map tasks")._().
+           li().a(url("tasks", jobid, "r"), "Reduce tasks")._().
+-          li().a(".logslink", url("http://", nodeHttpAddress, "node",
++          li().a(".logslink", url(HttpConfig.getSchemePrefix(),
++              nodeHttpAddress, "node",
+               "containerlogs", thisAmInfo.getContainerId().toString(), 
+               app.getJob().getUserName()), 
+               "AM Logs")._()._();
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/webapp/TaskPage.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/webapp/TaskPage.java
+index e83a957..90f082a 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/webapp/TaskPage.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/webapp/TaskPage.java
+@@ -27,6 +27,7 @@ import static org.apache.hadoop.yarn.webapp.view.JQueryUI.tableInit;
+ 
+ import java.util.Collection;
+ 
++import org.apache.hadoop.http.HttpConfig;
+ import org.apache.hadoop.mapreduce.v2.app.job.TaskAttempt;
+ import org.apache.hadoop.mapreduce.v2.app.webapp.dao.TaskAttemptInfo;
+ import org.apache.hadoop.util.StringUtils;
+@@ -93,13 +94,15 @@ public class TaskPage extends AppView {
+           nodeTd._("N/A");
+         } else {
+           nodeTd.
+-            a(".nodelink", url("http://", nodeHttpAddr), nodeHttpAddr);
++            a(".nodelink", url(HttpConfig.getSchemePrefix(),
++                               nodeHttpAddr), nodeHttpAddr);
+         }
+         nodeTd._();
+         if (containerId != null) {
+           String containerIdStr = ta.getAssignedContainerIdStr();
+           row.td().
+-            a(".logslink", url("http://", nodeHttpAddr, "node", "containerlogs",
++              a(".logslink", url(HttpConfig.getSchemePrefix(),
++              nodeHttpAddr, "node", "containerlogs",
+               containerIdStr, app.getJob().getUserName()), "logs")._();
+         } else {
+           row.td()._("N/A")._();
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/webapp/dao/AMAttemptInfo.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/webapp/dao/AMAttemptInfo.java
+index 96e2f1d..8dcb7c5 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/webapp/dao/AMAttemptInfo.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/webapp/dao/AMAttemptInfo.java
+@@ -24,6 +24,7 @@ import javax.xml.bind.annotation.XmlAccessType;
+ import javax.xml.bind.annotation.XmlAccessorType;
+ import javax.xml.bind.annotation.XmlRootElement;
+ 
++import org.apache.hadoop.http.HttpConfig;
+ import org.apache.hadoop.mapreduce.v2.api.records.AMInfo;
+ import org.apache.hadoop.yarn.api.records.ContainerId;
+ import org.apache.hadoop.yarn.api.records.NodeId;
+@@ -63,7 +64,7 @@ public class AMAttemptInfo {
+     ContainerId containerId = amInfo.getContainerId();
+     if (containerId != null) {
+       this.containerId = containerId.toString();
+-      this.logsLink = join("http://" + nodeHttpAddress,
++      this.logsLink = join(HttpConfig.getSchemePrefix() + nodeHttpAddress,
+           ujoin("node", "containerlogs", this.containerId, user));
+     }
+   }
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/util/HostUtil.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/util/HostUtil.java
+index 83bbbe9..0a42bb7 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/util/HostUtil.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/util/HostUtil.java
+@@ -20,6 +20,7 @@ package org.apache.hadoop.mapreduce.util;
+ 
+ import org.apache.hadoop.classification.InterfaceAudience.Private;
+ import org.apache.hadoop.classification.InterfaceStability.Unstable;
++import org.apache.hadoop.http.HttpConfig;
+ 
+ @Private
+ @Unstable
+@@ -33,9 +34,9 @@ public class HostUtil {
+    * @return the taskLogUrl
+    */
+   public static String getTaskLogUrl(String taskTrackerHostName,
+-      String httpPort, String taskAttemptID) {
+-    return ("http://" + taskTrackerHostName + ":" + httpPort
+-        + "/tasklog?attemptid=" + taskAttemptID);
++    String httpPort, String taskAttemptID) {
++    return (HttpConfig.getSchemePrefix() + taskTrackerHostName + ":" +
++        httpPort + "/tasklog?attemptid=" + taskAttemptID);
+   }
+ 
+   public static String convertTrackerNameToHostName(String trackerName) {
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs/src/main/java/org/apache/hadoop/mapreduce/v2/hs/webapp/HsJobBlock.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs/src/main/java/org/apache/hadoop/mapreduce/v2/hs/webapp/HsJobBlock.java
+index b21218e..25b22f0 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs/src/main/java/org/apache/hadoop/mapreduce/v2/hs/webapp/HsJobBlock.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs/src/main/java/org/apache/hadoop/mapreduce/v2/hs/webapp/HsJobBlock.java
+@@ -21,28 +21,18 @@ package org.apache.hadoop.mapreduce.v2.hs.webapp;
+ import com.google.inject.Inject;
+ import java.util.Date;
+ import java.util.List;
+-import java.util.Map;
+ 
+-import org.apache.hadoop.mapreduce.JobACL;
++import org.apache.hadoop.http.HttpConfig;
+ import org.apache.hadoop.mapreduce.v2.api.records.AMInfo;
+ import org.apache.hadoop.mapreduce.v2.api.records.JobId;
+-import org.apache.hadoop.mapreduce.v2.api.records.JobReport;
+-import org.apache.hadoop.mapreduce.v2.api.records.TaskAttemptId;
+-import org.apache.hadoop.mapreduce.v2.api.records.TaskAttemptState;
+-import org.apache.hadoop.mapreduce.v2.api.records.TaskId;
+ import org.apache.hadoop.mapreduce.v2.app.AppContext;
+ import org.apache.hadoop.mapreduce.v2.app.job.Job;
+-import org.apache.hadoop.mapreduce.v2.app.job.Task;
+-import org.apache.hadoop.mapreduce.v2.app.job.TaskAttempt;
+ import org.apache.hadoop.mapreduce.v2.app.webapp.dao.ConfEntryInfo;
+ import org.apache.hadoop.mapreduce.v2.hs.webapp.dao.AMAttemptInfo;
+ import org.apache.hadoop.mapreduce.v2.hs.webapp.dao.JobInfo;
+ import org.apache.hadoop.mapreduce.v2.util.MRApps;
+ import org.apache.hadoop.mapreduce.v2.util.MRApps.TaskAttemptStateUI;
+-import org.apache.hadoop.security.authorize.AccessControlList;
+ import org.apache.hadoop.util.StringUtils;
+-import org.apache.hadoop.yarn.api.records.NodeId;
+-import org.apache.hadoop.yarn.util.BuilderUtils;
+ import org.apache.hadoop.yarn.util.Times;
+ import org.apache.hadoop.yarn.webapp.ResponseInfo;
+ import org.apache.hadoop.yarn.webapp.hamlet.Hamlet;
+@@ -142,7 +132,8 @@ public class HsJobBlock extends HtmlBlock {
+             table.tr((odd = !odd) ? _ODD : _EVEN).
+               td(String.valueOf(attempt.getAttemptId())).
+               td(new Date(attempt.getStartTime()).toString()).
+-              td().a(".nodelink", url("http://", attempt.getNodeHttpAddress()), 
++              td().a(".nodelink", url(HttpConfig.getSchemePrefix(),
++                  attempt.getNodeHttpAddress()),
+                   attempt.getNodeHttpAddress())._().
+               td().a(".logslink", url(attempt.getShortLogsLink()), 
+                       "logs")._().
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs/src/main/java/org/apache/hadoop/mapreduce/v2/hs/webapp/HsTaskPage.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs/src/main/java/org/apache/hadoop/mapreduce/v2/hs/webapp/HsTaskPage.java
+index 5e4b701..9807b1f 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs/src/main/java/org/apache/hadoop/mapreduce/v2/hs/webapp/HsTaskPage.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs/src/main/java/org/apache/hadoop/mapreduce/v2/hs/webapp/HsTaskPage.java
+@@ -29,6 +29,7 @@ import static org.apache.hadoop.yarn.webapp.view.JQueryUI.tableInit;
+ 
+ import java.util.Collection;
+ 
++import org.apache.hadoop.http.HttpConfig;
+ import org.apache.hadoop.mapreduce.v2.api.records.TaskId;
+ import org.apache.hadoop.mapreduce.v2.api.records.TaskType;
+ import org.apache.hadoop.mapreduce.v2.app.job.TaskAttempt;
+@@ -143,7 +144,7 @@ public class HsTaskPage extends HsView {
+ 
+         td.br().$title(String.valueOf(sortId))._(). // sorting
+             _(taid)._().td(ta.getState().toString()).td().a(".nodelink",
+-                "http://"+ nodeHttpAddr,
++                HttpConfig.getSchemePrefix()+ nodeHttpAddr,
+                 nodeRackName + "/" + nodeHttpAddr);
+         td._();
+         row.td().
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient/src/main/java/org/apache/hadoop/mapred/ClientServiceDelegate.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient/src/main/java/org/apache/hadoop/mapred/ClientServiceDelegate.java
+index 0143cb7..51c5f47 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient/src/main/java/org/apache/hadoop/mapred/ClientServiceDelegate.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient/src/main/java/org/apache/hadoop/mapred/ClientServiceDelegate.java
+@@ -32,6 +32,7 @@ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.CommonConfigurationKeysPublic;
++import org.apache.hadoop.http.HttpConfig;
+ import org.apache.hadoop.mapreduce.JobID;
+ import org.apache.hadoop.mapreduce.JobStatus;
+ import org.apache.hadoop.mapreduce.MRJobConfig;
+@@ -392,7 +393,7 @@ public class ClientServiceDelegate {
+       String url = StringUtils.isNotEmpty(historyTrackingUrl)
+           ? historyTrackingUrl : trackingUrl;
+       if (!UNAVAILABLE.equals(url)) {
+-        url = "http://" + url;
++        url = HttpConfig.getSchemePrefix() + url;
+       }
+       jobStatus = TypeConverter.fromYarn(report, url);
+     }
+diff --git a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/attempt/RMAppAttemptImpl.java b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/attempt/RMAppAttemptImpl.java
+index 151c815..178f6f4 100644
+--- a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/attempt/RMAppAttemptImpl.java
++++ b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/attempt/RMAppAttemptImpl.java
+@@ -33,6 +33,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock.WriteLock;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.http.HttpConfig;
+ import org.apache.hadoop.yarn.api.records.ApplicationAttemptId;
+ import org.apache.hadoop.yarn.api.records.ApplicationResourceUsageReport;
+ import org.apache.hadoop.yarn.api.records.FinalApplicationStatus;
+@@ -369,13 +370,13 @@ public class RMAppAttemptImpl implements RMAppAttempt {
+       final String trackingUriWithoutScheme) {
+     this.readLock.lock();
+     try {
+-      URI trackingUri = trackingUriWithoutScheme == null ? null : 
++      URI trackingUri = trackingUriWithoutScheme == null ? null :
+         ProxyUriUtils.getUriFromAMUrl(trackingUriWithoutScheme);
+       URI proxyUri = ProxyUriUtils.getUriFromAMUrl(proxy);
+-      URI result = ProxyUriUtils.getProxyUri(trackingUri, proxyUri, 
++      URI result = ProxyUriUtils.getProxyUri(trackingUri, proxyUri,
+           applicationAttemptId.getApplicationId());
+       //We need to strip off the scheme to have it match what was there before
+-      return result.toASCIIString().substring(7);
++      return result.toASCIIString().substring(HttpConfig.getSchemePrefix().length());
+     } catch (URISyntaxException e) {
+       LOG.warn("Could not proxify "+trackingUriWithoutScheme,e);
+       return trackingUriWithoutScheme;
+diff --git a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/webapp/AppBlock.java b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/webapp/AppBlock.java
+index 3dcd2f0..c3593de 100644
+--- a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/webapp/AppBlock.java
++++ b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/webapp/AppBlock.java
+@@ -30,6 +30,7 @@ import java.util.Collection;
+ 
+ import com.google.inject.Inject;
+ 
++import org.apache.hadoop.http.HttpConfig;
+ import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.util.StringUtils;
+ import org.apache.hadoop.yarn.api.records.ApplicationAccessType;
+@@ -137,7 +138,8 @@ public class AppBlock extends HtmlBlock {
+       table.tr((odd = !odd) ? _ODD : _EVEN).
+         td(String.valueOf(attemptInfo.getAttemptId())).
+         td(Times.format(attemptInfo.getStartTime())).
+-        td().a(".nodelink", url("http://", attemptInfo.getNodeHttpAddress()),
++        td().a(".nodelink", url(HttpConfig.getSchemePrefix(),
++            attemptInfo.getNodeHttpAddress()),
+             attemptInfo.getNodeHttpAddress())._().
+         td().a(".logslink", url(attemptInfo.getLogsLink()), "logs")._().
+       _();
+diff --git a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/webapp/NodesPage.java b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/webapp/NodesPage.java
+index a9aafc5..18167c8 100644
+--- a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/webapp/NodesPage.java
++++ b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/webapp/NodesPage.java
+@@ -26,6 +26,7 @@ import static org.apache.hadoop.yarn.webapp.view.JQueryUI.tableInit;
+ 
+ import java.util.Collection;
+ 
++import org.apache.hadoop.http.HttpConfig;
+ import org.apache.hadoop.util.StringUtils;
+ import org.apache.hadoop.yarn.api.records.NodeState;
+ import org.apache.hadoop.yarn.server.resourcemanager.RMContext;
+@@ -118,7 +119,8 @@ class NodesPage extends RmView {
+           row.td()._("N/A")._();
+         } else {
+           String httpAddress = info.getNodeHTTPAddress();
+-          row.td().a("http://" + httpAddress, httpAddress)._();
++          row.td().a(HttpConfig.getSchemePrefix() + httpAddress,
++              httpAddress)._();
+         }
+         row.td(info.getHealthStatus()).
+             td().br().$title(String.valueOf(info.getLastHealthUpdate()))._().
+diff --git a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/webapp/dao/AppAttemptInfo.java b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/webapp/dao/AppAttemptInfo.java
+index 5ad726e..61b4880 100644
+--- a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/webapp/dao/AppAttemptInfo.java
++++ b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/webapp/dao/AppAttemptInfo.java
+@@ -23,6 +23,7 @@ import javax.xml.bind.annotation.XmlAccessType;
+ import javax.xml.bind.annotation.XmlAccessorType;
+ import javax.xml.bind.annotation.XmlRootElement;
+ 
++import org.apache.hadoop.http.HttpConfig;
+ import org.apache.hadoop.yarn.api.records.Container;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttempt;
+ import org.apache.hadoop.yarn.util.ConverterUtils;
+@@ -55,7 +56,8 @@ public class AppAttemptInfo {
+         this.containerId = masterContainer.getId().toString();
+         this.nodeHttpAddress = masterContainer.getNodeHttpAddress();
+         this.nodeId = masterContainer.getNodeId().toString();
+-        this.logsLink = join("http://", masterContainer.getNodeHttpAddress(),
++        this.logsLink = join(HttpConfig.getSchemePrefix(),
++            masterContainer.getNodeHttpAddress(),
+             "/node", "/containerlogs/",
+             ConverterUtils.toString(masterContainer.getId()),
+             "/", attempt.getSubmissionContext().getUser());
+diff --git a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/webapp/dao/AppInfo.java b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/webapp/dao/AppInfo.java
+index 47a263d..8a38278 100644
+--- a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/webapp/dao/AppInfo.java
++++ b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/webapp/dao/AppInfo.java
+@@ -24,6 +24,7 @@ import javax.xml.bind.annotation.XmlAccessorType;
+ import javax.xml.bind.annotation.XmlRootElement;
+ import javax.xml.bind.annotation.XmlTransient;
+ 
++import org.apache.hadoop.http.HttpConfig;
+ import org.apache.hadoop.yarn.api.records.ApplicationId;
+ import org.apache.hadoop.yarn.api.records.Container;
+ import org.apache.hadoop.yarn.api.records.FinalApplicationStatus;
+@@ -87,10 +88,10 @@ public class AppInfo {
+       this.trackingUI = this.trackingUrlIsNotReady ? "UNASSIGNED" : (app
+           .getFinishTime() == 0 ? "ApplicationMaster" : "History");
+       if (!trackingUrlIsNotReady) {
+-        this.trackingUrl = join("http://", trackingUrl);
++        this.trackingUrl = join(HttpConfig.getSchemePrefix(), trackingUrl);
+       }
+       this.trackingUrlPretty = trackingUrlIsNotReady ? "UNASSIGNED" : join(
+-          "http://", trackingUrl);
++          HttpConfig.getSchemePrefix(), trackingUrl);
+       this.applicationId = app.getApplicationId();
+       this.appIdNum = String.valueOf(app.getApplicationId().getId());
+       this.id = app.getApplicationId().toString();
+@@ -104,7 +105,6 @@ public class AppInfo {
+       }
+       this.finalStatus = app.getFinalApplicationStatus();
+       this.clusterId = ResourceManager.clusterTimeStamp;
+-
+       if (hasAccess) {
+         this.startedTime = app.getStartTime();
+         this.finishedTime = app.getFinishTime();
+@@ -116,7 +116,8 @@ public class AppInfo {
+           Container masterContainer = attempt.getMasterContainer();
+           if (masterContainer != null) {
+             this.amContainerLogsExist = true;
+-            String url = join("http://", masterContainer.getNodeHttpAddress(),
++            String url = join(HttpConfig.getSchemePrefix(),
++                masterContainer.getNodeHttpAddress(),
+                 "/node", "/containerlogs/",
+                 ConverterUtils.toString(masterContainer.getId()),
+                 "/", app.getUser());
+diff --git a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-web-proxy/src/main/java/org/apache/hadoop/yarn/server/webproxy/ProxyUriUtils.java b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-web-proxy/src/main/java/org/apache/hadoop/yarn/server/webproxy/ProxyUriUtils.java
+index 61e31ee..7545fc0 100644
+--- a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-web-proxy/src/main/java/org/apache/hadoop/yarn/server/webproxy/ProxyUriUtils.java
++++ b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-web-proxy/src/main/java/org/apache/hadoop/yarn/server/webproxy/ProxyUriUtils.java
+@@ -27,6 +27,7 @@ import java.net.URLEncoder;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.http.HttpConfig;
+ import org.apache.hadoop.yarn.api.records.ApplicationId;
+ 
+ public class ProxyUriUtils {
+@@ -138,8 +139,8 @@ public class ProxyUriUtils {
+    * @return a URI with an http scheme
+    * @throws URISyntaxException if the url is not formatted correctly.
+    */
+-  public static URI getUriFromAMUrl(String noSchemeUrl) 
++  public static URI getUriFromAMUrl(String noSchemeUrl)
+     throws URISyntaxException {
+-    return new URI("http://"+noSchemeUrl);
++      return new URI(HttpConfig.getSchemePrefix() + noSchemeUrl);
+   }
+ }
+diff --git a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-web-proxy/src/main/java/org/apache/hadoop/yarn/server/webproxy/amfilter/AmFilterInitializer.java b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-web-proxy/src/main/java/org/apache/hadoop/yarn/server/webproxy/amfilter/AmFilterInitializer.java
+index fdd7a70..bc43d51 100644
+--- a/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-web-proxy/src/main/java/org/apache/hadoop/yarn/server/webproxy/amfilter/AmFilterInitializer.java
++++ b/hadoop-mapreduce-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-web-proxy/src/main/java/org/apache/hadoop/yarn/server/webproxy/amfilter/AmFilterInitializer.java
+@@ -24,6 +24,7 @@ import java.util.Map;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.http.FilterContainer;
+ import org.apache.hadoop.http.FilterInitializer;
++import org.apache.hadoop.http.HttpConfig;
+ import org.apache.hadoop.yarn.api.ApplicationConstants;
+ import org.apache.hadoop.yarn.conf.YarnConfiguration;
+ 
+@@ -37,7 +38,8 @@ public class AmFilterInitializer extends FilterInitializer {
+     String proxy = YarnConfiguration.getProxyHostAndPort(conf);
+     String[] parts = proxy.split(":");
+     params.put(AmIpFilter.PROXY_HOST, parts[0]);
+-    params.put(AmIpFilter.PROXY_URI_BASE, "http://"+proxy+
++    params.put(AmIpFilter.PROXY_URI_BASE,
++        HttpConfig.getSchemePrefix() + proxy +
+         System.getenv(ApplicationConstants.APPLICATION_WEB_PROXY_BASE_ENV));
+     container.addFilter(FILTER_NAME, FILTER_CLASS, params);
+   }
+-- 
+1.7.0.4
+

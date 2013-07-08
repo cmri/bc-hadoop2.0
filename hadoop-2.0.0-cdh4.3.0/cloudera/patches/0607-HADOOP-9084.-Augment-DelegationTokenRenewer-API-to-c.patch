@@ -1,0 +1,153 @@
+From 9a4114ffca4f29251424486ed56f1cfccd33447a Mon Sep 17 00:00:00 2001
+From: Alejandro Abdelnur <tucu@apache.org>
+Date: Tue, 27 Nov 2012 19:23:05 +0000
+Subject: [PATCH 0607/1357] HADOOP-9084. Augment DelegationTokenRenewer API to cancel the tokens on calls to removeRenewAction. (kkambatl via tucu)
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1414326 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 9d67fb9146c0231dfd723613ebf3423a63129ccf)
+---
+ .../dev-support/findbugsExcludeFile.xml            |   10 +++++-
+ .../apache/hadoop/fs/DelegationTokenRenewer.java   |   22 ++++++++++++-
+ .../hadoop/fs/TestDelegationTokenRenewer.java      |   33 +++++++------------
+ 3 files changed, 41 insertions(+), 24 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/dev-support/findbugsExcludeFile.xml b/hadoop-common-project/hadoop-common/dev-support/findbugsExcludeFile.xml
+index 0244955..5ca05fd 100644
+--- a/hadoop-common-project/hadoop-common/dev-support/findbugsExcludeFile.xml
++++ b/hadoop-common-project/hadoop-common/dev-support/findbugsExcludeFile.xml
+@@ -303,5 +303,13 @@
+        <Field name="previousSnapshot" />
+        <Bug pattern="IS2_INCONSISTENT_SYNC" />
+      </Match>
+-
++     <!--
++       The method uses a generic type T that extends two other types
++       T1 and T2. Findbugs complains of a cast from T1 to T2.
++     -->
++     <Match>
++       <Class name="org.apache.hadoop.fs.DelegationTokenRenewer" />
++       <Method name="removeRenewAction" />
++       <Bug pattern="BC_UNCONFIRMED_CAST" />
++     </Match>
+  </FindBugsFilter>
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/DelegationTokenRenewer.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/DelegationTokenRenewer.java
+index 9e9e280..0237125 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/DelegationTokenRenewer.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/DelegationTokenRenewer.java
+@@ -24,6 +24,8 @@ import java.util.concurrent.DelayQueue;
+ import java.util.concurrent.Delayed;
+ import java.util.concurrent.TimeUnit;
+ 
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.security.token.Token;
+ import org.apache.hadoop.security.token.TokenIdentifier;
+@@ -35,6 +37,9 @@ import org.apache.hadoop.util.Time;
+ @InterfaceAudience.Private
+ public class DelegationTokenRenewer
+     extends Thread {
++  private static final Log LOG = LogFactory
++      .getLog(DelegationTokenRenewer.class);
++
+   /** The renewable interface used by the renewer. */
+   public interface Renewable {
+     /** @return the renew token. */
+@@ -164,11 +169,24 @@ public class DelegationTokenRenewer
+     }
+   }
+ 
+-  /** Remove the associated renew action from the queue */
++  /**
++   * Remove the associated renew action from the queue
++   * 
++   * @throws IOException
++   */
+   public synchronized <T extends FileSystem & Renewable> void removeRenewAction(
+-      final T fs) {
++      final T fs) throws IOException {
+     for (RenewAction<?> action : queue) {
+       if (action.weakFs.get() == fs) {
++        try {
++          fs.getRenewToken().cancel(fs.getConf());
++        } catch (InterruptedException ie) {
++          LOG.error("Interrupted while canceling token for " + fs.getUri()
++              + "filesystem");
++          if (LOG.isDebugEnabled()) {
++            LOG.debug(ie.getStackTrace());
++          }
++        }
+         queue.remove(action);
+         return;
+       }
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/TestDelegationTokenRenewer.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/TestDelegationTokenRenewer.java
+index 789641d..86a580c 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/TestDelegationTokenRenewer.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/TestDelegationTokenRenewer.java
+@@ -23,6 +23,7 @@ public class TestDelegationTokenRenewer {
+   @SuppressWarnings("rawtypes")
+   static class TestToken extends Token {
+     public volatile int renewCount = 0;
++    public volatile boolean cancelled = false;
+ 
+     @Override
+     public long renew(Configuration conf) {
+@@ -33,6 +34,11 @@ public class TestDelegationTokenRenewer {
+       }
+       return renewCount;
+     }
++
++    @Override
++    public void cancel(Configuration conf) {
++      cancelled = true;
++    }
+   }
+   
+   static class TestFileSystem extends FileSystem implements
+@@ -123,27 +129,12 @@ public class TestDelegationTokenRenewer {
+   }
+ 
+   @Test
+-  public void testAddRenewAction() throws IOException, InterruptedException {
+-    TestFileSystem tfs = new TestFileSystem();
+-    renewer.addRenewAction(tfs);
+-
+-    for (int i = 0; i < 10; i++) {
+-      Thread.sleep(RENEW_CYCLE);
+-      if (tfs.testToken.renewCount > 0) {
+-        return;
+-      }
+-    }
+-
+-    assertTrue("Token not renewed even after 10 seconds",
+-        (tfs.testToken.renewCount > 0));
+-  }
+-
+-  @Test
+-  public void testRemoveRenewAction() throws IOException, InterruptedException {
++  public void testAddRemoveRenewAction() throws IOException,
++      InterruptedException {
+     TestFileSystem tfs = new TestFileSystem();
+     renewer.addRenewAction(tfs);
+ 
+-    for (int i = 0; i < 10; i++) {
++    for (int i = 0; i < 60; i++) {
+       Thread.sleep(RENEW_CYCLE);
+       if (tfs.testToken.renewCount > 0) {
+         renewer.removeRenewAction(tfs);
+@@ -151,9 +142,9 @@ public class TestDelegationTokenRenewer {
+       }
+     }
+ 
+-    assertTrue("Token not renewed even once",
++    assertTrue("Token not renewed even after 1 minute",
+         (tfs.testToken.renewCount > 0));
+-    assertTrue("Token not removed",
+-        (tfs.testToken.renewCount < MAX_RENEWALS));
++    assertTrue("Token not removed", (tfs.testToken.renewCount < MAX_RENEWALS));
++    assertTrue("Token not cancelled", tfs.testToken.cancelled);
+   }
+ }
+-- 
+1.7.0.4
+

@@ -1,0 +1,121 @@
+From 95cbf48df827d2688f7660286cacbdcc065727c9 Mon Sep 17 00:00:00 2001
+From: Aaron Twining Myers <atm@apache.org>
+Date: Fri, 8 Jun 2012 07:04:58 +0000
+Subject: [PATCH 0226/1357] HDFS-2914. HA: Standby should not enter safemode when resources are low. Contributed by Vinay.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/branch-2@1347898 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit b1d9ce1345ad00cecbb096b032e0220e35ace9fb)
+---
+ .../hadoop/hdfs/server/namenode/FSNamesystem.java  |   20 +++++++++++++++-----
+ .../server/namenode/ha/TestFailureOfSharedDir.java |   12 ++++++++++++
+ 2 files changed, 27 insertions(+), 5 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+index 1deba70..5e5fd4e 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+@@ -568,8 +568,6 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+         !safeMode.isPopulatingReplQueues();
+       setBlockTotal();
+       blockManager.activate(conf);
+-      this.nnrmthread = new Daemon(new NameNodeResourceMonitor());
+-      nnrmthread.start();
+     } finally {
+       writeUnlock();
+     }
+@@ -586,7 +584,6 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+     writeLock();
+     try {
+       if (blockManager != null) blockManager.close();
+-      if (nnrmthread != null) nnrmthread.interrupt();
+     } finally {
+       writeUnlock();
+     }
+@@ -640,6 +637,10 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+       }
+       leaseManager.startMonitor();
+       startSecretManagerIfNecessary();
++
++      //ResourceMonitor required only at ActiveNN. See HDFS-2914
++      this.nnrmthread = new Daemon(new NameNodeResourceMonitor());
++      nnrmthread.start();
+     } finally {
+       writeUnlock();
+     }
+@@ -662,6 +663,10 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+       if (leaseManager != null) {
+         leaseManager.stopMonitor();
+       }
++      if (nnrmthread != null) {
++        ((NameNodeResourceMonitor) nnrmthread.getRunnable()).stopMonitor();
++        nnrmthread.interrupt();
++      }
+       if (dir != null && dir.fsImage != null) {
+         if (dir.fsImage.editLog != null) {
+           dir.fsImage.editLog.close();
+@@ -3394,10 +3399,11 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+    * acceptable levels, this daemon will cause the NN to exit safe mode.
+    */
+   class NameNodeResourceMonitor implements Runnable  {
++    boolean shouldNNRmRun = true;
+     @Override
+     public void run () {
+       try {
+-        while (fsRunning) {
++        while (fsRunning && shouldNNRmRun) {
+           checkAvailableResources();
+           if(!nameNodeHasResourcesAvailable()) {
+             String lowResourcesMsg = "NameNode low on available disk space. ";
+@@ -3418,7 +3424,11 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+         FSNamesystem.LOG.error("Exception in NameNodeResourceMonitor: ", e);
+       }
+     }
+-  }
++
++    public void stopMonitor() {
++      shouldNNRmRun = false;
++    }
++ }
+   
+   public FSImage getFSImage() {
+     return dir.fsImage;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestFailureOfSharedDir.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestFailureOfSharedDir.java
+index 3312dea..ed5b8e7 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestFailureOfSharedDir.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestFailureOfSharedDir.java
+@@ -17,6 +17,8 @@
+  */
+ package org.apache.hadoop.hdfs.server.namenode.ha;
+ 
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_RESOURCE_CHECK_INTERVAL_DEFAULT;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_RESOURCE_CHECK_INTERVAL_KEY;
+ import static org.junit.Assert.*;
+ 
+ import java.io.File;
+@@ -123,6 +125,7 @@ public class TestFailureOfSharedDir {
+   @Test
+   public void testFailureOfSharedDir() throws Exception {
+     Configuration conf = new Configuration();
++    conf.setLong(DFS_NAMENODE_RESOURCE_CHECK_INTERVAL_KEY, 2000);
+     
+     // The shared edits dir will automatically be marked required.
+     MiniDFSCluster cluster = null;
+@@ -147,6 +150,15 @@ public class TestFailureOfSharedDir {
+       assertEquals(0, FileUtil.chmod(sharedEditsDir.getAbsolutePath(), "-w",
+           true));
+ 
++      Thread.sleep(conf.getLong(DFS_NAMENODE_RESOURCE_CHECK_INTERVAL_KEY,
++          DFS_NAMENODE_RESOURCE_CHECK_INTERVAL_DEFAULT) * 2);
++
++      NameNode nn1 = cluster.getNameNode(1);
++      assertTrue(nn1.isStandbyState());
++      assertFalse(
++          "StandBy NameNode should not go to SafeMode on resource unavailability",
++          nn1.isInSafeMode());
++
+       NameNode nn0 = cluster.getNameNode(0);
+       try {
+         // Make sure that subsequent operations on the NN fail.
+-- 
+1.7.0.4
+

@@ -1,0 +1,203 @@
+From 953a806dd8561ee09c7f2f1c2497bf60c2cb93d3 Mon Sep 17 00:00:00 2001
+From: Aaron T. Myers <atm@cloudera.com>
+Date: Mon, 14 May 2012 10:44:43 -0700
+Subject: [PATCH 0044/1357] HDFS-3414. Balancer does not find NameNode if rpc-address or servicerpc-address are not set in client configs. Contributed by Aaron T. Myers.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/branch-2@1338277 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit dc14846c837ac8c49cd42afd6255cd965dd440e6)
+---
+ .../main/java/org/apache/hadoop/hdfs/DFSUtil.java  |   41 ++++++++++--
+ .../org/apache/hadoop/hdfs/MiniDFSCluster.java     |    7 ++
+ .../java/org/apache/hadoop/hdfs/TestDFSUtil.java   |   68 ++++++++++++++++----
+ 3 files changed, 99 insertions(+), 17 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSUtil.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSUtil.java
+index 493cd9d..cf4b2ad 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSUtil.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSUtil.java
+@@ -43,6 +43,7 @@ import org.apache.hadoop.HadoopIllegalArgumentException;
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.BlockLocation;
++import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hdfs.protocol.AlreadyBeingCreatedException;
+ import org.apache.hadoop.hdfs.protocol.ClientDatanodeProtocol;
+@@ -616,6 +617,14 @@ public class DFSUtil {
+   public static Collection<URI> getNameServiceUris(Configuration conf,
+       String... keys) {
+     Set<URI> ret = new HashSet<URI>();
++    
++    // We're passed multiple possible configuration keys for any given NN or HA
++    // nameservice, and search the config in order of these keys. In order to
++    // make sure that a later config lookup (e.g. fs.defaultFS) doesn't add a
++    // URI for a config key for which we've already found a preferred entry, we
++    // keep track of non-preferred keys here.
++    Set<URI> nonPreferredUris = new HashSet<URI>();
++    
+     for (String nsId : getNameServiceIds(conf)) {
+       if (HAUtil.isHAEnabled(conf, nsId)) {
+         // Add the logical URI of the nameservice.
+@@ -626,24 +635,46 @@ public class DFSUtil {
+         }
+       } else {
+         // Add the URI corresponding to the address of the NN.
++        boolean uriFound = false;
+         for (String key : keys) {
+           String addr = conf.get(concatSuffixes(key, nsId));
+           if (addr != null) {
+-            ret.add(createUri(HdfsConstants.HDFS_URI_SCHEME,
+-                NetUtils.createSocketAddr(addr)));
+-            break;
++            URI uri = createUri(HdfsConstants.HDFS_URI_SCHEME,
++                NetUtils.createSocketAddr(addr));
++            if (!uriFound) {
++              uriFound = true;
++              ret.add(uri);
++            } else {
++              nonPreferredUris.add(uri);
++            }
+           }
+         }
+       }
+     }
++    
+     // Add the generic configuration keys.
++    boolean uriFound = false;
+     for (String key : keys) {
+       String addr = conf.get(key);
+       if (addr != null) {
+-        ret.add(createUri("hdfs", NetUtils.createSocketAddr(addr)));
+-        break;
++        URI uri = createUri("hdfs", NetUtils.createSocketAddr(addr));
++        if (!uriFound) {
++          uriFound = true;
++          ret.add(uri);
++        } else {
++          nonPreferredUris.add(uri);
++        }
+       }
+     }
++    
++    // Add the default URI if it is an HDFS URI.
++    URI defaultUri = FileSystem.getDefaultUri(conf);
++    if (defaultUri != null &&
++        HdfsConstants.HDFS_URI_SCHEME.equals(defaultUri.getScheme()) &&
++        !nonPreferredUris.contains(defaultUri)) {
++      ret.add(defaultUri);
++    }
++    
+     return ret;
+   }
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/MiniDFSCluster.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/MiniDFSCluster.java
+index f0b71aa..cd1b431 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/MiniDFSCluster.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/MiniDFSCluster.java
+@@ -1253,6 +1253,13 @@ public class MiniDFSCluster {
+   public int getNameNodePort(int nnIndex) {
+     return nameNodes[nnIndex].nameNode.getNameNodeAddress().getPort();
+   }
++
++  /**
++   * @return the service rpc port used by the NameNode at the given index.
++   */     
++  public int getNameNodeServicePort(int nnIndex) {
++    return nameNodes[nnIndex].nameNode.getServiceRpcAddress().getPort();
++  }
+     
+   /**
+    * Shutdown all the nodes in the cluster.
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSUtil.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSUtil.java
+index 38aa1bf..1896877 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSUtil.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSUtil.java
+@@ -533,29 +533,73 @@ public class TestDFSUtil {
+   public void testGetNNUris() throws Exception {
+     HdfsConfiguration conf = new HdfsConfiguration();
+     
+-    final String NS1_NN1_HOST = "ns1-nn1.example.com:8020";
+-    final String NS1_NN2_HOST = "ns1-nn1.example.com:8020";
+-    final String NS2_NN_HOST  = "ns2-nn.example.com:8020";
+-    final String NN_HOST      = "nn.example.com:8020";
++    final String NS1_NN1_ADDR   = "ns1-nn1.example.com:8020";
++    final String NS1_NN2_ADDR   = "ns1-nn2.example.com:8020";
++    final String NS2_NN_ADDR    = "ns2-nn.example.com:8020";
++    final String NN1_ADDR       = "nn.example.com:8020";
++    final String NN1_SRVC_ADDR  = "nn.example.com:8021";
++    final String NN2_ADDR       = "nn2.example.com:8020";
+     
+     conf.set(DFS_FEDERATION_NAMESERVICES, "ns1,ns2");
+     conf.set(DFSUtil.addKeySuffixes(DFS_HA_NAMENODES_KEY_PREFIX, "ns1"),"nn1,nn2");
+     conf.set(DFSUtil.addKeySuffixes(
+-        DFS_NAMENODE_RPC_ADDRESS_KEY, "ns1", "nn1"), NS1_NN1_HOST);
++        DFS_NAMENODE_RPC_ADDRESS_KEY, "ns1", "nn1"), NS1_NN1_ADDR);
+     conf.set(DFSUtil.addKeySuffixes(
+-        DFS_NAMENODE_RPC_ADDRESS_KEY, "ns1", "nn2"), NS1_NN2_HOST);
++        DFS_NAMENODE_RPC_ADDRESS_KEY, "ns1", "nn2"), NS1_NN2_ADDR);
+     
+     conf.set(DFSUtil.addKeySuffixes(DFS_NAMENODE_SERVICE_RPC_ADDRESS_KEY, "ns2"),
+-        NS2_NN_HOST);
++        NS2_NN_ADDR);
++    
++    conf.set(DFS_NAMENODE_RPC_ADDRESS_KEY, "hdfs://" + NN1_ADDR);
++    
++    conf.set(CommonConfigurationKeys.FS_DEFAULT_NAME_KEY, "hdfs://" + NN2_ADDR);
++    
++    Collection<URI> uris = DFSUtil.getNameServiceUris(conf,
++        DFS_NAMENODE_SERVICE_RPC_ADDRESS_KEY,  DFS_NAMENODE_RPC_ADDRESS_KEY);
++    
++    assertEquals(4, uris.size());
++    assertTrue(uris.contains(new URI("hdfs://ns1")));
++    assertTrue(uris.contains(new URI("hdfs://" + NS2_NN_ADDR)));
++    assertTrue(uris.contains(new URI("hdfs://" + NN1_ADDR)));
++    assertTrue(uris.contains(new URI("hdfs://" + NN2_ADDR)));
+     
+-    conf.set(DFS_NAMENODE_RPC_ADDRESS_KEY, "hdfs://" + NN_HOST);
++    // Make sure that non-HDFS URIs in fs.defaultFS don't get included.
++    conf.set(CommonConfigurationKeys.FS_DEFAULT_NAME_KEY,
++        "viewfs://vfs-name.example.com");
+     
+-    Collection<URI> uris = DFSUtil.getNameServiceUris(conf, DFS_NAMENODE_RPC_ADDRESS_KEY, 
+-        DFS_NAMENODE_SERVICE_RPC_ADDRESS_KEY);
++    uris = DFSUtil.getNameServiceUris(conf, DFS_NAMENODE_SERVICE_RPC_ADDRESS_KEY, 
++        DFS_NAMENODE_RPC_ADDRESS_KEY);
+     
+     assertEquals(3, uris.size());
+     assertTrue(uris.contains(new URI("hdfs://ns1")));
+-    assertTrue(uris.contains(new URI("hdfs://" + NS2_NN_HOST)));
+-    assertTrue(uris.contains(new URI("hdfs://" + NN_HOST)));
++    assertTrue(uris.contains(new URI("hdfs://" + NS2_NN_ADDR)));
++    assertTrue(uris.contains(new URI("hdfs://" + NN1_ADDR)));
++    
++    // Make sure that an HA URI being the default URI doesn't result in multiple
++    // entries being returned.
++    conf.set(CommonConfigurationKeys.FS_DEFAULT_NAME_KEY, "hdfs://ns1");
++    
++    uris = DFSUtil.getNameServiceUris(conf, DFS_NAMENODE_SERVICE_RPC_ADDRESS_KEY, 
++        DFS_NAMENODE_RPC_ADDRESS_KEY);
++    
++    assertEquals(3, uris.size());
++    assertTrue(uris.contains(new URI("hdfs://ns1")));
++    assertTrue(uris.contains(new URI("hdfs://" + NS2_NN_ADDR)));
++    assertTrue(uris.contains(new URI("hdfs://" + NN1_ADDR)));
++    
++    // Make sure that when a service RPC address is used that is distinct from
++    // the client RPC address, and that client RPC address is also used as the
++    // default URI, that the client URI does not end up in the set of URIs
++    // returned.
++    conf = new HdfsConfiguration();
++    conf.set(CommonConfigurationKeys.FS_DEFAULT_NAME_KEY, "hdfs://" + NN1_ADDR);
++    conf.set(DFS_NAMENODE_RPC_ADDRESS_KEY, NN1_ADDR);
++    conf.set(DFS_NAMENODE_SERVICE_RPC_ADDRESS_KEY, NN1_SRVC_ADDR);
++    
++    uris = DFSUtil.getNameServiceUris(conf, DFS_NAMENODE_SERVICE_RPC_ADDRESS_KEY, 
++        DFS_NAMENODE_RPC_ADDRESS_KEY);
++    
++    assertEquals(1, uris.size());
++    assertTrue(uris.contains(new URI("hdfs://" + NN1_SRVC_ADDR)));
+   }
+ }
+-- 
+1.7.0.4
+

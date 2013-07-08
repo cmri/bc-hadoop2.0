@@ -1,0 +1,139 @@
+From d3f6accc2e7766e33c8a8429f2b15426485629ad Mon Sep 17 00:00:00 2001
+From: Eli Collins <eli@apache.org>
+Date: Sun, 7 Oct 2012 21:35:51 +0000
+Subject: [PATCH 0552/1357] HDFS-4006. TestCheckpoint#testSecondaryHasVeryOutOfDateImage occasionally fails due to unexpected exit. Contributed by Todd Lipcon
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1395387 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 6cc42eb36339ea963e89913c999e8a1422726134)
+---
+ .../hdfs/server/namenode/SecondaryNameNode.java    |   26 +++++++++++++++++--
+ .../hdfs/server/namenode/TestCheckpoint.java       |   24 ++++++++++++++++--
+ 2 files changed, 44 insertions(+), 6 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/SecondaryNameNode.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/SecondaryNameNode.java
+index 9a44b1e..9d0629c 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/SecondaryNameNode.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/SecondaryNameNode.java
+@@ -78,6 +78,7 @@ import org.apache.hadoop.util.StringUtils;
+ import org.apache.hadoop.util.Time;
+ 
+ import com.google.common.annotations.VisibleForTesting;
++import com.google.common.base.Preconditions;
+ import com.google.common.collect.ImmutableList;
+ 
+ /**********************************************************
+@@ -122,6 +123,8 @@ public class SecondaryNameNode implements Runnable {
+   private CheckpointConf checkpointConf;
+   private FSNamesystem namesystem;
+ 
++  private Thread checkpointThread;
++
+ 
+   @Override
+   public String toString() {
+@@ -277,6 +280,15 @@ public class SecondaryNameNode implements Runnable {
+    */
+   public void shutdown() {
+     shouldRun = false;
++    if (checkpointThread != null) {
++      checkpointThread.interrupt();
++      try {
++        checkpointThread.join(10000);
++      } catch (InterruptedException e) {
++        LOG.info("Interrupted waiting to join on checkpointer thread");
++        Thread.currentThread().interrupt(); // maintain status
++      }
++    }
+     try {
+       if (infoServer != null) infoServer.stop();
+     } catch (Exception e) {
+@@ -586,12 +598,20 @@ public class SecondaryNameNode implements Runnable {
+       terminate(ret);
+     }
+ 
+-    // Create a never ending deamon
+-    Daemon checkpointThread = new Daemon(secondary);
+-    checkpointThread.start();
++    secondary.startCheckpointThread();
+   }
+   
+   
++  public void startCheckpointThread() {
++    Preconditions.checkState(checkpointThread == null,
++        "Should not already have a thread");
++    Preconditions.checkState(shouldRun, "shouldRun should be true");
++    
++    checkpointThread = new Daemon(this);
++    checkpointThread.start();
++  }
++
++
+   /**
+    * Container for parsed command-line options.
+    */
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestCheckpoint.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestCheckpoint.java
+index 58fbfec..6d9f159 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestCheckpoint.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestCheckpoint.java
+@@ -31,6 +31,8 @@ import java.io.File;
+ import java.io.FilenameFilter;
+ import java.io.IOException;
+ import java.lang.management.ManagementFactory;
++import java.lang.management.ThreadInfo;
++import java.lang.management.ThreadMXBean;
+ import java.net.InetSocketAddress;
+ import java.net.URI;
+ import java.util.ArrayList;
+@@ -76,6 +78,7 @@ import org.apache.hadoop.test.GenericTestUtils.DelayAnswer;
+ import org.apache.hadoop.test.GenericTestUtils.LogCapturer;
+ import org.apache.hadoop.util.StringUtils;
+ import org.apache.log4j.Level;
++import org.junit.After;
+ import org.junit.Before;
+ import org.junit.Test;
+ import org.mockito.ArgumentMatcher;
+@@ -130,6 +133,22 @@ public class TestCheckpoint {
+   }
+   
+   
++  @After
++  public void checkForSNNThreads() {
++    ThreadMXBean threadBean = ManagementFactory.getThreadMXBean();
++    
++    ThreadInfo[] infos = threadBean.getThreadInfo(threadBean.getAllThreadIds(), 20);
++    for (ThreadInfo info : infos) {
++      if (info == null) continue;
++      LOG.info("Check thread: " + info.getThreadName());
++      if (info.getThreadName().contains("SecondaryNameNode")) {
++        fail("Leaked thread: " + info + "\n" +
++            Joiner.on("\n").join(info.getStackTrace()));
++      }
++    }
++    LOG.info("--------");
++  }
++  
+   static void checkFile(FileSystem fileSys, Path name, int repl)
+     throws IOException {
+     assertTrue(fileSys.exists(name));
+@@ -1746,7 +1765,7 @@ public class TestCheckpoint {
+   /**
+    * Test that the 2NN triggers a checkpoint after the configurable interval
+    */
+-  @Test
++  @Test(timeout=30000)
+   public void testCheckpointTriggerOnTxnCount() throws Exception {
+     MiniDFSCluster cluster = null;
+     SecondaryNameNode secondary = null;
+@@ -1760,8 +1779,7 @@ public class TestCheckpoint {
+           .format(true).build();
+       FileSystem fs = cluster.getFileSystem();
+       secondary = startSecondaryNameNode(conf);
+-      Thread t = new Thread(secondary);
+-      t.start();
++      secondary.startCheckpointThread();
+       final NNStorage storage = secondary.getFSImage().getStorage();
+ 
+       // 2NN should checkpoint at startup
+-- 
+1.7.0.4
+

@@ -1,0 +1,182 @@
+From 519a2db9e28c8dfe6faa6c946cf6cad9c1db6066 Mon Sep 17 00:00:00 2001
+From: Todd Lipcon <todd@apache.org>
+Date: Wed, 5 Dec 2012 21:14:01 +0000
+Subject: [PATCH 0617/1357] HADOOP-9103. UTF8 class does not properly decode Unicode characters outside the basic multilingual plane. Contributed by Todd Lipcon.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/branch-2@1417650 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 14b90808043dcc91f9c8a093d2947701b034cbf3)
+---
+ .../src/main/java/org/apache/hadoop/io/UTF8.java   |   51 +++++++++++++++++-
+ .../test/java/org/apache/hadoop/io/TestUTF8.java   |   56 +++++++++++++++++++-
+ 2 files changed, 104 insertions(+), 3 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/UTF8.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/UTF8.java
+index 6a0f886..4a98465 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/UTF8.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/UTF8.java
+@@ -22,6 +22,7 @@ import java.io.IOException;
+ import java.io.DataInput;
+ import java.io.DataOutput;
+ 
++import org.apache.hadoop.util.StringUtils;
+ 
+ import org.apache.commons.logging.*;
+ import org.apache.hadoop.classification.InterfaceAudience;
+@@ -31,6 +32,9 @@ import org.apache.hadoop.classification.InterfaceStability;
+  * 
+  * <p>Also includes utilities for efficiently reading and writing UTF-8.
+  *
++ * Note that this decodes UTF-8 but actually encodes CESU-8, a variant of
++ * UTF-8: see http://en.wikipedia.org/wiki/CESU-8
++ *
+  * @deprecated replaced by Text
+  */
+ @Deprecated
+@@ -207,6 +211,19 @@ public class UTF8 implements WritableComparable<UTF8> {
+     return result;
+   }
+ 
++  /**
++   * Convert a UTF-8 encoded byte array back into a string.
++   *
++   * @throws IOException if the byte array is invalid UTF8
++   */
++  public static String fromBytes(byte[] bytes) throws IOException {
++    DataInputBuffer dbuf = new DataInputBuffer();
++    dbuf.reset(bytes, 0, bytes.length);
++    StringBuilder buf = new StringBuilder(bytes.length);
++    readChars(dbuf, buf, bytes.length);
++    return buf.toString();
++  }
++
+   /** Read a UTF-8 encoded string.
+    *
+    * @see DataInput#readUTF()
+@@ -228,18 +245,48 @@ public class UTF8 implements WritableComparable<UTF8> {
+     while (i < nBytes) {
+       byte b = bytes[i++];
+       if ((b & 0x80) == 0) {
++        // 0b0xxxxxxx: 1-byte sequence
+         buffer.append((char)(b & 0x7F));
+-      } else if ((b & 0xE0) != 0xE0) {
++      } else if ((b & 0xE0) == 0xC0) {
++        // 0b110xxxxx: 2-byte sequence
+         buffer.append((char)(((b & 0x1F) << 6)
+             | (bytes[i++] & 0x3F)));
+-      } else {
++      } else if ((b & 0xF0) == 0xE0) {
++        // 0b1110xxxx: 3-byte sequence
+         buffer.append((char)(((b & 0x0F) << 12)
+             | ((bytes[i++] & 0x3F) << 6)
+             |  (bytes[i++] & 0x3F)));
++      } else if ((b & 0xF8) == 0xF0) {
++        // 0b11110xxx: 4-byte sequence
++        int codepoint =
++            ((b & 0x07) << 18)
++          | ((bytes[i++] & 0x3F) <<  12)
++          | ((bytes[i++] & 0x3F) <<  6)
++          | ((bytes[i++] & 0x3F));
++        buffer.append(highSurrogate(codepoint))
++              .append(lowSurrogate(codepoint));
++      } else {
++        // The UTF8 standard describes 5-byte and 6-byte sequences, but
++        // these are no longer allowed as of 2003 (see RFC 3629)
++
++        // Only show the next 6 bytes max in the error code - in case the
++        // buffer is large, this will prevent an exceedingly large message.
++        int endForError = Math.min(i + 5, nBytes);
++        throw new IOException("Invalid UTF8 at " +
++          StringUtils.byteToHexString(bytes, i - 1, endForError));
+       }
+     }
+   }
+ 
++  private static char highSurrogate(int codePoint) {
++    return (char) ((codePoint >>> 10)
++        + (Character.MIN_HIGH_SURROGATE - (Character.MIN_SUPPLEMENTARY_CODE_POINT >>> 10)));
++  }
++
++  private static char lowSurrogate(int codePoint) {
++    return (char) ((codePoint & 0x3ff) + Character.MIN_LOW_SURROGATE);
++  }
++
+   /** Write a UTF-8 encoded string.
+    *
+    * @see DataOutput#writeUTF(String)
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/TestUTF8.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/TestUTF8.java
+index 5c068a1..902f215 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/TestUTF8.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/TestUTF8.java
+@@ -19,8 +19,12 @@
+ package org.apache.hadoop.io;
+ 
+ import junit.framework.TestCase;
++import java.io.IOException;
+ import java.util.Random;
+ 
++import org.apache.hadoop.test.GenericTestUtils;
++import org.apache.hadoop.util.StringUtils;
++
+ /** Unit tests for UTF8. */
+ @SuppressWarnings("deprecation")
+ public class TestUTF8 extends TestCase {
+@@ -92,5 +96,55 @@ public class TestUTF8 extends TestCase {
+ 
+     assertEquals(s, new String(dob.getData(), 2, dob.getLength()-2, "UTF-8"));
+   }
+-	
++
++  /**
++   * Test encoding and decoding of UTF8 outside the basic multilingual plane.
++   *
++   * This is a regression test for HADOOP-9103.
++   */
++  public void testNonBasicMultilingualPlane() throws Exception {
++    // Test using the "CAT FACE" character (U+1F431)
++    // See http://www.fileformat.info/info/unicode/char/1f431/index.htm
++    String catFace = "\uD83D\uDC31";
++
++    // This encodes to 4 bytes in UTF-8:
++    byte[] encoded = catFace.getBytes("UTF-8");
++    assertEquals(4, encoded.length);
++    assertEquals("f09f90b1", StringUtils.byteToHexString(encoded));
++
++    // Decode back to String using our own decoder
++    String roundTrip = UTF8.fromBytes(encoded);
++    assertEquals(catFace, roundTrip);
++  }
++
++  /**
++   * Test that decoding invalid UTF8 throws an appropriate error message.
++   */
++  public void testInvalidUTF8() throws Exception {
++    byte[] invalid = new byte[] {
++        0x01, 0x02, (byte)0xff, (byte)0xff, 0x01, 0x02, 0x03, 0x04, 0x05 };
++    try {
++      UTF8.fromBytes(invalid);
++      fail("did not throw an exception");
++    } catch (IOException ioe) {
++      GenericTestUtils.assertExceptionContains(
++          "Invalid UTF8 at ffff01020304", ioe);
++    }
++  }
++
++  /**
++   * Test for a 5-byte UTF8 sequence, which is now considered illegal.
++   */
++  public void test5ByteUtf8Sequence() throws Exception {
++    byte[] invalid = new byte[] {
++        0x01, 0x02, (byte)0xf8, (byte)0x88, (byte)0x80,
++        (byte)0x80, (byte)0x80, 0x04, 0x05 };
++    try {
++      UTF8.fromBytes(invalid);
++      fail("did not throw an exception");
++    } catch (IOException ioe) {
++      GenericTestUtils.assertExceptionContains(
++          "Invalid UTF8 at f88880808004", ioe);
++    }
++  }
+ }
+-- 
+1.7.0.4
+

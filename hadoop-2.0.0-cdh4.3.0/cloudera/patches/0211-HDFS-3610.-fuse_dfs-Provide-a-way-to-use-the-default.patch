@@ -1,0 +1,385 @@
+From a51f19c761eb145bbea71171b32e8d5dc454d2ea Mon Sep 17 00:00:00 2001
+From: Eli Collins <eli@apache.org>
+Date: Sat, 14 Jul 2012 17:19:26 +0000
+Subject: [PATCH 0211/1357] HDFS-3610. fuse_dfs: Provide a way to use the default (configured) NN URI. Contributed by Colin Patrick McCabe
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/branch-2@1361566 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit e5b8f22049a28dfc688e1f6962e4db7a5a22bd8d)
+---
+ .../src/contrib/fuse-dfs/src/fuse_connect.c        |    8 +++--
+ .../src/contrib/fuse-dfs/src/fuse_connect.h        |    2 +-
+ .../src/contrib/fuse-dfs/src/fuse_context_handle.h |    2 +-
+ .../src/contrib/fuse-dfs/src/fuse_dfs.c            |    4 +-
+ .../src/contrib/fuse-dfs/src/fuse_impls_chmod.c    |    2 +-
+ .../src/contrib/fuse-dfs/src/fuse_impls_chown.c    |    2 +-
+ .../src/contrib/fuse-dfs/src/fuse_impls_getattr.c  |    4 +-
+ .../src/contrib/fuse-dfs/src/fuse_impls_mkdir.c    |    2 +-
+ .../src/contrib/fuse-dfs/src/fuse_impls_open.c     |    2 +-
+ .../src/contrib/fuse-dfs/src/fuse_impls_readdir.c  |    2 +-
+ .../src/contrib/fuse-dfs/src/fuse_impls_rename.c   |    2 +-
+ .../src/contrib/fuse-dfs/src/fuse_impls_rmdir.c    |    2 +-
+ .../src/contrib/fuse-dfs/src/fuse_impls_statfs.c   |    2 +-
+ .../src/contrib/fuse-dfs/src/fuse_impls_truncate.c |    2 +-
+ .../src/contrib/fuse-dfs/src/fuse_impls_unlink.c   |    2 +-
+ .../src/contrib/fuse-dfs/src/fuse_impls_utimens.c  |    2 +-
+ .../src/contrib/fuse-dfs/src/fuse_init.c           |    6 ++--
+ .../src/contrib/fuse-dfs/src/fuse_options.c        |   34 ++++++++++++++------
+ .../src/contrib/fuse-dfs/src/fuse_options.h        |    4 +-
+ 19 files changed, 51 insertions(+), 35 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_connect.c b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_connect.c
+index 2b3a38f..bfb7a1e 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_connect.c
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_connect.c
+@@ -172,7 +172,7 @@ done:
+  * Connect to the NN as the current user/group.
+  * Returns a fs handle on success, or NULL on failure.
+  */
+-hdfsFS doConnectAsUser(const char *hostname, int port) {
++hdfsFS doConnectAsUser(const char *nn_uri, int nn_port) {
+   struct hdfsBuilder *bld;
+   uid_t uid = fuse_get_context()->uid;
+   char *user = getUsername(uid);
+@@ -202,8 +202,10 @@ hdfsFS doConnectAsUser(const char *hostname, int port) {
+       goto done;
+     }
+     hdfsBuilderSetForceNewInstance(bld);
+-    hdfsBuilderSetNameNode(bld, hostname);
+-    hdfsBuilderSetNameNodePort(bld, port);
++    hdfsBuilderSetNameNode(bld, nn_uri);
++    if (nn_port) {
++        hdfsBuilderSetNameNodePort(bld, nn_port);
++    }
+     hdfsBuilderSetUserName(bld, user);
+     if (hdfsAuthConf == AUTH_CONF_KERBEROS) {
+       findKerbTicketCachePath(kpath, sizeof(kpath));
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_connect.h b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_connect.h
+index 23450a5..4bddeea 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_connect.h
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_connect.h
+@@ -21,7 +21,7 @@
+ 
+ #include "fuse_dfs.h"
+ 
+-hdfsFS doConnectAsUser(const char *hostname, int port);
++hdfsFS doConnectAsUser(const char *nn_uri, int nn_port);
+ int doDisconnect(hdfsFS fs);
+ int allocFsTable(void);
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_context_handle.h b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_context_handle.h
+index 3e47a1e..ae07735 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_context_handle.h
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_context_handle.h
+@@ -31,7 +31,7 @@
+ //
+ typedef struct dfs_context_struct {
+   int debug;
+-  char *nn_hostname;
++  char *nn_uri;
+   int nn_port;
+   int read_only;
+   int usetrash;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_dfs.c b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_dfs.c
+index 9cb9075..e218c81 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_dfs.c
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_dfs.c
+@@ -101,14 +101,14 @@ int main(int argc, char *argv[])
+     fuse_opt_add_arg(&args, buf);
+   }
+ 
+-  if (options.server == NULL || options.port == 0) {
++  if (options.nn_uri == NULL) {
+     print_usage(argv[0]);
+     exit(0);
+   }
+ 
+   // Check connection as root
+   if (options.initchecks == 1) {
+-    hdfsFS tempFS = hdfsConnectAsUser(options.server, options.port, "root");
++    hdfsFS tempFS = hdfsConnectAsUser(options.nn_uri, options.nn_port, "root");
+     if (NULL == tempFS) {
+       const char *cp = getenv("CLASSPATH");
+       const char *ld = getenv("LD_LIBRARY_PATH");
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_chmod.c b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_chmod.c
+index dbf39a7..2c1e96b 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_chmod.c
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_chmod.c
+@@ -31,7 +31,7 @@ int dfs_chmod(const char *path, mode_t mode)
+   assert(dfs);
+   assert('/' == *path);
+ 
+-  hdfsFS userFS = doConnectAsUser(dfs->nn_hostname, dfs->nn_port);
++  hdfsFS userFS = doConnectAsUser(dfs->nn_uri, dfs->nn_port);
+   if (userFS == NULL) {
+     ERROR("Could not connect to HDFS");
+     ret = -EIO;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_chown.c b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_chown.c
+index c0b5bfb..9c6105d 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_chown.c
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_chown.c
+@@ -54,7 +54,7 @@ int dfs_chown(const char *path, uid_t uid, gid_t gid)
+     goto cleanup;
+   } 
+ 
+-  userFS = doConnectAsUser(dfs->nn_hostname, dfs->nn_port);
++  userFS = doConnectAsUser(dfs->nn_uri, dfs->nn_port);
+   if (userFS == NULL) {
+     ERROR("Could not connect to HDFS");
+     ret = -EIO;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_getattr.c b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_getattr.c
+index b0fbd7e..56f634e 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_getattr.c
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_getattr.c
+@@ -31,9 +31,9 @@ int dfs_getattr(const char *path, struct stat *st)
+   assert(path);
+   assert(st);
+ 
+-  hdfsFS fs = doConnectAsUser(dfs->nn_hostname,dfs->nn_port);
++  hdfsFS fs = doConnectAsUser(dfs->nn_uri, dfs->nn_port);
+   if (NULL == fs) {
+-    ERROR("Could not connect to %s:%d", dfs->nn_hostname, dfs->nn_port);
++    ERROR("Could not connect to %s:%d", dfs->nn_uri, dfs->nn_port);
+     return -EIO;
+   }
+ 
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_mkdir.c b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_mkdir.c
+index 558557d..d0624af 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_mkdir.c
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_mkdir.c
+@@ -41,7 +41,7 @@ int dfs_mkdir(const char *path, mode_t mode)
+     return -EACCES;
+   }
+   
+-  hdfsFS userFS = doConnectAsUser(dfs->nn_hostname, dfs->nn_port);
++  hdfsFS userFS = doConnectAsUser(dfs->nn_uri, dfs->nn_port);
+   if (userFS == NULL) {
+     ERROR("Could not connect");
+     return -EIO;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_open.c b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_open.c
+index f7d0ed5..071590a 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_open.c
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_open.c
+@@ -45,7 +45,7 @@ int dfs_open(const char *path, struct fuse_file_info *fi)
+     return -EIO;
+   }
+ 
+-  fh->fs = doConnectAsUser(dfs->nn_hostname, dfs->nn_port);
++  fh->fs = doConnectAsUser(dfs->nn_uri, dfs->nn_port);
+   if (fh->fs == NULL) {
+     ERROR("Could not connect to dfs");
+     return -EIO;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_readdir.c b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_readdir.c
+index c8d1c0b..f6fe48b 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_readdir.c
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_readdir.c
+@@ -31,7 +31,7 @@ int dfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
+   assert(path);
+   assert(buf);
+ 
+-  hdfsFS userFS = doConnectAsUser(dfs->nn_hostname, dfs->nn_port);
++  hdfsFS userFS = doConnectAsUser(dfs->nn_uri, dfs->nn_port);
+   if (userFS == NULL) {
+     ERROR("Could not connect");
+     return -EIO;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_rename.c b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_rename.c
+index 96ac082..bbb0462 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_rename.c
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_rename.c
+@@ -46,7 +46,7 @@ int dfs_rename(const char *from, const char *to)
+     return -EACCES;
+   }
+ 
+-  hdfsFS userFS = doConnectAsUser(dfs->nn_hostname, dfs->nn_port);
++  hdfsFS userFS = doConnectAsUser(dfs->nn_uri, dfs->nn_port);
+   if (userFS == NULL) {
+     ERROR("Could not connect");
+     return -EIO;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_rmdir.c b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_rmdir.c
+index 57127ce..259040f 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_rmdir.c
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_rmdir.c
+@@ -43,7 +43,7 @@ int dfs_rmdir(const char *path)
+     return -EACCES;
+   }
+ 
+-  hdfsFS userFS = doConnectAsUser(dfs->nn_hostname, dfs->nn_port);
++  hdfsFS userFS = doConnectAsUser(dfs->nn_uri, dfs->nn_port);
+   if (userFS == NULL) {
+     ERROR("Could not connect");
+     return -EIO;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_statfs.c b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_statfs.c
+index 476ffe3..c7004a9 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_statfs.c
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_statfs.c
+@@ -33,7 +33,7 @@ int dfs_statfs(const char *path, struct statvfs *st)
+ 
+   memset(st,0,sizeof(struct statvfs));
+ 
+-  hdfsFS userFS = doConnectAsUser(dfs->nn_hostname, dfs->nn_port);
++  hdfsFS userFS = doConnectAsUser(dfs->nn_uri, dfs->nn_port);
+   if (userFS == NULL) {
+     ERROR("Could not connect");
+     return -EIO;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_truncate.c b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_truncate.c
+index 7357b4c..d09b0c8 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_truncate.c
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_truncate.c
+@@ -45,7 +45,7 @@ int dfs_truncate(const char *path, off_t size)
+     return ret;
+   }
+ 
+-  hdfsFS userFS = doConnectAsUser(dfs->nn_hostname, dfs->nn_port);
++  hdfsFS userFS = doConnectAsUser(dfs->nn_uri, dfs->nn_port);
+   if (userFS == NULL) {
+     ERROR("Could not connect");
+     ret = -EIO;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_unlink.c b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_unlink.c
+index 54058b4..a3d2034 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_unlink.c
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_unlink.c
+@@ -43,7 +43,7 @@ int dfs_unlink(const char *path)
+     return -EACCES;
+   }
+ 
+-  hdfsFS userFS = doConnectAsUser(dfs->nn_hostname, dfs->nn_port);
++  hdfsFS userFS = doConnectAsUser(dfs->nn_uri, dfs->nn_port);
+   if (userFS == NULL) {
+     ERROR("Could not connect");
+     return -EIO;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_utimens.c b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_utimens.c
+index 24df6b8..f9144f8 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_utimens.c
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_impls_utimens.c
+@@ -33,7 +33,7 @@ int dfs_utimens(const char *path, const struct timespec ts[2])
+   time_t aTime = ts[0].tv_sec;
+   time_t mTime = ts[1].tv_sec;
+ 
+-  hdfsFS userFS = doConnectAsUser(dfs->nn_hostname, dfs->nn_port);
++  hdfsFS userFS = doConnectAsUser(dfs->nn_uri, dfs->nn_port);
+   if (userFS == NULL) {
+     ERROR("Could not connect");
+     return -EIO;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_init.c b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_init.c
+index 878b6f6..6c1c0d0 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_init.c
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_init.c
+@@ -92,15 +92,15 @@ void *dfs_init(void) {
+ 
+   // initialize the context
+   dfs->debug                 = options.debug;
+-  dfs->nn_hostname           = options.server;
+-  dfs->nn_port               = options.port;
++  dfs->nn_uri                = options.nn_uri;
++  dfs->nn_port               = options.nn_port;
+   dfs->read_only             = options.read_only;
+   dfs->usetrash              = options.usetrash;
+   dfs->protectedpaths        = NULL;
+   dfs->rdbuffer_size         = options.rdbuffer_size;
+   dfs->direct_io             = options.direct_io;
+ 
+-  INFO("Mounting %s:%d", dfs->nn_hostname, dfs->nn_port);
++  INFO("Mounting.  nn_uri=%s, nn_port=%d", dfs->nn_uri, dfs->nn_port);
+ 
+   init_protectedpaths(dfs);
+   assert(dfs->protectedpaths != NULL);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_options.c b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_options.c
+index 30c0399..3582974 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_options.c
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_options.c
+@@ -23,6 +23,9 @@
+ #include <getopt.h>
+ #include <stdlib.h>
+ 
++#define OLD_HDFS_URI_LOCATION "dfs://"
++#define NEW_HDFS_URI_LOCATION "hdfs://"
++
+ void print_options() {
+   printf("options:\n"
+ 	 "\tprotected=%s\n"
+@@ -35,7 +38,7 @@ void print_options() {
+ 	 "\tattribute_timeout=%d\n"
+ 	 "\tprivate=%d\n"
+ 	 "\trdbuffer_size=%d (KBs)\n", 
+-	 options.protected, options.server, options.port, options.debug,
++	 options.protected, options.nn_uri, options.nn_port, options.debug,
+ 	 options.read_only, options.usetrash, options.entry_timeout, 
+ 	 options.attribute_timeout, options.private, 
+ 	 (int)options.rdbuffer_size / 1024);
+@@ -78,11 +81,11 @@ enum
+ 
+ struct fuse_opt dfs_opts[] =
+   {
+-    DFSFS_OPT_KEY("server=%s", server, 0),
++    DFSFS_OPT_KEY("server=%s", nn_uri, 0),
+     DFSFS_OPT_KEY("entry_timeout=%d", entry_timeout, 0),
+     DFSFS_OPT_KEY("attribute_timeout=%d", attribute_timeout, 0),
+     DFSFS_OPT_KEY("protected=%s", protected, 0),
+-    DFSFS_OPT_KEY("port=%d", port, 0),
++    DFSFS_OPT_KEY("port=%d", nn_port, 0),
+     DFSFS_OPT_KEY("rdbuffer=%d", rdbuffer_size,0),
+ 
+     FUSE_OPT_KEY("private", KEY_PRIVATE),
+@@ -105,6 +108,7 @@ struct fuse_opt dfs_opts[] =
+ int dfs_options(void *data, const char *arg, int key,  struct fuse_args *outargs)
+ {
+   (void) data;
++  int nn_uri_len;
+ 
+   switch (key) {
+   case FUSE_OPT_KEY_OPT:
+@@ -150,11 +154,8 @@ int dfs_options(void *data, const char *arg, int key,  struct fuse_args *outargs
+ #endif
+     break;
+   default: {
+-    // try and see if the arg is a URI for DFS
+-    int tmp_port;
+-    char tmp_server[1024];
+-
+-    if (!sscanf(arg,"dfs://%1024[a-zA-Z0-9_.-]:%d",tmp_server,&tmp_port)) {
++    // try and see if the arg is a URI
++    if (!strstr(arg, "://")) {
+       if (strcmp(arg,"ro") == 0) {
+         options.read_only = 1;
+       } else if (strcmp(arg,"rw") == 0) {
+@@ -165,8 +166,21 @@ int dfs_options(void *data, const char *arg, int key,  struct fuse_args *outargs
+         return 0;
+       }
+     } else {
+-      options.port = tmp_port;
+-      options.server = strdup(tmp_server);
++      if (options.nn_uri) {
++        INFO("Ignoring option %s because '-server' was already "
++          "specified!", arg);
++        return 1;
++      }
++      if (strstr(arg, OLD_HDFS_URI_LOCATION) == arg) {
++        // For historical reasons, we let people refer to hdfs:// as dfs://
++        nn_uri_len = strlen(NEW_HDFS_URI_LOCATION) + 
++                strlen(arg + strlen(OLD_HDFS_URI_LOCATION)) + 1;
++        options.nn_uri = malloc(nn_uri_len);
++        snprintf(options.nn_uri, nn_uri_len, "%s%s", NEW_HDFS_URI_LOCATION, 
++              arg + strlen(OLD_HDFS_URI_LOCATION));
++      } else {
++        options.nn_uri = strdup(arg);
++      }
+     }
+   }
+   }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_options.h b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_options.h
+index b34d179..4bfc235 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_options.h
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/fuse-dfs/src/fuse_options.h
+@@ -22,8 +22,8 @@
+ /** options for fuse_opt.h */
+ struct options {
+   char* protected;
+-  char* server;
+-  int port;
++  char* nn_uri;
++  int nn_port;
+   int debug;
+   int read_only;
+   int initchecks;
+-- 
+1.7.0.4
+

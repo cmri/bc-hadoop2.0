@@ -1,0 +1,136 @@
+From 6ff4d996113fdf291b6cc04aa5e07b9bdf700b7e Mon Sep 17 00:00:00 2001
+From: Tom White <tom@cloudera.com>
+Date: Fri, 3 Aug 2012 15:15:51 -0400
+Subject: [PATCH 1170/1357] MR1: MAPREDUCE-4487. Reduce job latency by removing hardcoded sleep statements.
+
+Reason: Performance
+Author: Tom White
+Ref: CDH-6839
+---
+ src/mapred/org/apache/hadoop/mapred/Child.java     |   16 +++++------
+ .../org/apache/hadoop/mapred/ReduceTask.java       |   28 +++++++++++++------
+ 2 files changed, 26 insertions(+), 18 deletions(-)
+
+diff --git a/src/mapred/org/apache/hadoop/mapred/Child.java b/src/mapred/org/apache/hadoop/mapred/Child.java
+index 78f8ee6..062c7b4 100644
+--- a/src/mapred/org/apache/hadoop/mapred/Child.java
++++ b/src/mapred/org/apache/hadoop/mapred/Child.java
+@@ -91,7 +91,8 @@ class Child {
+     final InetSocketAddress address = new InetSocketAddress(host, port);
+     final TaskAttemptID firstTaskid = TaskAttemptID.forName(args[2]);
+     final String logLocation = args[3];
+-    final int SLEEP_LONGER_COUNT = 5;
++    final int minIdleSleepTimeMillis = 10;
++    final int maxIdleSleepTimeMillis = 1500;
+     int jvmIdInt = Integer.parseInt(args[4]);
+     JVMId jvmId = new JVMId(firstTaskid.getJobID(),firstTaskid.isMap(),jvmIdInt);
+     
+@@ -174,7 +175,7 @@ class Child {
+       pid = System.getenv().get("JVM_PID");
+     }
+     JvmContext context = new JvmContext(jvmId, pid);
+-    int idleLoopCount = 0;
++    int idleSleepTime = minIdleSleepTimeMillis;
+     Task task = null;
+     
+     UserGroupInformation childUGI = null;
+@@ -193,17 +194,14 @@ class Child {
+             taskid = null;
+             currentJobSegmented = true;
+ 
+-            if (++idleLoopCount >= SLEEP_LONGER_COUNT) {
+-              //we sleep for a bigger interval when we don't receive
+-              //tasks for a while
+-              Thread.sleep(1500);
+-            } else {
+-              Thread.sleep(500);
++            Thread.sleep(idleSleepTime);
++            if (idleSleepTime * 2 <= maxIdleSleepTimeMillis) {
++              idleSleepTime = idleSleepTime * 2;
+             }
+             continue;
+           }
+         }
+-        idleLoopCount = 0;
++        idleSleepTime = minIdleSleepTimeMillis;
+         task = myTask.getTask();
+         task.setJvmContext(jvmContext);
+         taskid = task.getTaskID();
+diff --git a/src/mapred/org/apache/hadoop/mapred/ReduceTask.java b/src/mapred/org/apache/hadoop/mapred/ReduceTask.java
+index 5788ce5..bb5739f 100644
+--- a/src/mapred/org/apache/hadoop/mapred/ReduceTask.java
++++ b/src/mapred/org/apache/hadoop/mapred/ReduceTask.java
+@@ -684,11 +684,6 @@ class ReduceTask extends Task {
+      * A flag to indicate when to exit localFS merge
+      */
+     private volatile boolean exitLocalFSMerge = false;
+-
+-    /** 
+-     * A flag to indicate when to exit getMapEvents thread 
+-     */
+-    private volatile boolean exitGetMapEvents = false;
+     
+     /**
+      * When we accumulate maxInMemOutputs number of files in ram, we merge/spill
+@@ -2133,7 +2128,9 @@ class ReduceTask extends Task {
+               // we should indicate progress as we don't want TT to think
+               // we're stuck and kill us
+               reporter.progress();
+-              Thread.sleep(5000);
++              synchronized (copyResultsOrNewEventsLock) {
++                copyResultsOrNewEventsLock.wait(5000);
++              }
+             }
+           } catch (InterruptedException e) { } // IGNORE
+           
+@@ -2271,9 +2268,8 @@ class ReduceTask extends Task {
+         }
+         
+         // all done, inform the copiers to exit
+-        exitGetMapEvents= true;
+         try {
+-          getMapEventsThread.join();
++          getMapEventsThread.terminate();
+           LOG.info("getMapsEventsThread joined.");
+         } catch (InterruptedException ie) {
+           LOG.info("getMapsEventsThread threw an exception: " +
+@@ -2775,6 +2771,10 @@ class ReduceTask extends Task {
+ 
+     private class GetMapEventsThread extends Thread {
+       
++      /** 
++       * A flag to indicate when to exit getMapEvents thread 
++       */
++      private volatile boolean exitGetMapEvents = false;
+       private IntWritable fromEventId = new IntWritable(0);
+       private static final long SLEEP_TIME = 1000;
+       
+@@ -2803,7 +2803,9 @@ class ReduceTask extends Task {
+                     "Got " + numNewMaps + " new map-outputs"); 
+               }
+             }
+-            Thread.sleep(SLEEP_TIME);
++            synchronized(this) {
++              wait(SLEEP_TIME);
++            }
+           } 
+           catch (InterruptedException e) {
+             LOG.warn(reduceTask.getTaskID() +
+@@ -2823,6 +2825,14 @@ class ReduceTask extends Task {
+       
+       }
+       
++      public void terminate() throws InterruptedException {
++        exitGetMapEvents = true;
++        synchronized(this) {
++          notifyAll();
++        }
++        join();
++      }
++      
+       /** 
+        * Queries the {@link TaskTracker} for a set of map-completion events 
+        * from a given event ID.
+-- 
+1.7.0.4
+

@@ -1,0 +1,248 @@
+From b90a5c50074a0d75df708d4ce3d224676045bc95 Mon Sep 17 00:00:00 2001
+From: Alejandro Abdelnur <tucu@apache.org>
+Date: Wed, 15 Aug 2012 23:15:09 +0000
+Subject: [PATCH 1172/1357] MR1: MAPREDUCE-4511. Add IFile readahead (ahmed via tucu)
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/branch-1@1373672 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 1ca5374b8eec25feef38bd5f29308f8ef70f287a)
+---
+ src/mapred/mapred-default.xml                      |   16 ++++-
+ src/mapred/org/apache/hadoop/mapred/IFile.java     |    2 +-
+ .../org/apache/hadoop/mapred/IFileInputStream.java |   80 +++++++++++++++++++-
+ .../org/apache/hadoop/mapred/ReduceTask.java       |    2 +-
+ .../org/apache/hadoop/mapred/TestIFileStreams.java |    7 +-
+ 5 files changed, 97 insertions(+), 10 deletions(-)
+
+diff --git a/src/mapred/mapred-default.xml b/src/mapred/mapred-default.xml
+index b4b57fc..7ebdcc2 100644
+--- a/src/mapred/mapred-default.xml
++++ b/src/mapred/mapred-default.xml
+@@ -984,7 +984,21 @@
+     acceptable.
+     </description>
+   </property>
+-  
++
++  <property>
++    <name>mapreduce.ifile.readahead</name>
++    <value>true</value>
++    <description>Configuration key to enable/disable IFile readahead.
++    </description>
++  </property>
++
++  <property>
++    <name>mapreduce.ifile.readahead.bytes</name>
++    <value>4194304</value>
++    <description>Configuration key to set the IFile readahead length in bytes.
++    </description>
++  </property>
++
+ <!-- Job Notification Configuration -->
+ 
+ <!--
+diff --git a/src/mapred/org/apache/hadoop/mapred/IFile.java b/src/mapred/org/apache/hadoop/mapred/IFile.java
+index f33a7e8..7942636 100644
+--- a/src/mapred/org/apache/hadoop/mapred/IFile.java
++++ b/src/mapred/org/apache/hadoop/mapred/IFile.java
+@@ -299,7 +299,7 @@ class IFile {
+                   CompressionCodec codec,
+                   Counters.Counter readsCounter) throws IOException {
+       readRecordsCounter = readsCounter;
+-      checksumIn = new IFileInputStream(in,length);
++      checksumIn = new IFileInputStream(in,length, conf);
+       if (codec != null) {
+         decompressor = CodecPool.getDecompressor(codec);
+         if (decompressor != null) {
+diff --git a/src/mapred/org/apache/hadoop/mapred/IFileInputStream.java b/src/mapred/org/apache/hadoop/mapred/IFileInputStream.java
+index 115ea2b..5495e4a 100644
+--- a/src/mapred/org/apache/hadoop/mapred/IFileInputStream.java
++++ b/src/mapred/org/apache/hadoop/mapred/IFileInputStream.java
+@@ -19,11 +19,20 @@
+ package org.apache.hadoop.mapred;
+ 
+ import java.io.EOFException;
++import java.io.FileDescriptor;
++import java.io.FileInputStream;
+ import java.io.IOException;
+ import java.io.InputStream;
+ 
++import org.apache.hadoop.conf.Configuration;
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.fs.ChecksumException;
++import org.apache.hadoop.fs.FSDataInputStream;
++import org.apache.hadoop.fs.HasFileDescriptor;
+ import org.apache.hadoop.io.IOUtils;
++import org.apache.hadoop.io.ReadaheadPool;
++import org.apache.hadoop.io.ReadaheadPool.ReadaheadRequest;
+ import org.apache.hadoop.util.DataChecksum;
+ /**
+  * A checksum input stream, used for IFiles.
+@@ -32,7 +41,8 @@ import org.apache.hadoop.util.DataChecksum;
+ 
+ class IFileInputStream extends InputStream {
+   
+-  private final InputStream in; //The input stream to be verified for checksum. 
++  private final InputStream in; //The input stream to be verified for checksum.
++  private final FileDescriptor inFd; // the file descriptor, if it is known
+   private final long length; //The total length of the input file
+   private final long dataLength;
+   private DataChecksum sum;
+@@ -40,19 +50,66 @@ class IFileInputStream extends InputStream {
+   private final byte b[] = new byte[1];
+   private byte csum[] = null;
+   private int checksumSize;
+-  
++
++  private ReadaheadRequest curReadahead = null;
++  private ReadaheadPool raPool = ReadaheadPool.getInstance();
++  private boolean readahead;
++  private int readaheadLength;
++
++  /**
++   * Configuration key to enable/disable IFile readahead.
++   */
++  public static final String MAPRED_IFILE_READAHEAD =
++    "mapreduce.ifile.readahead";
++
++  public static final boolean DEFAULT_MAPRED_IFILE_READAHEAD = true;
++
++  /**
++   * Configuration key to set the IFile readahead length in bytes.
++   */
++  public static final String MAPRED_IFILE_READAHEAD_BYTES =
++    "mapreduce.ifile.readahead.bytes";
++
++  public static final int DEFAULT_MAPRED_IFILE_READAHEAD_BYTES =
++    4 * 1024 * 1024;
++
++  public static final Log LOG = LogFactory.getLog(IFileInputStream.class);
++
+   /**
+    * Create a checksum input stream that reads
+    * @param in The input stream to be verified for checksum.
+    * @param len The length of the input stream including checksum bytes.
+    */
+-  public IFileInputStream(InputStream in, long len) {
++  public IFileInputStream(InputStream in, long len, Configuration conf) {
+     this.in = in;
++    this.inFd = getFileDescriptorIfAvail(in);
+     sum = DataChecksum.newDataChecksum(DataChecksum.CHECKSUM_CRC32, 
+         Integer.MAX_VALUE);
+     checksumSize = sum.getChecksumSize();
+     length = len;
+     dataLength = length - checksumSize;
++
++    conf = (conf != null) ? conf : new Configuration();
++    readahead = conf.getBoolean(MAPRED_IFILE_READAHEAD,
++        DEFAULT_MAPRED_IFILE_READAHEAD);
++    readaheadLength = conf.getInt(MAPRED_IFILE_READAHEAD_BYTES,
++        DEFAULT_MAPRED_IFILE_READAHEAD_BYTES);
++
++    doReadahead();
++  }
++
++  private static FileDescriptor getFileDescriptorIfAvail(InputStream in) {
++    FileDescriptor fd = null;
++    try {
++      if (in instanceof HasFileDescriptor) {
++        fd = ((HasFileDescriptor)in).getFileDescriptor();
++      } else if (in instanceof FileInputStream) {
++        fd = ((FileInputStream)in).getFD();
++      }
++    } catch (IOException e) {
++      LOG.info("Unable to determine FileDescriptor", e);
++    }
++    return fd;
+   }
+ 
+   /**
+@@ -61,6 +118,10 @@ class IFileInputStream extends InputStream {
+    */
+   @Override
+   public void close() throws IOException {
++
++    if (curReadahead != null) {
++      curReadahead.cancel();
++    }
+     if (currentOffset < dataLength) {
+       byte[] t = new byte[Math.min((int)
+             (Integer.MAX_VALUE & (dataLength - currentOffset)), 32 * 1024)];
+@@ -97,10 +158,21 @@ class IFileInputStream extends InputStream {
+     if (currentOffset >= dataLength) {
+       return -1;
+     }
+-    
++
++    doReadahead();
++
+     return doRead(b,off,len);
+   }
+ 
++  private void doReadahead() {
++    if (raPool != null && inFd != null && readahead) {
++      curReadahead = raPool.readaheadStream(
++          "ifile", inFd,
++          currentOffset, readaheadLength, dataLength,
++          curReadahead);
++    }
++  }
++
+   /**
+    * Read bytes from the stream.
+    * At EOF, checksum is validated and sent back
+diff --git a/src/mapred/org/apache/hadoop/mapred/ReduceTask.java b/src/mapred/org/apache/hadoop/mapred/ReduceTask.java
+index bb5739f..500276f 100644
+--- a/src/mapred/org/apache/hadoop/mapred/ReduceTask.java
++++ b/src/mapred/org/apache/hadoop/mapred/ReduceTask.java
+@@ -1630,7 +1630,7 @@ class ReduceTask extends Task {
+         }
+ 
+         IFileInputStream checksumIn = 
+-          new IFileInputStream(input,compressedLength);
++          new IFileInputStream(input,compressedLength, conf);
+ 
+         input = checksumIn;       
+       
+diff --git a/src/test/org/apache/hadoop/mapred/TestIFileStreams.java b/src/test/org/apache/hadoop/mapred/TestIFileStreams.java
+index f2a19f6..86431e5 100644
+--- a/src/test/org/apache/hadoop/mapred/TestIFileStreams.java
++++ b/src/test/org/apache/hadoop/mapred/TestIFileStreams.java
+@@ -17,6 +17,7 @@
+  */
+ package org.apache.hadoop.mapred;
+ 
++import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.ChecksumException;
+ import org.apache.hadoop.io.DataInputBuffer;
+ import org.apache.hadoop.io.DataOutputBuffer;
+@@ -35,7 +36,7 @@ public class TestIFileStreams extends TestCase {
+     ifos.close();
+     DataInputBuffer dib = new DataInputBuffer();
+     dib.reset(dob.getData(), DLEN + 4);
+-    IFileInputStream ifis = new IFileInputStream(dib, 104);
++    IFileInputStream ifis = new IFileInputStream(dib, 104, new Configuration());
+     for (int i = 0; i < DLEN; ++i) {
+       assertEquals(i, ifis.read());
+     }
+@@ -54,7 +55,7 @@ public class TestIFileStreams extends TestCase {
+     final byte[] b = dob.getData();
+     ++b[17];
+     dib.reset(b, DLEN + 4);
+-    IFileInputStream ifis = new IFileInputStream(dib, 104);
++    IFileInputStream ifis = new IFileInputStream(dib, 104, new Configuration());
+     int i = 0;
+     try {
+       while (i < DLEN) {
+@@ -83,7 +84,7 @@ public class TestIFileStreams extends TestCase {
+     ifos.close();
+     DataInputBuffer dib = new DataInputBuffer();
+     dib.reset(dob.getData(), DLEN + 4);
+-    IFileInputStream ifis = new IFileInputStream(dib, 100);
++    IFileInputStream ifis = new IFileInputStream(dib, 100, new Configuration());
+     int i = 0;
+     try {
+       while (i < DLEN - 8) {
+-- 
+1.7.0.4
+

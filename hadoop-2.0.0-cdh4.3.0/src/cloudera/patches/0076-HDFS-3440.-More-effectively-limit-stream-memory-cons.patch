@@ -1,0 +1,299 @@
+From afa475115795242e901dd986206be0bc7e94dc72 Mon Sep 17 00:00:00 2001
+From: Todd Lipcon <todd@apache.org>
+Date: Fri, 18 May 2012 05:28:18 +0000
+Subject: [PATCH 0076/1357] HDFS-3440. More effectively limit stream memory consumption when reading corrupt edit logs. Contributed by Colin Patrick McCabe.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1339978 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit abcf6c2544f0b8a63b963cd7f00e541f8b7fc037)
+---
+ .../bkjournal/BookKeeperEditLogInputStream.java    |    2 +-
+ .../server/namenode/EditLogBackupInputStream.java  |    2 +-
+ .../server/namenode/EditLogFileInputStream.java    |    2 +-
+ .../hdfs/server/namenode/FSEditLogLoader.java      |   28 ++++++++++++-
+ .../hadoop/hdfs/server/namenode/FSEditLogOp.java   |   10 ++++-
+ .../hadoop/hdfs/server/namenode/StreamLimiter.java |   30 +++++++++++++
+ .../hadoop/hdfs/server/namenode/TestEditLog.java   |    2 +-
+ .../hdfs/server/namenode/TestFSEditLogLoader.java  |   45 ++++++++++++++++++++
+ 8 files changed, 114 insertions(+), 7 deletions(-)
+ create mode 100644 hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/StreamLimiter.java
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/bkjournal/src/main/java/org/apache/hadoop/contrib/bkjournal/BookKeeperEditLogInputStream.java b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/bkjournal/src/main/java/org/apache/hadoop/contrib/bkjournal/BookKeeperEditLogInputStream.java
+index 9d070d9..0baab0b 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/contrib/bkjournal/src/main/java/org/apache/hadoop/contrib/bkjournal/BookKeeperEditLogInputStream.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/contrib/bkjournal/src/main/java/org/apache/hadoop/contrib/bkjournal/BookKeeperEditLogInputStream.java
+@@ -75,7 +75,7 @@ class BookKeeperEditLogInputStream extends EditLogInputStream {
+     tracker = new FSEditLogLoader.PositionTrackingInputStream(bin);
+     DataInputStream in = new DataInputStream(tracker);
+ 
+-    reader = new FSEditLogOp.Reader(in, logVersion);
++    reader = new FSEditLogOp.Reader(in, tracker, logVersion);
+   }
+ 
+   @Override
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogBackupInputStream.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogBackupInputStream.java
+index 1f514cd..f91b713 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogBackupInputStream.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogBackupInputStream.java
+@@ -119,7 +119,7 @@ class EditLogBackupInputStream extends EditLogInputStream {
+ 
+     this.version = version;
+ 
+-    reader = new FSEditLogOp.Reader(in, version);
++    reader = new FSEditLogOp.Reader(in, tracker, version);
+   }
+ 
+   void clear() throws IOException {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogFileInputStream.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogFileInputStream.java
+index ea6fe28..b296152 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogFileInputStream.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogFileInputStream.java
+@@ -85,7 +85,7 @@ public class EditLogFileInputStream extends EditLogInputStream {
+       throw new LogHeaderCorruptException("No header found in log");
+     }
+ 
+-    reader = new FSEditLogOp.Reader(in, logVersion);
++    reader = new FSEditLogOp.Reader(in, tracker, logVersion);
+     this.firstTxId = firstTxId;
+     this.lastTxId = lastTxId;
+     this.isInProgress = isInProgress;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLogLoader.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLogLoader.java
+index 5e0ec14..a174d5b 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLogLoader.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLogLoader.java
+@@ -723,17 +723,31 @@ public class FSEditLogLoader {
+ 
+   /**
+    * Stream wrapper that keeps track of the current stream position.
++   * 
++   * This stream also allows us to set a limit on how many bytes we can read
++   * without getting an exception.
+    */
+-  public static class PositionTrackingInputStream extends FilterInputStream {
++  public static class PositionTrackingInputStream extends FilterInputStream
++      implements StreamLimiter {
+     private long curPos = 0;
+     private long markPos = -1;
++    private long limitPos = Long.MAX_VALUE;
+ 
+     public PositionTrackingInputStream(InputStream is) {
+       super(is);
+     }
+ 
++    private void checkLimit(long amt) throws IOException {
++      long extra = (curPos + amt) - limitPos;
++      if (extra > 0) {
++        throw new IOException("Tried to read " + amt + " byte(s) past " +
++            "the limit at offset " + limitPos);
++      }
++    }
++    
+     @Override
+     public int read() throws IOException {
++      checkLimit(1);
+       int ret = super.read();
+       if (ret != -1) curPos++;
+       return ret;
+@@ -741,6 +755,7 @@ public class FSEditLogLoader {
+ 
+     @Override
+     public int read(byte[] data) throws IOException {
++      checkLimit(data.length);
+       int ret = super.read(data);
+       if (ret > 0) curPos += ret;
+       return ret;
+@@ -748,12 +763,18 @@ public class FSEditLogLoader {
+ 
+     @Override
+     public int read(byte[] data, int offset, int length) throws IOException {
++      checkLimit(length);
+       int ret = super.read(data, offset, length);
+       if (ret > 0) curPos += ret;
+       return ret;
+     }
+ 
+     @Override
++    public void setLimit(long limit) {
++      limitPos = curPos + limit;
++    }
++
++    @Override
+     public void mark(int limit) {
+       super.mark(limit);
+       markPos = curPos;
+@@ -775,6 +796,11 @@ public class FSEditLogLoader {
+     
+     @Override
+     public long skip(long amt) throws IOException {
++      long extra = (curPos + amt) - limitPos;
++      if (extra > 0) {
++        throw new IOException("Tried to skip " + extra + " bytes past " +
++            "the limit at offset " + limitPos);
++      }
+       long ret = super.skip(amt);
+       curPos += ret;
+       return ret;
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLogOp.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLogOp.java
+index 2eadd4b..489f030 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLogOp.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLogOp.java
+@@ -75,7 +75,10 @@ import java.io.EOFException;
+ public abstract class FSEditLogOp {
+   public final FSEditLogOpCodes opCode;
+   long txid;
+-  private static final int MAX_OP_SIZE = 100 * 1024 * 1024;
++  /**
++   * Opcode size is limited to 1.5 megabytes
++   */
++  public static final int MAX_OP_SIZE = (3 * 1024 * 1024) / 2;
+ 
+ 
+   @SuppressWarnings("deprecation")
+@@ -2229,6 +2232,7 @@ public abstract class FSEditLogOp {
+    */
+   public static class Reader {
+     private final DataInputStream in;
++    private final StreamLimiter limiter;
+     private final int logVersion;
+     private final Checksum checksum;
+     private final OpInstanceCache cache;
+@@ -2239,7 +2243,7 @@ public abstract class FSEditLogOp {
+      * @param logVersion The version of the data coming from the stream.
+      */
+     @SuppressWarnings("deprecation")
+-    public Reader(DataInputStream in, int logVersion) {
++    public Reader(DataInputStream in, StreamLimiter limiter, int logVersion) {
+       this.logVersion = logVersion;
+       if (LayoutVersion.supports(Feature.EDITS_CHESKUM, logVersion)) {
+         this.checksum = new PureJavaCrc32();
+@@ -2253,6 +2257,7 @@ public abstract class FSEditLogOp {
+       } else {
+         this.in = in;
+       }
++      this.limiter = limiter;
+       this.cache = new OpInstanceCache();
+     }
+ 
+@@ -2272,6 +2277,7 @@ public abstract class FSEditLogOp {
+     public FSEditLogOp readOp(boolean skipBrokenEdits) throws IOException {
+       while (true) {
+         try {
++          limiter.setLimit(MAX_OP_SIZE);
+           in.mark(MAX_OP_SIZE);
+           return decodeOp();
+         } catch (GarbageAfterTerminatorException e) {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/StreamLimiter.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/StreamLimiter.java
+new file mode 100644
+index 0000000..9742082
+--- /dev/null
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/StreamLimiter.java
+@@ -0,0 +1,30 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hdfs.server.namenode;
++
++/**
++ * An object that allows you to set a limit on a stream.  This limit
++ * represents the number of bytes that can be read without getting an
++ * exception.
++ */
++interface StreamLimiter {
++  /**
++   * Set a limit.  Calling this function clears any existing limit.
++   */
++  public void setLimit(long limit);
++}
+\ No newline at end of file
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestEditLog.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestEditLog.java
+index 085b510..e892539 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestEditLog.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestEditLog.java
+@@ -766,7 +766,7 @@ public class TestEditLog extends TestCase {
+       tracker = new FSEditLogLoader.PositionTrackingInputStream(in);
+       in = new DataInputStream(tracker);
+             
+-      reader = new FSEditLogOp.Reader(in, version);
++      reader = new FSEditLogOp.Reader(in, tracker, version);
+     }
+   
+     @Override
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSEditLogLoader.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSEditLogLoader.java
+index 1917dde..4302534 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSEditLogLoader.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSEditLogLoader.java
+@@ -22,8 +22,10 @@ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertTrue;
+ import static org.junit.Assert.fail;
+ 
++import java.io.BufferedInputStream;
+ import java.io.File;
+ import java.io.FileInputStream;
++import java.io.FileOutputStream;
+ import java.io.IOException;
+ import java.io.RandomAccessFile;
+ import java.nio.channels.FileChannel;
+@@ -316,4 +318,47 @@ public class TestFSEditLogLoader {
+       fis.close();
+     }
+   }
++  
++  @Test
++  public void testStreamLimiter() throws IOException {
++    final File LIMITER_TEST_FILE = new File(TEST_DIR, "limiter.test");
++    
++    FileOutputStream fos = new FileOutputStream(LIMITER_TEST_FILE);
++    try {
++      fos.write(0x12);
++      fos.write(0x12);
++      fos.write(0x12);
++    } finally {
++      fos.close();
++    }
++    
++    FileInputStream fin = new FileInputStream(LIMITER_TEST_FILE);
++    BufferedInputStream bin = new BufferedInputStream(fin);
++    FSEditLogLoader.PositionTrackingInputStream tracker = 
++        new FSEditLogLoader.PositionTrackingInputStream(bin);
++    try {
++      tracker.setLimit(2);
++      tracker.mark(100);
++      tracker.read();
++      tracker.read();
++      try {
++        tracker.read();
++        fail("expected to get IOException after reading past the limit");
++      } catch (IOException e) {
++      }
++      tracker.reset();
++      tracker.mark(100);
++      byte arr[] = new byte[3];
++      try {
++        tracker.read(arr);
++        fail("expected to get IOException after reading past the limit");
++      } catch (IOException e) {
++      }
++      tracker.reset();
++      arr = new byte[2];
++      tracker.read(arr);
++    } finally {
++      tracker.close();
++    }
++  }
+ }
+-- 
+1.7.0.4
+

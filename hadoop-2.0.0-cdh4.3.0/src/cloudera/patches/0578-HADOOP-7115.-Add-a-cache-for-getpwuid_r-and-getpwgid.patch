@@ -1,0 +1,511 @@
+From 4d006b16baeb6871f485aecca389b18296af52c2 Mon Sep 17 00:00:00 2001
+From: Alejandro Abdelnur <tucu@cloudera.com>
+Date: Fri, 9 Nov 2012 10:46:52 -0800
+Subject: [PATCH 0578/1357] HADOOP-7115. Add a cache for getpwuid_r and getpwgid_r calls (tucu)
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1407577 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 535ed824c49738f31b3cb4309acf19b7a56b58ec)
+
+Conflicts:
+	hadoop-common-project/hadoop-common/CHANGES.txt
+---
+ .../apache/hadoop/fs/CommonConfigurationKeys.java  |    8 +-
+ .../java/org/apache/hadoop/io/SecureIOUtils.java   |    2 +-
+ .../org/apache/hadoop/io/nativeio/NativeIO.java    |   83 ++++++++-
+ .../src/org/apache/hadoop/io/nativeio/NativeIO.c   |  204 +++++++++++++------
+ .../src/main/resources/core-default.xml            |   11 +
+ .../apache/hadoop/io/nativeio/TestNativeIO.java    |   16 ++-
+ 6 files changed, 250 insertions(+), 74 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/CommonConfigurationKeys.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/CommonConfigurationKeys.java
+index d8bce7b..f4f6d3a 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/CommonConfigurationKeys.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/CommonConfigurationKeys.java
+@@ -189,5 +189,11 @@ public class CommonConfigurationKeys extends CommonConfigurationKeysPublic {
+    */
+   public static final String KERBEROS_TICKET_CACHE_PATH =
+       "hadoop.security.kerberos.ticket.cache.path";
+-}
+ 
++  public static final String HADOOP_SECURITY_UID_NAME_CACHE_TIMEOUT_KEY =
++    "hadoop.security.uid.cache.secs";
++
++  public static final long HADOOP_SECURITY_UID_NAME_CACHE_TIMEOUT_DEFAULT =
++    4*60*60; // 4 hours
++
++}
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/SecureIOUtils.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/SecureIOUtils.java
+index 6bc798e..e826a82 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/SecureIOUtils.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/SecureIOUtils.java
+@@ -121,7 +121,7 @@ public class SecureIOUtils {
+     FileInputStream fis = new FileInputStream(f);
+     boolean success = false;
+     try {
+-      Stat stat = NativeIO.fstat(fis.getFD());
++      Stat stat = NativeIO.getFstat(fis.getFD());
+       checkStat(f, stat.getOwner(), stat.getGroup(), expectedOwner,
+           expectedGroup);
+       success = true;
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/nativeio/NativeIO.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/nativeio/NativeIO.java
+index 2a7f883..841ea83 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/nativeio/NativeIO.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/nativeio/NativeIO.java
+@@ -19,8 +19,13 @@ package org.apache.hadoop.io.nativeio;
+ 
+ import java.io.FileDescriptor;
+ import java.io.IOException;
++import java.util.Map;
++import java.util.concurrent.ConcurrentHashMap;
+ 
++import org.apache.hadoop.classification.InterfaceAudience;
++import org.apache.hadoop.classification.InterfaceStability;
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.CommonConfigurationKeys;
+ import org.apache.hadoop.util.NativeCodeLoader;
+ 
+ import org.apache.commons.logging.Log;
+@@ -30,6 +35,8 @@ import org.apache.commons.logging.LogFactory;
+  * These functions should generally be used alongside a fallback to another
+  * more portable mechanism.
+  */
++@InterfaceAudience.Private
++@InterfaceStability.Unstable
+ public class NativeIO {
+   // Flags for open() call from bits/fcntl.h
+   public static final int O_RDONLY   =    00;
+@@ -86,6 +93,8 @@ public class NativeIO {
+     "hadoop.workaround.non.threadsafe.getpwuid";
+   static final boolean WORKAROUND_NON_THREADSAFE_CALLS_DEFAULT = false;
+ 
++  private static long cacheTimeout = -1;
++
+   static {
+     if (NativeCodeLoader.isNativeCodeLoaded()) {
+       try {
+@@ -96,6 +105,14 @@ public class NativeIO {
+ 
+         initNative();
+         nativeLoaded = true;
++
++        cacheTimeout = conf.getLong(
++          CommonConfigurationKeys.HADOOP_SECURITY_UID_NAME_CACHE_TIMEOUT_KEY,
++          CommonConfigurationKeys.HADOOP_SECURITY_UID_NAME_CACHE_TIMEOUT_DEFAULT) *
++          1000;
++        LOG.debug("Initialized cache for IDs to User/Group mapping with a" +
++          " cache timeout of " + cacheTimeout/1000 + " seconds.");
++
+       } catch (Throwable t) {
+         // This can happen if the user has an older version of libhadoop.so
+         // installed - in this case we can continue without native IO
+@@ -115,7 +132,7 @@ public class NativeIO {
+   /** Wrapper around open(2) */
+   public static native FileDescriptor open(String path, int flags, int mode) throws IOException;
+   /** Wrapper around fstat(2) */
+-  public static native Stat fstat(FileDescriptor fd) throws IOException;
++  private static native Stat fstat(FileDescriptor fd) throws IOException;
+   /** Wrapper around chmod(2) */
+   public static native void chmod(String path, int mode) throws IOException;
+ 
+@@ -176,6 +193,7 @@ public class NativeIO {
+    * Result type of the fstat call
+    */
+   public static class Stat {
++    private int ownerId, groupId;
+     private String owner, group;
+     private int mode;
+ 
+@@ -196,9 +214,9 @@ public class NativeIO {
+     public static final int S_IWUSR = 0000200;  /* write permission, owner */
+     public static final int S_IXUSR = 0000100;  /* execute/search permission, owner */
+ 
+-    Stat(String owner, String group, int mode) {
+-      this.owner = owner;
+-      this.group = group;
++    Stat(int ownerId, int groupId, int mode) {
++      this.ownerId = ownerId;
++      this.groupId = groupId;
+       this.mode = mode;
+     }
+ 
+@@ -217,4 +235,61 @@ public class NativeIO {
+       return mode;
+     }
+   }
++
++  static native String getUserName(int uid) throws IOException;
++
++  static native String getGroupName(int uid) throws IOException;
++
++  private static class CachedName {
++    final long timestamp;
++    final String name;
++
++    public CachedName(String name, long timestamp) {
++      this.name = name;
++      this.timestamp = timestamp;
++    }
++  }
++
++  private static final Map<Integer, CachedName> USER_ID_NAME_CACHE =
++    new ConcurrentHashMap<Integer, CachedName>();
++
++  private static final Map<Integer, CachedName> GROUP_ID_NAME_CACHE =
++    new ConcurrentHashMap<Integer, CachedName>();
++
++  private enum IdCache { USER, GROUP }
++
++  private static String getName(IdCache domain, int id) throws IOException {
++    Map<Integer, CachedName> idNameCache = (domain == IdCache.USER)
++      ? USER_ID_NAME_CACHE : GROUP_ID_NAME_CACHE;
++    String name;
++    CachedName cachedName = idNameCache.get(id);
++    long now = System.currentTimeMillis();
++    if (cachedName != null && (cachedName.timestamp + cacheTimeout) > now) {
++      name = cachedName.name;
++    } else {
++      name = (domain == IdCache.USER) ? getUserName(id) : getGroupName(id);
++      if (LOG.isDebugEnabled()) {
++        String type = (domain == IdCache.USER) ? "UserName" : "GroupName";
++        LOG.debug("Got " + type + " " + name + " for ID " + id +
++          " from the native implementation");
++      }
++      cachedName = new CachedName(name, now);
++      idNameCache.put(id, cachedName);
++    }
++    return name;
++  }
++
++  /**
++   * Returns the file stat for a file descriptor.
++   *
++   * @param fd file descriptor.
++   * @return the file descriptor file stat.
++   * @throws IOException thrown if there was an IO error while obtaining the file stat.
++   */
++  public static Stat getFstat(FileDescriptor fd) throws IOException {
++    Stat stat = fstat(fd);
++    stat.owner = getName(IdCache.USER, stat.ownerId);
++    stat.group = getName(IdCache.GROUP, stat.groupId);
++    return stat;
++  }
+ }
+diff --git a/hadoop-common-project/hadoop-common/src/main/native/src/org/apache/hadoop/io/nativeio/NativeIO.c b/hadoop-common-project/hadoop-common/src/main/native/src/org/apache/hadoop/io/nativeio/NativeIO.c
+index 139ddaf..841885d 100644
+--- a/hadoop-common-project/hadoop-common/src/main/native/src/org/apache/hadoop/io/nativeio/NativeIO.c
++++ b/hadoop-common-project/hadoop-common/src/main/native/src/org/apache/hadoop/io/nativeio/NativeIO.c
+@@ -72,16 +72,27 @@ static int workaround_non_threadsafe_calls(JNIEnv *env, jclass clazz) {
+ static void stat_init(JNIEnv *env, jclass nativeio_class) {
+   // Init Stat
+   jclass clazz = (*env)->FindClass(env, "org/apache/hadoop/io/nativeio/NativeIO$Stat");
+-  PASS_EXCEPTIONS(env);
++  if (!clazz) {
++    return; // exception has been raised
++  }
+   stat_clazz = (*env)->NewGlobalRef(env, clazz);
++  if (!stat_clazz) {
++    return; // exception has been raised
++  }
+   stat_ctor = (*env)->GetMethodID(env, stat_clazz, "<init>",
+-    "(Ljava/lang/String;Ljava/lang/String;I)V");
+-  
++    "(III)V");
++  if (!stat_ctor) {
++    return; // exception has been raised
++  }
+   jclass obj_class = (*env)->FindClass(env, "java/lang/Object");
+-  assert(obj_class != NULL);
++  if (!obj_class) {
++    return; // exception has been raised
++  }
+   jmethodID  obj_ctor = (*env)->GetMethodID(env, obj_class,
+     "<init>", "()V");
+-  assert(obj_ctor != NULL);
++  if (!obj_ctor) {
++    return; // exception has been raised
++  }
+ 
+   if (workaround_non_threadsafe_calls(env, nativeio_class)) {
+     pw_lock_object = (*env)->NewObject(env, obj_class, obj_ctor);
+@@ -158,8 +169,6 @@ Java_org_apache_hadoop_io_nativeio_NativeIO_fstat(
+   JNIEnv *env, jclass clazz, jobject fd_object)
+ {
+   jobject ret = NULL;
+-  char *pw_buf = NULL;
+-  int pw_lock_locked = 0;
+ 
+   int fd = fd_get(env, fd_object);
+   PASS_EXCEPTIONS_GOTO(env, cleanup);
+@@ -171,71 +180,14 @@ Java_org_apache_hadoop_io_nativeio_NativeIO_fstat(
+     goto cleanup;
+   }
+ 
+-  size_t pw_buflen = get_pw_buflen();
+-  if ((pw_buf = malloc(pw_buflen)) == NULL) {
+-    THROW(env, "java/lang/OutOfMemoryError", "Couldn't allocate memory for pw buffer");
+-    goto cleanup;
+-  }
+-
+-  if (pw_lock_object != NULL) {
+-    if ((*env)->MonitorEnter(env, pw_lock_object) != JNI_OK) {
+-      goto cleanup;
+-    }
+-    pw_lock_locked = 1;
+-  }
+-
+-  // Grab username
+-  struct passwd pwd, *pwdp;
+-  while ((rc = getpwuid_r(s.st_uid, &pwd, pw_buf, pw_buflen, &pwdp)) != 0) {
+-    if (rc != ERANGE) {
+-      throw_ioe(env, rc);
+-      goto cleanup;
+-    }
+-    free(pw_buf);
+-    pw_buflen *= 2;
+-    if ((pw_buf = malloc(pw_buflen)) == NULL) {
+-      THROW(env, "java/lang/OutOfMemoryError", "Couldn't allocate memory for pw buffer");
+-      goto cleanup;
+-    }
+-  }
+-  assert(pwdp == &pwd);
+-
+-  jstring jstr_username = (*env)->NewStringUTF(env, pwd.pw_name);
+-  if (jstr_username == NULL) goto cleanup;
+-
+-  // Grab group
+-  struct group grp, *grpp;
+-  while ((rc = getgrgid_r(s.st_gid, &grp, pw_buf, pw_buflen, &grpp)) != 0) {
+-    if (rc != ERANGE) {
+-      throw_ioe(env, rc);
+-      goto cleanup;
+-    }
+-    free(pw_buf);
+-    pw_buflen *= 2;
+-    if ((pw_buf = malloc(pw_buflen)) == NULL) {
+-      THROW(env, "java/lang/OutOfMemoryError", "Couldn't allocate memory for pw buffer");
+-      goto cleanup;
+-    }
+-  }
+-  assert(grpp == &grp);
+-
+-  jstring jstr_groupname = (*env)->NewStringUTF(env, grp.gr_name);
+-  PASS_EXCEPTIONS_GOTO(env, cleanup);
+-
+   // Construct result
+   ret = (*env)->NewObject(env, stat_clazz, stat_ctor,
+-    jstr_username, jstr_groupname, s.st_mode);
++    (jint)s.st_uid, (jint)s.st_gid, (jint)s.st_mode);
+ 
+ cleanup:
+-  if (pw_buf != NULL) free(pw_buf);
+-  if (pw_lock_locked) {
+-    (*env)->MonitorExit(env, pw_lock_object);
+-  }
+   return ret;
+ }
+ 
+-
+-
+ /**
+  * public static native void posix_fadvise(
+  *   FileDescriptor fd, long offset, long len, int flags);
+@@ -362,6 +314,128 @@ Java_org_apache_hadoop_io_nativeio_NativeIO_chmod(
+   (*env)->ReleaseStringUTFChars(env, j_path, path);
+ }
+ 
++/*
++ * static native String getUserName(int uid);
++ */
++JNIEXPORT jstring JNICALL 
++Java_org_apache_hadoop_io_nativeio_NativeIO_getUserName(JNIEnv *env, 
++jclass clazz, jint uid)
++{
++  int pw_lock_locked = 0;
++  if (pw_lock_object != NULL) {
++    if ((*env)->MonitorEnter(env, pw_lock_object) != JNI_OK) {
++      goto cleanup;
++    }
++    pw_lock_locked = 1;
++  }
++
++  char *pw_buf = NULL;
++  int rc;
++  size_t pw_buflen = get_pw_buflen();
++  if ((pw_buf = malloc(pw_buflen)) == NULL) {
++    THROW(env, "java/lang/OutOfMemoryError", "Couldn't allocate memory for pw buffer");
++    goto cleanup;
++  }
++
++  // Grab username
++  struct passwd pwd, *pwdp;
++  while ((rc = getpwuid_r((uid_t)uid, &pwd, pw_buf, pw_buflen, &pwdp)) != 0) {
++    if (rc != ERANGE) {
++      throw_ioe(env, rc);
++      goto cleanup;
++    }
++    free(pw_buf);
++    pw_buflen *= 2;
++    if ((pw_buf = malloc(pw_buflen)) == NULL) {
++      THROW(env, "java/lang/OutOfMemoryError", "Couldn't allocate memory for pw buffer");
++      goto cleanup;
++    }
++  }
++  if (pwdp == NULL) {
++    char msg[80];
++    snprintf(msg, sizeof(msg), "uid not found: %d", uid);
++    THROW(env, "java/io/IOException", msg);
++    goto cleanup;
++  }
++  if (pwdp != &pwd) {
++    char msg[80];
++    snprintf(msg, sizeof(msg), "pwd pointer inconsistent with reference. uid: %d", uid);
++    THROW(env, "java/lang/IllegalStateException", msg);
++    goto cleanup;
++  }
++
++  jstring jstr_username = (*env)->NewStringUTF(env, pwd.pw_name);
++
++cleanup:
++  if (pw_lock_locked) {
++    (*env)->MonitorExit(env, pw_lock_object);
++  }
++  if (pw_buf != NULL) free(pw_buf);
++  return jstr_username;
++}
++
++/*
++ * static native String getGroupName(int gid);
++ */
++JNIEXPORT jstring JNICALL 
++Java_org_apache_hadoop_io_nativeio_NativeIO_getGroupName(JNIEnv *env, 
++jclass clazz, jint gid)
++{
++  int pw_lock_locked = 0;
++ 
++  if (pw_lock_object != NULL) {
++    if ((*env)->MonitorEnter(env, pw_lock_object) != JNI_OK) {
++      goto cleanup;
++    }
++    pw_lock_locked = 1;
++  }
++  
++  char *pw_buf = NULL;
++  int rc;
++  size_t pw_buflen = get_pw_buflen();
++  if ((pw_buf = malloc(pw_buflen)) == NULL) {
++    THROW(env, "java/lang/OutOfMemoryError", "Couldn't allocate memory for pw buffer");
++    goto cleanup;
++  }
++  
++  // Grab group
++  struct group grp, *grpp;
++  while ((rc = getgrgid_r((uid_t)gid, &grp, pw_buf, pw_buflen, &grpp)) != 0) {
++    if (rc != ERANGE) {
++      throw_ioe(env, rc);
++      goto cleanup;
++    }
++    free(pw_buf);
++    pw_buflen *= 2;
++    if ((pw_buf = malloc(pw_buflen)) == NULL) {
++      THROW(env, "java/lang/OutOfMemoryError", "Couldn't allocate memory for pw buffer");
++      goto cleanup;
++    }
++  }
++  if (grpp == NULL) {
++    char msg[80];
++    snprintf(msg, sizeof(msg), "gid not found: %d", gid);
++    THROW(env, "java/io/IOException", msg);
++    goto cleanup;
++  }
++  if (grpp != &grp) {
++    char msg[80];
++    snprintf(msg, sizeof(msg), "pwd pointer inconsistent with reference. gid: %d", gid);
++    THROW(env, "java/lang/IllegalStateException", msg);
++    goto cleanup;
++  }
++
++  jstring jstr_groupname = (*env)->NewStringUTF(env, grp.gr_name);
++  PASS_EXCEPTIONS_GOTO(env, cleanup);
++  
++cleanup:
++  if (pw_lock_locked) {
++    (*env)->MonitorExit(env, pw_lock_object);
++  }
++  if (pw_buf != NULL) free(pw_buf);
++  return jstr_groupname;
++}
++
+ 
+ /*
+  * Throw a java.IO.IOException, generating the message from errno.
+diff --git a/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml b/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml
+index 4eecf27..b14a2af 100644
+--- a/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml
++++ b/hadoop-common-project/hadoop-common/src/main/resources/core-default.xml
+@@ -214,6 +214,17 @@
+   </description>
+ </property>
+ 
++
++<property>
++    <name>hadoop.security.uid.cache.secs</name>
++    <value>14400</value>
++    <description>
++        This is the config controlling the validity of the entries in the cache
++        containing the userId to userName and groupId to groupName used by
++        NativeIO getFstat().
++    </description>
++</property>
++
+ <property>
+   <name>hadoop.rpc.protection</name>
+   <value>authentication</value>
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/nativeio/TestNativeIO.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/nativeio/TestNativeIO.java
+index b9d4ec5..1241f81 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/nativeio/TestNativeIO.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/nativeio/TestNativeIO.java
+@@ -61,7 +61,7 @@ public class TestNativeIO {
+   public void testFstat() throws Exception {
+     FileOutputStream fos = new FileOutputStream(
+       new File(TEST_DIR, "testfstat"));
+-    NativeIO.Stat stat = NativeIO.fstat(fos.getFD());
++    NativeIO.Stat stat = NativeIO.getFstat(fos.getFD());
+     fos.close();
+     LOG.info("Stat: " + String.valueOf(stat));
+ 
+@@ -92,7 +92,7 @@ public class TestNativeIO {
+           long et = Time.now() + 5000;
+           while (Time.now() < et) {
+             try {
+-              NativeIO.Stat stat = NativeIO.fstat(fos.getFD());
++              NativeIO.Stat stat = NativeIO.getFstat(fos.getFD());
+               assertEquals(System.getProperty("user.name"), stat.getOwner());
+               assertNotNull(stat.getGroup());
+               assertTrue(!"".equals(stat.getGroup()));
+@@ -124,7 +124,7 @@ public class TestNativeIO {
+       new File(TEST_DIR, "testfstat2"));
+     fos.close();
+     try {
+-      NativeIO.Stat stat = NativeIO.fstat(fos.getFD());
++      NativeIO.Stat stat = NativeIO.getFstat(fos.getFD());
+     } catch (NativeIOException nioe) {
+       LOG.info("Got expected exception", nioe);
+       assertEquals(Errno.EBADF, nioe.getErrno());
+@@ -279,4 +279,14 @@ public class TestNativeIO {
+     assertEquals(expected, perms.toShort());
+   }
+ 
++  @Test
++  public void testGetUserName() throws IOException {
++    assertFalse(NativeIO.getUserName(0).isEmpty());
++  }
++
++  @Test
++  public void testGetGroupName() throws IOException {
++    assertFalse(NativeIO.getGroupName(0).isEmpty());
++  }
++
+ }
+-- 
+1.7.0.4
+

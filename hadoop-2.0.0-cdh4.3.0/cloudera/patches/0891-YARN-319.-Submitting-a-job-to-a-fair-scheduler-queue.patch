@@ -1,0 +1,132 @@
+From fecd6ca6c8ac03323ae7f2c8f785012431df6751 Mon Sep 17 00:00:00 2001
+From: Thomas White <tomwhite@apache.org>
+Date: Wed, 23 Jan 2013 10:53:05 +0000
+Subject: [PATCH 0891/1357] YARN-319. Submitting a job to a fair scheduler queue for which the user does not have permission causes the client to wait forever. Contributed by shenhong.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1437336 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit fd6bde5522e98a21bd608f756c1de656bcf54e88)
+---
+ .../scheduler/fair/FairScheduler.java              |    8 ++-
+ .../scheduler/fair/TestFairScheduler.java          |   59 ++++++++++++++++++++
+ 2 files changed, 65 insertions(+), 2 deletions(-)
+
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
+index 80ea41b..f51c6d7 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
+@@ -57,6 +57,7 @@ import org.apache.hadoop.yarn.server.resourcemanager.resource.Resources;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptEvent;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptEventType;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptState;
++import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.event.RMAppAttemptRejectedEvent;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainer;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainerEventType;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainerState;
+@@ -503,8 +504,11 @@ public class FairScheduler implements ResourceScheduler {
+     // Enforce ACLs
+     UserGroupInformation userUgi = UserGroupInformation.createRemoteUser(user);
+     if (!queue.hasAccess(QueueACL.SUBMIT_APPLICATIONS, userUgi)) {
+-      LOG.info("User " + userUgi.getUserName() +
+-          " cannot submit applications to queue " + queue.getName());
++      String msg = "User " + userUgi.getUserName() +
++    	        " cannot submit applications to queue " + queue.getName();
++      LOG.info(msg);
++      rmContext.getDispatcher().getEventHandler().handle(
++    	        new RMAppAttemptRejectedEvent(applicationAttemptId, msg));
+       return;
+     }
+     
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
+index bc37494..e905d80 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
+@@ -41,22 +41,31 @@ import junit.framework.Assert;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.security.authorize.AccessControlList;
+ import org.apache.hadoop.yarn.Clock;
++import org.apache.hadoop.yarn.MockApps;
+ import org.apache.hadoop.yarn.api.records.ApplicationAttemptId;
+ import org.apache.hadoop.yarn.api.records.ApplicationId;
++import org.apache.hadoop.yarn.api.records.ApplicationSubmissionContext;
+ import org.apache.hadoop.yarn.api.records.ContainerId;
+ import org.apache.hadoop.yarn.api.records.ContainerStatus;
++import org.apache.hadoop.yarn.api.records.FinalApplicationStatus;
+ import org.apache.hadoop.yarn.api.records.Priority;
+ import org.apache.hadoop.yarn.api.records.QueueACL;
+ import org.apache.hadoop.yarn.api.records.ResourceRequest;
++import org.apache.hadoop.yarn.api.records.impl.pb.ApplicationSubmissionContextPBImpl;
+ import org.apache.hadoop.yarn.conf.YarnConfiguration;
+ import org.apache.hadoop.yarn.event.AsyncDispatcher;
+ import org.apache.hadoop.yarn.factories.RecordFactory;
+ import org.apache.hadoop.yarn.factory.providers.RecordFactoryProvider;
++import org.apache.hadoop.yarn.server.resourcemanager.ApplicationMasterService;
+ import org.apache.hadoop.yarn.server.resourcemanager.MockNodes;
+ import org.apache.hadoop.yarn.server.resourcemanager.ResourceManager;
+ import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore;
+ import org.apache.hadoop.yarn.server.resourcemanager.recovery.StoreFactory;
+ import org.apache.hadoop.yarn.server.resourcemanager.resource.Resources;
++import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMApp;
++import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppEvent;
++import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppEventType;
++import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppImpl;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptState;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainer;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNode;
+@@ -1359,4 +1368,54 @@ public class TestFairScheduler {
+     assertEquals(2, app1.getLiveContainers().size());
+     assertEquals(1, app2.getLiveContainers().size());
+   }
++  
++  
++  @SuppressWarnings("unchecked")
++  @Test
++  public void testNotAllowSubmitApplication() throws Exception {
++    // Set acl's
++    Configuration conf = createConfiguration();
++    conf.set(FairSchedulerConfiguration.ALLOCATION_FILE, ALLOC_FILE);
++    scheduler.reinitialize(conf, resourceManager.getRMContext());
++    PrintWriter out = new PrintWriter(new FileWriter(ALLOC_FILE));
++    out.println("<?xml version=\"1.0\"?>");
++    out.println("<allocations>");
++    out.println("<queue name=\"queue1\">");
++    out.println("<aclSubmitApps>userallow</aclSubmitApps>");
++    out.println("</queue>");
++    out.println("</allocations>");
++    out.close();
++    QueueManager queueManager = scheduler.getQueueManager();
++    queueManager.initialize();
++    
++    int appId = this.APP_ID++;
++    String user = "usernotallow";
++    String queue = "queue1";
++    ApplicationId applicationId = MockApps.newAppID(appId);
++    String name = MockApps.newAppName();
++    ApplicationMasterService masterService =
++        new ApplicationMasterService(resourceManager.getRMContext(), scheduler);
++    ApplicationSubmissionContext submissionContext = new ApplicationSubmissionContextPBImpl();
++    RMApp application =
++        new RMAppImpl(applicationId, resourceManager.getRMContext(), conf, name, user, 
++          queue, submissionContext, null, scheduler, masterService,
++          System.currentTimeMillis());
++    resourceManager.getRMContext().getRMApps().putIfAbsent(applicationId, application);
++    application.handle(new RMAppEvent(applicationId, RMAppEventType.START));
++
++    ApplicationAttemptId attId = recordFactory.newRecordInstance(ApplicationAttemptId.class);
++    attId.setAttemptId(this.ATTEMPT_ID++);
++    attId.setApplicationId(applicationId);
++    scheduler.addApplication(attId, queue, user);
++    
++    final int MAX_TRIES=20;
++    int numTries = 0;
++    while (application.getFinishTime() == 0 && numTries < MAX_TRIES) {
++      try {
++        Thread.sleep(100);
++      } catch (InterruptedException ex) {ex.printStackTrace();}
++      numTries++;
++    }
++    assertEquals(FinalApplicationStatus.FAILED, application.getFinalApplicationStatus());
++  }
+ }
+-- 
+1.7.0.4
+

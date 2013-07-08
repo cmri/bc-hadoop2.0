@@ -1,0 +1,181 @@
+From 4f6bfb0189a6ac1e583fead5c9c7c7e04dd6bd33 Mon Sep 17 00:00:00 2001
+From: Todd Lipcon <todd@apache.org>
+Date: Tue, 9 Apr 2013 21:34:03 +0000
+Subject: [PATCH 1005/1357] HDFS-4643. Fix flakiness in TestQuorumJournalManager. Contributed by Todd Lipcon.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/branch-2@1466252 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit dbf3ef138cb1be1bca64d105ae400f9a37e6ac19)
+---
+ .../org/apache/hadoop/test/GenericTestUtils.java   |   22 ++++++++++++
+ .../qjournal/client/TestQuorumJournalManager.java  |   36 ++++++++++++++-----
+ .../hdfs/server/namenode/TestCheckpoint.java       |   15 +--------
+ 3 files changed, 49 insertions(+), 24 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/test/GenericTestUtils.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/test/GenericTestUtils.java
+index 3f0556d..9f920f4 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/test/GenericTestUtils.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/test/GenericTestUtils.java
+@@ -20,6 +20,9 @@ package org.apache.hadoop.test;
+ import java.io.File;
+ import java.io.IOException;
+ import java.io.StringWriter;
++import java.lang.management.ManagementFactory;
++import java.lang.management.ThreadInfo;
++import java.lang.management.ThreadMXBean;
+ import java.lang.reflect.InvocationTargetException;
+ import java.util.Arrays;
+ import java.util.Random;
+@@ -336,4 +339,23 @@ public abstract class GenericTestUtils {
+     Assert.assertTrue("Expected " + actual + " to be in range (" + expectedMin + ","
+         + expectedMax + ")", expectedMin <= actual && actual <= expectedMax);
+   }
++
++  /**
++   * Assert that there are no threads running whose name matches the
++   * given regular expression.
++   * @param regex the regex to match against
++   */
++  public static void assertNoThreadsMatching(String regex) {
++    Pattern pattern = Pattern.compile(regex);
++    ThreadMXBean threadBean = ManagementFactory.getThreadMXBean();
++    
++    ThreadInfo[] infos = threadBean.getThreadInfo(threadBean.getAllThreadIds(), 20);
++    for (ThreadInfo info : infos) {
++      if (info == null) continue;
++      if (pattern.matcher(info.getThreadName()).matches()) {
++        Assert.fail("Leaked thread: " + info + "\n" +
++            Joiner.on("\n").join(info.getStackTrace()));
++      }
++    }
++  }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/qjournal/client/TestQuorumJournalManager.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/qjournal/client/TestQuorumJournalManager.java
+index 7c2bb29..e62e26b 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/qjournal/client/TestQuorumJournalManager.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/qjournal/client/TestQuorumJournalManager.java
+@@ -74,6 +74,8 @@ public class TestQuorumJournalManager {
+   private Configuration conf;
+   private QuorumJournalManager qjm;
+   private List<AsyncLogger> spies;
++
++  private List<QuorumJournalManager> toClose = Lists.newLinkedList();
+   
+   static {
+     ((Log4JLogger)ProtobufRpcEngine.LOG).getLogger().setLevel(Level.ALL);
+@@ -98,11 +100,26 @@ public class TestQuorumJournalManager {
+   
+   @After
+   public void shutdown() throws IOException {
++    IOUtils.cleanup(LOG, toClose.toArray(new Closeable[0]));
++    
++    // Should not leak clients between tests -- this can cause flaky tests.
++    // (See HDFS-4643)
++    GenericTestUtils.assertNoThreadsMatching(".*IPC Client.*");
++    
+     if (cluster != null) {
+       cluster.shutdown();
+     }
+   }
+   
++  /**
++   * Enqueue a QJM for closing during shutdown. This makes the code a little
++   * easier to follow, with fewer try..finally clauses necessary.
++   */
++  private QuorumJournalManager closeLater(QuorumJournalManager qjm) {
++    toClose.add(qjm);
++    return qjm;
++  }
++  
+   @Test
+   public void testSingleWriter() throws Exception {
+     writeSegment(cluster, qjm, 1, 3, true);
+@@ -119,8 +136,8 @@ public class TestQuorumJournalManager {
+   
+   @Test
+   public void testFormat() throws Exception {
+-    QuorumJournalManager qjm = new QuorumJournalManager(
+-        conf, cluster.getQuorumJournalURI("testFormat-jid"), FAKE_NSINFO);
++    QuorumJournalManager qjm = closeLater(new QuorumJournalManager(
++        conf, cluster.getQuorumJournalURI("testFormat-jid"), FAKE_NSINFO));
+     assertFalse(qjm.hasSomeData());
+     qjm.format(FAKE_NSINFO);
+     assertTrue(qjm.hasSomeData());
+@@ -128,8 +145,7 @@ public class TestQuorumJournalManager {
+   
+   @Test
+   public void testReaderWhileAnotherWrites() throws Exception {
+-    
+-    QuorumJournalManager readerQjm = createSpyingQJM();
++    QuorumJournalManager readerQjm = closeLater(createSpyingQJM());
+     List<EditLogInputStream> streams = Lists.newArrayList();
+     readerQjm.selectInputStreams(streams, 0, false);
+     assertEquals(0, streams.size());
+@@ -251,8 +267,8 @@ public class TestQuorumJournalManager {
+     
+     
+     // Make a new QJM
+-    qjm = new QuorumJournalManager(
+-        conf, cluster.getQuorumJournalURI(JID), FAKE_NSINFO);
++    qjm = closeLater(new QuorumJournalManager(
++        conf, cluster.getQuorumJournalURI(JID), FAKE_NSINFO));
+     qjm.recoverUnfinalizedSegments();
+     checkRecovery(cluster, 1, 3);
+ 
+@@ -364,8 +380,8 @@ public class TestQuorumJournalManager {
+         NNStorage.getInProgressEditsFileName(1));
+ 
+     // Make a new QJM
+-    qjm = new QuorumJournalManager(
+-        conf, cluster.getQuorumJournalURI(JID), FAKE_NSINFO);
++    qjm = closeLater(new QuorumJournalManager(
++        conf, cluster.getQuorumJournalURI(JID), FAKE_NSINFO));
+     qjm.recoverUnfinalizedSegments();
+     checkRecovery(cluster, 1, 3);
+   }
+@@ -902,8 +918,8 @@ public class TestQuorumJournalManager {
+         return Mockito.spy(logger);
+       }
+     };
+-    return new QuorumJournalManager(
+-        conf, cluster.getQuorumJournalURI(JID), FAKE_NSINFO, spyFactory);
++    return closeLater(new QuorumJournalManager(
++        conf, cluster.getQuorumJournalURI(JID), FAKE_NSINFO, spyFactory));
+   }
+ 
+   private static void waitForAllPendingCalls(AsyncLoggerSet als)
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestCheckpoint.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestCheckpoint.java
+index aa7677a..34b71ff 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestCheckpoint.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestCheckpoint.java
+@@ -30,8 +30,6 @@ import static org.junit.Assert.fail;
+ import java.io.File;
+ import java.io.IOException;
+ import java.lang.management.ManagementFactory;
+-import java.lang.management.ThreadInfo;
+-import java.lang.management.ThreadMXBean;
+ import java.net.InetSocketAddress;
+ import java.net.URI;
+ import java.util.ArrayList;
+@@ -120,18 +118,7 @@ public class TestCheckpoint {
+   
+   @After
+   public void checkForSNNThreads() {
+-    ThreadMXBean threadBean = ManagementFactory.getThreadMXBean();
+-    
+-    ThreadInfo[] infos = threadBean.getThreadInfo(threadBean.getAllThreadIds(), 20);
+-    for (ThreadInfo info : infos) {
+-      if (info == null) continue;
+-      LOG.info("Check thread: " + info.getThreadName());
+-      if (info.getThreadName().contains("SecondaryNameNode")) {
+-        fail("Leaked thread: " + info + "\n" +
+-            Joiner.on("\n").join(info.getStackTrace()));
+-      }
+-    }
+-    LOG.info("--------");
++    GenericTestUtils.assertNoThreadsMatching(".*SecondaryNameNode.*");
+   }
+   
+   static void checkFile(FileSystem fileSys, Path name, int repl)
+-- 
+1.7.0.4
+

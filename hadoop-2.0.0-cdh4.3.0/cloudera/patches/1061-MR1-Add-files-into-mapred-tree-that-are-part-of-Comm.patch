@@ -1,0 +1,2858 @@
+From 3cd60ead34dc0e52894bae137df7eac52cb7dd94 Mon Sep 17 00:00:00 2001
+From: Todd Lipcon <todd@cloudera.com>
+Date: Fri, 2 Dec 2011 15:25:44 -0800
+Subject: [PATCH 1061/1357] MR1: Add files into mapred tree that are part of Common/HDFS 0.20 but no longer in 0.23.
+
+---
+ src/mapred/org/apache/hadoop/fs/HarFileSystem.java |  939 ++++++++++++++++++++
+ .../org/apache/hadoop/mapred/JTProtocols.java      |   14 +
+ src/mapred/org/apache/hadoop/mapred/NetUtils2.java |   51 ++
+ .../hadoop/util/LinuxMemoryCalculatorPlugin.java   |  132 +++
+ .../hadoop/util/LinuxResourceCalculatorPlugin.java |  407 +++++++++
+ .../apache/hadoop/util/MemoryCalculatorPlugin.java |   74 ++
+ .../org/apache/hadoop/util/PluginDispatcher.java   |  135 +++
+ src/mapred/org/apache/hadoop/util/ProcessTree.java |  218 +++++
+ .../apache/hadoop/util/ProcfsBasedProcessTree.java |  602 +++++++++++++
+ .../hadoop/util/ResourceCalculatorPlugin.java      |  159 ++++
+ .../apache/hadoop/util/SingleArgumentRunnable.java |   25 +
+ 11 files changed, 2756 insertions(+), 0 deletions(-)
+ create mode 100644 src/mapred/org/apache/hadoop/fs/HarFileSystem.java
+ create mode 100644 src/mapred/org/apache/hadoop/mapred/JTProtocols.java
+ create mode 100644 src/mapred/org/apache/hadoop/mapred/NetUtils2.java
+ create mode 100644 src/mapred/org/apache/hadoop/util/LinuxMemoryCalculatorPlugin.java
+ create mode 100644 src/mapred/org/apache/hadoop/util/LinuxResourceCalculatorPlugin.java
+ create mode 100644 src/mapred/org/apache/hadoop/util/MemoryCalculatorPlugin.java
+ create mode 100644 src/mapred/org/apache/hadoop/util/PluginDispatcher.java
+ create mode 100644 src/mapred/org/apache/hadoop/util/ProcessTree.java
+ create mode 100644 src/mapred/org/apache/hadoop/util/ProcfsBasedProcessTree.java
+ create mode 100644 src/mapred/org/apache/hadoop/util/ResourceCalculatorPlugin.java
+ create mode 100644 src/mapred/org/apache/hadoop/util/SingleArgumentRunnable.java
+
+diff --git a/src/mapred/org/apache/hadoop/fs/HarFileSystem.java b/src/mapred/org/apache/hadoop/fs/HarFileSystem.java
+new file mode 100644
+index 0000000..13abc14
+--- /dev/null
++++ b/src/mapred/org/apache/hadoop/fs/HarFileSystem.java
+@@ -0,0 +1,939 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.fs;
++
++import java.io.FileNotFoundException;
++import java.io.IOException;
++import java.net.URI;
++import java.net.URISyntaxException;
++import java.util.ArrayList;
++import java.util.List;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.permission.FsPermission;
++import org.apache.hadoop.io.Text;
++import org.apache.hadoop.util.LineReader;
++import org.apache.hadoop.util.Progressable;
++
++/**
++ * This is an implementation of the Hadoop Archive 
++ * Filesystem. This archive Filesystem has index files
++ * of the form _index* and has contents of the form
++ * part-*. The index files store the indexes of the 
++ * real files. The index files are of the form _masterindex
++ * and _index. The master index is a level of indirection 
++ * in to the index file to make the look ups faster. the index
++ * file is sorted with hash code of the paths that it contains 
++ * and the master index contains pointers to the positions in 
++ * index for ranges of hashcodes.
++ */
++
++public class HarFileSystem extends FilterFileSystem {
++  public static final int VERSION = 1;
++  // uri representation of this Har filesystem
++  private URI uri;
++  // the version of this har filesystem
++  private int version;
++  // underlying uri 
++  private URI underLyingURI;
++  // the top level path of the archive
++  // in the underlying file system
++  private Path archivePath;
++  // the masterIndex of the archive
++  private Path masterIndex;
++  // the index file 
++  private Path archiveIndex;
++  // the har auth
++  private String harAuth;
++  
++  /**
++   * public construction of harfilesystem
++   *
++   */
++  public HarFileSystem() {
++  }
++  
++  /**
++   * Constructor to create a HarFileSystem with an
++   * underlying filesystem.
++   * @param fs
++   */
++  public HarFileSystem(FileSystem fs) {
++    super(fs);
++  }
++  
++  /**
++   * Initialize a Har filesystem per har archive. The 
++   * archive home directory is the top level directory
++   * in the filesystem that contains the HAR archive.
++   * Be careful with this method, you do not want to go 
++   * on creating new Filesystem instances per call to 
++   * path.getFileSystem().
++   * the uri of Har is 
++   * har://underlyingfsscheme-host:port/archivepath.
++   * or 
++   * har:///archivepath. This assumes the underlying filesystem
++   * to be used in case not specified.
++   */
++  public void initialize(URI name, Configuration conf) throws IOException {
++    //decode the name
++    underLyingURI = decodeHarURI(name, conf);
++    //  we got the right har Path- now check if this is 
++    //truly a har filesystem
++    Path harPath = archivePath(new Path(name.toString()));
++    if (harPath == null) { 
++      throw new IOException("Invalid path for the Har Filesystem. " + 
++                           name.toString());
++    }
++    if (fs == null) {
++      fs = FileSystem.get(underLyingURI, conf);
++    }
++    this.uri = harPath.toUri();
++    this.archivePath = new Path(this.uri.getPath());
++    this.harAuth = getHarAuth(this.underLyingURI);
++    //check for the underlying fs containing
++    // the index file
++    this.masterIndex = new Path(archivePath, "_masterindex");
++    this.archiveIndex = new Path(archivePath, "_index");
++    if (!fs.exists(masterIndex) || !fs.exists(archiveIndex)) {
++      throw new IOException("Invalid path for the Har Filesystem. " +
++          "No index file in " + harPath);
++    }
++    try{ 
++      this.version = getHarVersion();
++    } catch(IOException io) {
++      throw new IOException("Unable to " +
++          "read the version of the Har file system: " + this.archivePath);
++    }
++    if (this.version != HarFileSystem.VERSION) {
++      throw new IOException("Invalid version " + 
++          this.version + " expected " + HarFileSystem.VERSION);
++    }
++  }
++  
++  // get the version of the filesystem from the masterindex file
++  // the version is currently not useful since its the first version 
++  // of archives
++  public int getHarVersion() throws IOException { 
++    FSDataInputStream masterIn = fs.open(masterIndex);
++    LineReader lmaster = new LineReader(masterIn, getConf());
++    Text line = new Text();
++    lmaster.readLine(line);
++    try {
++      masterIn.close();
++    } catch(IOException e){
++      //disregard it.
++      // its a read.
++    }
++    String versionLine = line.toString();
++    String[] arr = versionLine.split(" ");
++    int version = Integer.parseInt(arr[0]);
++    return version;
++  }
++  
++  /*
++   * find the parent path that is the 
++   * archive path in the path. The last
++   * path segment that ends with .har is 
++   * the path that will be returned.
++   */
++  private Path archivePath(Path p) {
++    Path retPath = null;
++    Path tmp = p;
++    for (int i=0; i< p.depth(); i++) {
++      if (tmp.toString().endsWith(".har")) {
++        retPath = tmp;
++        break;
++      }
++      tmp = tmp.getParent();
++    }
++    return retPath;
++  }
++
++  /**
++   * decode the raw URI to get the underlying URI
++   * @param rawURI raw Har URI
++   * @return filtered URI of the underlying fileSystem
++   */
++  private URI decodeHarURI(URI rawURI, Configuration conf) throws IOException {
++    String tmpAuth = rawURI.getAuthority();
++    //we are using the default file
++    //system in the config 
++    //so create a underlying uri and 
++    //return it
++    if (tmpAuth == null) {
++      //create a path 
++      return FileSystem.getDefaultUri(conf);
++    }
++    String host = rawURI.getHost();
++    if (host == null) {
++      throw new IOException("URI: " + rawURI
++          + " is an invalid Har URI since host==null."
++          + "  Expecting har://<scheme>-<host>/<path>.");
++    }
++    int i = host.indexOf('-');
++    if (i < 0) {
++      throw new IOException("URI: " + rawURI
++          + " is an invalid Har URI since '-' not found."
++          + "  Expecting har://<scheme>-<host>/<path>.");
++    }
++    final String underLyingScheme = host.substring(0, i);
++    i++;
++    final String underLyingHost = i == host.length()? null: host.substring(i);
++    int underLyingPort = rawURI.getPort();
++    String auth = (underLyingHost == null && underLyingPort == -1)?
++                  null:(underLyingHost+":"+underLyingPort);
++    URI tmp = null;
++    if (rawURI.getQuery() != null) {
++      // query component not allowed
++      throw new IOException("query component in Path not supported  " + rawURI);
++    }
++    try {
++      tmp = new URI(underLyingScheme, auth, rawURI.getPath(), 
++            rawURI.getQuery(), rawURI.getFragment());
++    } catch (URISyntaxException e) {
++        // do nothing should not happen
++    }
++    return tmp;
++  }
++  
++  /**
++   * return the top level archive.
++   */
++  public Path getWorkingDirectory() {
++    return new Path(uri.toString());
++  }
++  
++  /**
++   * Create a har specific auth 
++   * har-underlyingfs:port
++   * @param underLyingURI the uri of underlying
++   * filesystem
++   * @return har specific auth
++   */
++  private String getHarAuth(URI underLyingUri) {
++    String auth = underLyingUri.getScheme() + "-";
++    if (underLyingUri.getHost() != null) {
++      auth += underLyingUri.getHost() + ":";
++      if (underLyingUri.getPort() != -1) {
++        auth +=  underLyingUri.getPort();
++      }
++    }
++    else {
++      auth += ":";
++    }
++    return auth;
++  }
++  
++  /**
++   * Returns the uri of this filesystem.
++   * The uri is of the form 
++   * har://underlyingfsschema-host:port/pathintheunderlyingfs
++   */
++  @Override
++  public URI getUri() {
++    return this.uri;
++  }
++  
++  /**
++   * this method returns the path 
++   * inside the har filesystem.
++   * this is relative path inside 
++   * the har filesystem.
++   * @param path the fully qualified path in the har filesystem.
++   * @return relative path in the filesystem.
++   */
++  private Path getPathInHar(Path path) {
++    Path harPath = new Path(path.toUri().getPath());
++    if (archivePath.compareTo(harPath) == 0)
++      return new Path(Path.SEPARATOR);
++    Path tmp = new Path(harPath.getName());
++    Path parent = harPath.getParent();
++    while (!(parent.compareTo(archivePath) == 0)) {
++      if (parent.toString().equals(Path.SEPARATOR)) {
++        tmp = null;
++        break;
++      }
++      tmp = new Path(parent.getName(), tmp);
++      parent = parent.getParent();
++    }
++    if (tmp != null) 
++      tmp = new Path(Path.SEPARATOR, tmp);
++    return tmp;
++  }
++  
++  //the relative path of p. basically 
++  // getting rid of /. Parsing and doing 
++  // string manipulation is not good - so
++  // just use the path api to do it.
++  private Path makeRelative(String initial, Path p) {
++    Path root = new Path(Path.SEPARATOR);
++    if (root.compareTo(p) == 0)
++      return new Path(initial);
++    Path retPath = new Path(p.getName());
++    Path parent = p.getParent();
++    for (int i=0; i < p.depth()-1; i++) {
++      retPath = new Path(parent.getName(), retPath);
++      parent = parent.getParent();
++    }
++    return new Path(initial, retPath.toString());
++  }
++  
++  /* this makes a path qualified in the har filesystem
++   * (non-Javadoc)
++   * @see org.apache.hadoop.fs.FilterFileSystem#makeQualified(
++   * org.apache.hadoop.fs.Path)
++   */
++  @Override
++  public Path makeQualified(Path path) {
++    // make sure that we just get the 
++    // path component 
++    Path fsPath = path;
++    if (!path.isAbsolute()) {
++      fsPath = new Path(archivePath, path);
++    }
++
++    URI tmpURI = fsPath.toUri();
++    //change this to Har uri 
++    return new Path(uri.getScheme(), harAuth, tmpURI.getPath());
++  }
++  
++  /**
++   * get block locations from the underlying fs
++   * @param file the input filestatus to get block locations
++   * @param start the start in the file
++   * @param len the length in the file
++   * @return block locations for this segment of file
++   * @throws IOException
++   */
++  @Override
++  public BlockLocation[] getFileBlockLocations(FileStatus file, long start,
++      long len) throws IOException {
++    // just fake block locations
++    // its fast and simpler
++    // doing various block location manipulation
++    // with part files adds a lot of overhead because 
++    // of the look ups of filestatus in index files
++    return new BlockLocation[]{ new BlockLocation() };
++  }
++  
++  /**
++   * fake the rawblocks since map reduce uses the block offsets to 
++   * fo some computations regarding the blocks
++   * @param rawBlocks the raw blocks returned by the filesystem
++   * @return faked blocks with changed offsets.
++   */
++  private BlockLocation[] fakeBlockLocations(BlockLocation[] rawBlocks, 
++		  long startIndex) {
++	for (BlockLocation block : rawBlocks) {
++		long rawOffset = block.getOffset();
++		block.setOffset(rawOffset - startIndex);
++	}
++	return rawBlocks;
++  }
++  
++  /**
++   * the hash of the path p inside iniside
++   * the filesystem
++   * @param p the path in the harfilesystem
++   * @return the hash code of the path.
++   */
++  public static int getHarHash(Path p) {
++    return (p.toString().hashCode() & 0x7fffffff);
++  }
++  
++  static class Store {
++    public Store() {
++      begin = end = startHash = endHash = 0;
++    }
++    public Store(long begin, long end, int startHash, int endHash) {
++      this.begin = begin;
++      this.end = end;
++      this.startHash = startHash;
++      this.endHash = endHash;
++    }
++    public long begin;
++    public long end;
++    public int startHash;
++    public int endHash;
++  }
++  
++  /**
++   * Get filestatuses of all the children of a given directory. This just reads
++   * through index file and reads line by line to get all statuses for children
++   * of a directory. Its a brute force way of getting all such filestatuses
++   * 
++   * @param parent
++   *          the parent path directory
++   * @param statuses
++   *          the list to add the children filestatuses to
++   * @param children
++   *          the string list of children for this parent
++   * @param archiveIndexStat
++   *          the archive index filestatus
++   */
++  private void fileStatusesInIndex(HarStatus parent, List<FileStatus> statuses,
++      List<String> children, FileStatus archiveIndexStat) throws IOException {
++    // read the index file
++    FSDataInputStream aIn = null;
++    try {
++      aIn = fs.open(archiveIndex);
++      LineReader aLin;
++      long read = 0;
++      aLin = new LineReader(aIn, getConf());
++      String parentString = parent.getName();
++      Path harPath = new Path(parentString);
++      int harlen = harPath.depth();
++      Text line = new Text();
++      while (read < archiveIndexStat.getLen()) {
++        int tmp = aLin.readLine(line);
++        read += tmp;
++        String lineFeed = line.toString();
++        String child = lineFeed.substring(0, lineFeed.indexOf(" "));
++        if ((child.startsWith(parentString))) {
++          Path thisPath = new Path(child);
++          if (thisPath.depth() == harlen + 1) {
++            // bingo!
++            HarStatus hstatus = new HarStatus(lineFeed);
++            FileStatus childStatus = new FileStatus(hstatus.isDir() ? 0
++                : hstatus.getLength(), hstatus.isDir(), (int) archiveIndexStat
++                .getReplication(), archiveIndexStat.getBlockSize(),
++                archiveIndexStat.getModificationTime(), archiveIndexStat
++                    .getAccessTime(), new FsPermission(archiveIndexStat
++                    .getPermission()), archiveIndexStat.getOwner(),
++                archiveIndexStat.getGroup(), makeRelative(this.uri.toString(),
++                    new Path(hstatus.name)));
++            statuses.add(childStatus);
++          }
++          line.clear();
++        }
++      }
++    } finally {
++      if (aIn != null) {
++        aIn.close();
++      }
++    }
++  }
++  
++  // make sure that this harPath is relative to the har filesystem
++  // this only works for relative paths. This returns the line matching
++  // the file in the index. Returns a null if there is not matching 
++  // filename in the index file.
++  private String fileStatusInIndex(Path harPath) throws IOException {
++    // read the index file 
++    int hashCode = getHarHash(harPath);
++    // get the master index to find the pos 
++    // in the index file
++    FSDataInputStream in = fs.open(masterIndex);
++    FileStatus masterStat = fs.getFileStatus(masterIndex);
++    LineReader lin = new LineReader(in, getConf());
++    Text line = new Text();
++    long read = lin.readLine(line);
++   //ignore the first line. this is the header of the index files
++    String[] readStr = null;
++    List<Store> stores = new ArrayList<Store>();
++    while(read < masterStat.getLen()) {
++      int b = lin.readLine(line);
++      read += b;
++      readStr = line.toString().split(" ");
++      int startHash = Integer.parseInt(readStr[0]);
++      int endHash  = Integer.parseInt(readStr[1]);
++      if (startHash <= hashCode && hashCode <= endHash) {
++        stores.add(new Store(Long.parseLong(readStr[2]), 
++            Long.parseLong(readStr[3]), startHash,
++            endHash));
++      }
++      line.clear();
++    }
++    try {
++      lin.close();
++    } catch(IOException io){
++      // do nothing just a read.
++    }
++    FSDataInputStream aIn = fs.open(archiveIndex);
++    LineReader aLin;
++    String retStr = null;
++    // now start reading the real index file
++    for (Store s: stores) {
++      read = 0;
++      aIn.seek(s.begin);
++      aLin = new LineReader(aIn, getConf());
++      while (read + s.begin < s.end) {
++        int tmp = aLin.readLine(line);
++        read += tmp;
++        String lineFeed = line.toString();
++        String[] parsed = lineFeed.split(" ");
++        if (harPath.compareTo(new Path(parsed[0])) == 0) {
++          // bingo!
++          retStr = lineFeed;
++          break;
++        }
++        line.clear();
++      }
++      if (retStr != null)
++        break;
++    }
++    try {
++      aIn.close();
++    } catch(IOException io) {
++      //do nothing
++    }
++    return retStr;
++  }
++  
++  // a single line parser for hadoop archives status 
++  // stored in a single line in the index files 
++  // the format is of the form 
++  // filename "dir"/"file" partFileName startIndex length 
++  // <space seperated children>
++  private static class HarStatus {
++    boolean isDir;
++    String name;
++    List<String> children;
++    String partName;
++    long startIndex;
++    long length;
++    public HarStatus(String harString) {
++      String[] splits = harString.split(" ");
++      this.name = splits[0];
++      this.isDir = "dir".equals(splits[1]) ? true: false;
++      // this is equal to "none" if its a directory
++      this.partName = splits[2];
++      this.startIndex = Long.parseLong(splits[3]);
++      this.length = Long.parseLong(splits[4]);
++      if (isDir) {
++        children = new ArrayList<String>();
++        for (int i = 5; i < splits.length; i++) {
++          children.add(splits[i]);
++        }
++      }
++    }
++    public boolean isDir() {
++      return isDir;
++    }
++    
++    public String getName() {
++      return name;
++    }
++    
++    public List<String> getChildren() {
++      return children;
++    }
++    public String getFileName() {
++      return name;
++    }
++    public String getPartName() {
++      return partName;
++    }
++    public long getStartIndex() {
++      return startIndex;
++    }
++    public long getLength() {
++      return length;
++    }
++  }
++  
++  /**
++   * return the filestatus of files in har archive.
++   * The permission returned are that of the archive
++   * index files. The permissions are not persisted 
++   * while creating a hadoop archive.
++   * @param f the path in har filesystem
++   * @return filestatus.
++   * @throws IOException
++   */
++  @Override
++  public FileStatus getFileStatus(Path f) throws IOException {
++    FileStatus archiveStatus = fs.getFileStatus(archiveIndex);
++    // get the fs DataInputStream for the underlying file
++    // look up the index.
++    Path p = makeQualified(f);
++    Path harPath = getPathInHar(p);
++    if (harPath == null) {
++      throw new IOException("Invalid file name: " + f + " in " + uri);
++    }
++    String readStr = fileStatusInIndex(harPath);
++    if (readStr == null) {
++      throw new FileNotFoundException("File: " +  f + " does not exist in " + uri);
++    }
++    HarStatus hstatus = null;
++    hstatus = new HarStatus(readStr);
++    return new FileStatus(hstatus.isDir()?0:hstatus.getLength(), hstatus.isDir(),
++        (int)archiveStatus.getReplication(), archiveStatus.getBlockSize(),
++        archiveStatus.getModificationTime(), archiveStatus.getAccessTime(),
++        new FsPermission(
++        archiveStatus.getPermission()), archiveStatus.getOwner(), 
++        archiveStatus.getGroup(), 
++            makeRelative(this.uri.toString(), new Path(hstatus.name)));
++  }
++
++  /**
++   * @return null since no checksum algorithm is implemented.
++   */
++  public FileChecksum getFileChecksum(Path f) {
++    return null;
++  }
++
++  /**
++   * Returns a har input stream which fakes end of 
++   * file. It reads the index files to get the part 
++   * file name and the size and start of the file.
++   */
++  @Override
++  public FSDataInputStream open(Path f, int bufferSize) throws IOException {
++    // get the fs DataInputStream for the underlying file
++    // look up the index.
++    Path p = makeQualified(f);
++    Path harPath = getPathInHar(p);
++    if (harPath == null) {
++      throw new IOException("Invalid file name: " + f + " in " + uri);
++    }
++    String readStr = fileStatusInIndex(harPath);
++    if (readStr == null) {
++      throw new FileNotFoundException(f + ": not found in " + archivePath);
++    }
++    HarStatus hstatus = new HarStatus(readStr); 
++    // we got it.. woo hooo!!! 
++    if (hstatus.isDir()) {
++      throw new FileNotFoundException(f + " : not a file in " +
++                archivePath);
++    }
++    return new HarFSDataInputStream(fs, new Path(archivePath, 
++        hstatus.getPartName()),
++        hstatus.getStartIndex(), hstatus.getLength(), bufferSize);
++  }
++ 
++  /*
++   * create throws an exception in Har filesystem.
++   * The archive once created cannot be changed.
++   */
++  public FSDataOutputStream create(Path f, int bufferSize) 
++                                    throws IOException {
++    throw new IOException("Har: Create not allowed");
++  }
++  
++  public FSDataOutputStream create(Path f,
++      FsPermission permission,
++      boolean overwrite,
++      int bufferSize,
++      short replication,
++      long blockSize,
++      Progressable progress) throws IOException {
++    throw new IOException("Har: create not allowed.");
++  }
++  
++  @Override
++  public void close() throws IOException {
++    if (fs != null) {
++      try {
++        fs.close();
++      } catch(IOException ie) {
++        //this might already be closed
++        // ignore
++      }
++    }
++  }
++  
++  /**
++   * Not implemented.
++   */
++  @Override
++  public boolean setReplication(Path src, short replication) throws IOException{
++    throw new IOException("Har: setreplication not allowed");
++  }
++  
++  /**
++   * Not implemented.
++   */
++  @Override
++  public boolean delete(Path f, boolean recursive) throws IOException { 
++    throw new IOException("Har: delete not allowed");
++  }
++  
++  /**
++   * liststatus returns the children of a directory 
++   * after looking up the index files.
++   */
++  @Override
++  public FileStatus[] listStatus(Path f) throws IOException {
++    //need to see if the file is an index in file
++    //get the filestatus of the archive directory
++    // we will create fake filestatuses to return
++    // to the client
++    List<FileStatus> statuses = new ArrayList<FileStatus>();
++    FileStatus archiveStatus = fs.getFileStatus(archiveIndex);
++    Path tmpPath = makeQualified(f);
++    Path harPath = getPathInHar(tmpPath);
++    String readStr = fileStatusInIndex(harPath);
++    if (readStr == null) {
++      throw new FileNotFoundException("File " + f + " not found in " + archivePath);
++    }
++    HarStatus hstatus = new HarStatus(readStr);
++    if (!hstatus.isDir()) 
++        statuses.add(new FileStatus(hstatus.getLength(), 
++            hstatus.isDir(),
++            archiveStatus.getReplication(), archiveStatus.getBlockSize(),
++            archiveStatus.getModificationTime(), archiveStatus.getAccessTime(),
++            new FsPermission(archiveStatus.getPermission()),
++            archiveStatus.getOwner(), archiveStatus.getGroup(), 
++            makeRelative(this.uri.toString(), new Path(hstatus.name))));
++    else 
++      fileStatusesInIndex(hstatus, statuses, hstatus.children, archiveStatus);
++    
++    return statuses.toArray(new FileStatus[statuses.size()]);
++  }
++  
++  /**
++   * return the top level archive path.
++   */
++  public Path getHomeDirectory() {
++    return new Path(uri.toString());
++  }
++  
++  public void setWorkingDirectory(Path newDir) {
++    //does nothing.
++  }
++  
++  /**
++   * not implemented.
++   */
++  public boolean mkdirs(Path f, FsPermission permission) throws IOException {
++    throw new IOException("Har: mkdirs not allowed");
++  }
++  
++  /**
++   * not implemented.
++   */
++  public void copyFromLocalFile(boolean delSrc, Path src, Path dst) throws 
++        IOException {
++    throw new IOException("Har: copyfromlocalfile not allowed");
++  }
++  
++  /**
++   * copies the file in the har filesystem to a local file.
++   */
++  public void copyToLocalFile(boolean delSrc, Path src, Path dst) 
++    throws IOException {
++    FileUtil.copy(this, src, getLocal(getConf()), dst, false, getConf());
++  }
++  
++  /**
++   * not implemented.
++   */
++  public Path startLocalOutput(Path fsOutputFile, Path tmpLocalFile) 
++    throws IOException {
++    throw new IOException("Har: startLocalOutput not allowed");
++  }
++  
++  /**
++   * not implemented.
++   */
++  public void completeLocalOutput(Path fsOutputFile, Path tmpLocalFile) 
++    throws IOException {
++    throw new IOException("Har: completeLocalOutput not allowed");
++  }
++  
++  /**
++   * not implemented.
++   */
++  public void setOwner(Path p, String username, String groupname)
++    throws IOException {
++    throw new IOException("Har: setowner not allowed");
++  }
++
++  /**
++   * Not implemented.
++   */
++  public void setPermission(Path p, FsPermission permisssion) 
++    throws IOException {
++    throw new IOException("Har: setPermission not allowed");
++  }
++  
++  /**
++   * Hadoop archives input stream. This input stream fakes EOF 
++   * since archive files are part of bigger part files.
++   */
++  private static class HarFSDataInputStream extends FSDataInputStream {
++    /**
++     * Create an input stream that fakes all the reads/positions/seeking.
++     */
++    private static class HarFsInputStream extends FSInputStream {
++      private long position, start, end;
++      //The underlying data input stream that the
++      // underlying filesystem will return.
++      private FSDataInputStream underLyingStream;
++      //one byte buffer
++      private byte[] oneBytebuff = new byte[1];
++      HarFsInputStream(FileSystem fs, Path path, long start,
++          long length, int bufferSize) throws IOException {
++        underLyingStream = fs.open(path, bufferSize);
++        underLyingStream.seek(start);
++        // the start of this file in the part file
++        this.start = start;
++        // the position pointer in the part file
++        this.position = start;
++        // the end pointer in the part file
++        this.end = start + length;
++      }
++      
++      public synchronized int available() throws IOException {
++        long remaining = end - underLyingStream.getPos();
++        if (remaining > (long)Integer.MAX_VALUE) {
++          return Integer.MAX_VALUE;
++        }
++        return (int) remaining;
++      }
++      
++      public synchronized  void close() throws IOException {
++        underLyingStream.close();
++        super.close();
++      }
++      
++      //not implemented
++      @Override
++      public void mark(int readLimit) {
++        // do nothing 
++      }
++      
++      /**
++       * reset is not implemented
++       */
++      public void reset() throws IOException {
++        throw new IOException("reset not implemented.");
++      }
++      
++      public synchronized int read() throws IOException {
++        int ret = read(oneBytebuff, 0, 1);
++        return (ret <= 0) ? -1: (oneBytebuff[0] & 0xff);
++      }
++      
++      public synchronized int read(byte[] b) throws IOException {
++        int ret = read(b, 0, b.length);
++        if (ret != -1) {
++          position += ret;
++        }
++        return ret;
++      }
++      
++      /**
++       * 
++       */
++      public synchronized int read(byte[] b, int offset, int len) 
++        throws IOException {
++        int newlen = len;
++        int ret = -1;
++        if (position + len > end) {
++          newlen = (int) (end - position);
++        }
++        // end case
++        if (newlen == 0) 
++          return ret;
++        ret = underLyingStream.read(b, offset, newlen);
++        position += ret;
++        return ret;
++      }
++      
++      public synchronized long skip(long n) throws IOException {
++        long tmpN = n;
++        if (tmpN > 0) {
++          if (position + tmpN > end) {
++            tmpN = end - position;
++          }
++          underLyingStream.seek(tmpN + position);
++          position += tmpN;
++          return tmpN;
++        }
++        return (tmpN < 0)? -1 : 0;
++      }
++      
++      public synchronized long getPos() throws IOException {
++        return (position - start);
++      }
++      
++      public synchronized void seek(long pos) throws IOException {
++        if (pos < 0 || (start + pos > end)) {
++          throw new IOException("Failed to seek: EOF");
++        }
++        position = start + pos;
++        underLyingStream.seek(position);
++      }
++
++      public boolean seekToNewSource(long targetPos) throws IOException {
++        //do not need to implement this
++        // hdfs in itself does seektonewsource 
++        // while reading.
++        return false;
++      }
++      
++      /**
++       * implementing position readable. 
++       */
++      public int read(long pos, byte[] b, int offset, int length) 
++      throws IOException {
++        int nlength = length;
++        if (start + nlength + pos > end) {
++          nlength = (int) (end - (start + pos));
++        }
++        return underLyingStream.read(pos + start , b, offset, nlength);
++      }
++      
++      /**
++       * position readable again.
++       */
++      public void readFully(long pos, byte[] b, int offset, int length) 
++      throws IOException {
++        if (start + length + pos > end) {
++          throw new IOException("Not enough bytes to read.");
++        }
++        underLyingStream.readFully(pos + start, b, offset, length);
++      }
++      
++      public void readFully(long pos, byte[] b) throws IOException {
++          readFully(pos, b, 0, b.length);
++      }
++      
++    }
++  
++    /**
++     * constructors for har input stream.
++     * @param fs the underlying filesystem
++     * @param p The path in the underlying filesystem
++     * @param start the start position in the part file
++     * @param length the length of valid data in the part file
++     * @param bufsize the buffer size
++     * @throws IOException
++     */
++    public HarFSDataInputStream(FileSystem fs, Path  p, long start, 
++        long length, int bufsize) throws IOException {
++        super(new HarFsInputStream(fs, p, start, length, bufsize));
++    }
++
++    /**
++     * constructor for har input stream.
++     * @param fs the underlying filesystem
++     * @param p the path in the underlying file system
++     * @param start the start position in the part file
++     * @param length the length of valid data in the part file.
++     * @throws IOException
++     */
++    public HarFSDataInputStream(FileSystem fs, Path  p, long start, long length)
++      throws IOException {
++        super(new HarFsInputStream(fs, p, start, length, 0));
++    }
++  }
++}
+diff --git a/src/mapred/org/apache/hadoop/mapred/JTProtocols.java b/src/mapred/org/apache/hadoop/mapred/JTProtocols.java
+new file mode 100644
+index 0000000..ce561ff
+--- /dev/null
++++ b/src/mapred/org/apache/hadoop/mapred/JTProtocols.java
+@@ -0,0 +1,14 @@
++package org.apache.hadoop.mapred;
++
++import org.apache.hadoop.security.RefreshUserMappingsProtocol;
++import org.apache.hadoop.security.authorize.RefreshAuthorizationPolicyProtocol;
++import org.apache.hadoop.tools.GetUserMappingsProtocol;
++
++public interface JTProtocols extends
++  InterTrackerProtocol,
++  JobSubmissionProtocol, TaskTrackerManager, RefreshUserMappingsProtocol,
++  GetUserMappingsProtocol,
++  RefreshAuthorizationPolicyProtocol, AdminOperationsProtocol
++{
++
++}
+diff --git a/src/mapred/org/apache/hadoop/mapred/NetUtils2.java b/src/mapred/org/apache/hadoop/mapred/NetUtils2.java
+new file mode 100644
+index 0000000..4cff169
+--- /dev/null
++++ b/src/mapred/org/apache/hadoop/mapred/NetUtils2.java
+@@ -0,0 +1,51 @@
++package org.apache.hadoop.mapred;
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.net.NetUtils;
++
++public class NetUtils2 {
++  static final Log LOG = LogFactory.getLog(NetUtils.class);
++  
++  /**
++   * Handle the transition from pairs of attributes specifying a host and port
++   * to a single colon separated one.
++   * @param conf the configuration to check
++   * @param oldBindAddressName the old address attribute name
++   * @param oldPortName the old port attribute name
++   * @param newBindAddressName the new combined name
++   * @return the complete address from the configuration
++   */
++  @Deprecated
++  public static String getServerAddress(Configuration conf,
++                                        String oldBindAddressName,
++                                        String oldPortName,
++                                        String newBindAddressName) {
++    String oldAddr = conf.get(oldBindAddressName);
++    String oldPort = conf.get(oldPortName);
++    String newAddrPort = conf.get(newBindAddressName);
++    if (oldAddr == null && oldPort == null) {
++      return newAddrPort;
++    }
++    String[] newAddrPortParts = newAddrPort.split(":",2);
++    if (newAddrPortParts.length != 2) {
++      throw new IllegalArgumentException("Invalid address/port: " + 
++                                         newAddrPort);
++    }
++    if (oldAddr == null) {
++      oldAddr = newAddrPortParts[0];
++    } else {
++      LOG.warn("Configuration parameter " + oldBindAddressName +
++               " is deprecated. Use " + newBindAddressName + " instead.");
++    }
++    if (oldPort == null) {
++      oldPort = newAddrPortParts[1];
++    } else {
++      LOG.warn("Configuration parameter " + oldPortName +
++               " is deprecated. Use " + newBindAddressName + " instead.");      
++    }
++    return oldAddr + ":" + oldPort;
++  }
++
++}
+diff --git a/src/mapred/org/apache/hadoop/util/LinuxMemoryCalculatorPlugin.java b/src/mapred/org/apache/hadoop/util/LinuxMemoryCalculatorPlugin.java
+new file mode 100644
+index 0000000..3870a47
+--- /dev/null
++++ b/src/mapred/org/apache/hadoop/util/LinuxMemoryCalculatorPlugin.java
+@@ -0,0 +1,132 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.util;
++
++import java.io.BufferedReader;
++import java.io.FileNotFoundException;
++import java.io.FileReader;
++import java.io.IOException;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++
++/**
++ * Plugin to calculate virtual and physical memories on Linux systems.
++ */
++public class LinuxMemoryCalculatorPlugin extends MemoryCalculatorPlugin {
++  private static final Log LOG =
++      LogFactory.getLog(LinuxMemoryCalculatorPlugin.class);
++
++  /**
++   * proc's meminfo virtual file has keys-values in the format
++   * "key:[ \t]*value[ \t]kB".
++   */
++  private static final String PROCFS_MEMFILE = "/proc/meminfo";
++  private static final Pattern PROCFS_MEMFILE_FORMAT =
++      Pattern.compile("^([a-zA-Z]*):[ \t]*([0-9]*)[ \t]kB");
++
++  // We just need the values for the keys MemTotal and SwapTotal
++  private static final String MEMTOTAL_STRING = "MemTotal";
++  private static final String SWAPTOTAL_STRING = "SwapTotal";
++
++  private long ramSize = 0;
++  private long swapSize = 0;
++
++  boolean readMemInfoFile = false;
++
++  private void readProcMemInfoFile() {
++
++    if (readMemInfoFile) {
++      return;
++    }
++
++    // Read "/proc/memInfo" file
++    BufferedReader in = null;
++    FileReader fReader = null;
++    try {
++      fReader = new FileReader(PROCFS_MEMFILE);
++      in = new BufferedReader(fReader);
++    } catch (FileNotFoundException f) {
++      // shouldn't happen....
++      return;
++    }
++
++    Matcher mat = null;
++
++    try {
++      String str = in.readLine();
++      while (str != null) {
++        mat = PROCFS_MEMFILE_FORMAT.matcher(str);
++        if (mat.find()) {
++          if (mat.group(1).equals(MEMTOTAL_STRING)) {
++            ramSize = Long.parseLong(mat.group(2));
++          } else if (mat.group(1).equals(SWAPTOTAL_STRING)) {
++            swapSize = Long.parseLong(mat.group(2));
++          }
++        }
++        str = in.readLine();
++      }
++    } catch (IOException io) {
++      LOG.warn("Error reading the stream " + io);
++    } finally {
++      // Close the streams
++      try {
++        fReader.close();
++        try {
++          in.close();
++        } catch (IOException i) {
++          LOG.warn("Error closing the stream " + in);
++        }
++      } catch (IOException i) {
++        LOG.warn("Error closing the stream " + fReader);
++      }
++    }
++
++    readMemInfoFile = true;
++  }
++
++  /** {@inheritDoc} */
++  @Override
++  public long getPhysicalMemorySize() {
++    readProcMemInfoFile();
++    return ramSize * 1024;
++  }
++
++  /** {@inheritDoc} */
++  @Override
++  public long getVirtualMemorySize() {
++    readProcMemInfoFile();
++    return (ramSize + swapSize) * 1024;
++  }
++
++  /**
++   * Test the {@link LinuxMemoryCalculatorPlugin}
++   * 
++   * @param args
++   */
++  public static void main(String[] args) {
++    LinuxMemoryCalculatorPlugin plugin = new LinuxMemoryCalculatorPlugin();
++    System.out.println("Physical memory Size(bytes) : "
++        + plugin.getPhysicalMemorySize());
++    System.out.println("Total Virtual memory Size(bytes) : "
++        + plugin.getVirtualMemorySize());
++  }
++}
+\ No newline at end of file
+diff --git a/src/mapred/org/apache/hadoop/util/LinuxResourceCalculatorPlugin.java b/src/mapred/org/apache/hadoop/util/LinuxResourceCalculatorPlugin.java
+new file mode 100644
+index 0000000..adf6cef
+--- /dev/null
++++ b/src/mapred/org/apache/hadoop/util/LinuxResourceCalculatorPlugin.java
+@@ -0,0 +1,407 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.util;
++
++import java.io.BufferedReader;
++import java.io.FileNotFoundException;
++import java.io.FileReader;
++import java.io.IOException;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++
++/**
++ * Plugin to calculate resource information on Linux systems.
++ */
++public class LinuxResourceCalculatorPlugin extends ResourceCalculatorPlugin {
++  private static final Log LOG =
++      LogFactory.getLog(LinuxResourceCalculatorPlugin.class);
++
++  /**
++   * proc's meminfo virtual file has keys-values in the format
++   * "key:[ \t]*value[ \t]kB".
++   */
++  private static final String PROCFS_MEMFILE = "/proc/meminfo";
++  private static final Pattern PROCFS_MEMFILE_FORMAT =
++      Pattern.compile("^([a-zA-Z]*):[ \t]*([0-9]*)[ \t]kB");
++
++  // We need the values for the following keys in meminfo
++  private static final String MEMTOTAL_STRING = "MemTotal";
++  private static final String SWAPTOTAL_STRING = "SwapTotal";
++  private static final String MEMFREE_STRING = "MemFree";
++  private static final String SWAPFREE_STRING = "SwapFree";
++  private static final String INACTIVE_STRING = "Inactive";
++  private static final int UNAVAILABLE = -1;
++
++  /**
++   * Patterns for parsing /proc/cpuinfo
++   */
++  private static final String PROCFS_CPUINFO = "/proc/cpuinfo";
++  private static final Pattern PROCESSOR_FORMAT =
++      Pattern.compile("^processor[ \t]:[ \t]*([0-9]*)");
++  private static final Pattern FREQUENCY_FORMAT =
++      Pattern.compile("^cpu MHz[ \t]*:[ \t]*([0-9.]*)");
++
++  /**
++   * Pattern for parsing /proc/stat
++   */
++  private static final String PROCFS_STAT = "/proc/stat";
++  private static final Pattern CPU_TIME_FORMAT =
++    Pattern.compile("^cpu[ \t]*([0-9]*)" +
++    		            "[ \t]*([0-9]*)[ \t]*([0-9]*)[ \t].*");
++  
++  private String procfsMemFile;
++  private String procfsCpuFile;
++  private String procfsStatFile;
++  long jiffyLengthInMillis;
++
++  private long ramSize = 0;
++  private long swapSize = 0;
++  private long ramSizeFree = 0;  // free ram space on the machine (kB)
++  private long swapSizeFree = 0; // free swap space on the machine (kB)
++  private long inactiveSize = 0; // inactive cache memory (kB)
++  private int numProcessors = 0; // number of processors on the system
++  private long cpuFrequency = 0L; // CPU frequency on the system (kHz)
++  private long cumulativeCpuTime = 0L; // CPU used time since system is on (ms)
++  private long lastCumulativeCpuTime = 0L; // CPU used time read last time (ms)
++  // Unix timestamp while reading the CPU time (ms)
++  private float cpuUsage = UNAVAILABLE;
++  private long sampleTime = UNAVAILABLE;
++  private long lastSampleTime = UNAVAILABLE;
++  private ProcfsBasedProcessTree pTree = null;
++
++  boolean readMemInfoFile = false;
++  boolean readCpuInfoFile = false;
++  
++  /**
++   * Get current time
++   * @return Unix time stamp in millisecond
++   */
++  long getCurrentTime() {
++    return System.currentTimeMillis();
++  }
++  
++  public LinuxResourceCalculatorPlugin() {
++    procfsMemFile = PROCFS_MEMFILE;
++    procfsCpuFile = PROCFS_CPUINFO;
++    procfsStatFile = PROCFS_STAT;
++    jiffyLengthInMillis = ProcfsBasedProcessTree.JIFFY_LENGTH_IN_MILLIS;
++    String pid = System.getenv().get("JVM_PID");
++    pTree = new ProcfsBasedProcessTree(pid);
++  }
++  
++  /**
++   * Constructor which allows assigning the /proc/ directories. This will be
++   * used only in unit tests
++   * @param procfsMemFile fake file for /proc/meminfo
++   * @param procfsCpuFile fake file for /proc/cpuinfo
++   * @param procfsStatFile fake file for /proc/stat
++   * @param jiffyLengthInMillis fake jiffy length value
++   */
++  public LinuxResourceCalculatorPlugin(String procfsMemFile,
++                                       String procfsCpuFile,
++                                       String procfsStatFile,
++                                       long jiffyLengthInMillis) {
++    this.procfsMemFile = procfsMemFile;
++    this.procfsCpuFile = procfsCpuFile;
++    this.procfsStatFile = procfsStatFile;
++    this.jiffyLengthInMillis = jiffyLengthInMillis;
++    String pid = System.getenv().get("JVM_PID");
++    pTree = new ProcfsBasedProcessTree(pid);
++  }
++
++  /**
++   * Read /proc/meminfo, parse and compute memory information only once
++   */
++  private void readProcMemInfoFile() {
++    readProcMemInfoFile(false);
++  }
++
++  /**
++   * Read /proc/meminfo, parse and compute memory information
++   * @param readAgain if false, read only on the first time
++   */
++  private void readProcMemInfoFile(boolean readAgain) {
++
++    if (readMemInfoFile && !readAgain) {
++      return;
++    }
++
++    // Read "/proc/memInfo" file
++    BufferedReader in = null;
++    FileReader fReader = null;
++    try {
++      fReader = new FileReader(procfsMemFile);
++      in = new BufferedReader(fReader);
++    } catch (FileNotFoundException f) {
++      // shouldn't happen....
++      return;
++    }
++
++    Matcher mat = null;
++
++    try {
++      String str = in.readLine();
++      while (str != null) {
++        mat = PROCFS_MEMFILE_FORMAT.matcher(str);
++        if (mat.find()) {
++          if (mat.group(1).equals(MEMTOTAL_STRING)) {
++            ramSize = Long.parseLong(mat.group(2));
++          } else if (mat.group(1).equals(SWAPTOTAL_STRING)) {
++            swapSize = Long.parseLong(mat.group(2));
++          } else if (mat.group(1).equals(MEMFREE_STRING)) {
++            ramSizeFree = Long.parseLong(mat.group(2));
++          } else if (mat.group(1).equals(SWAPFREE_STRING)) {
++            swapSizeFree = Long.parseLong(mat.group(2));
++          } else if (mat.group(1).equals(INACTIVE_STRING)) {
++            inactiveSize = Long.parseLong(mat.group(2));
++          }
++        }
++        str = in.readLine();
++      }
++    } catch (IOException io) {
++      LOG.warn("Error reading the stream " + io);
++    } finally {
++      // Close the streams
++      try {
++        fReader.close();
++        try {
++          in.close();
++        } catch (IOException i) {
++          LOG.warn("Error closing the stream " + in);
++        }
++      } catch (IOException i) {
++        LOG.warn("Error closing the stream " + fReader);
++      }
++    }
++
++    readMemInfoFile = true;
++  }
++
++  /**
++   * Read /proc/cpuinfo, parse and calculate CPU information
++   */
++  private void readProcCpuInfoFile() {
++    // This directory needs to be read only once
++    if (readCpuInfoFile) {
++      return;
++    }
++    // Read "/proc/cpuinfo" file
++    BufferedReader in = null;
++    FileReader fReader = null;
++    try {
++      fReader = new FileReader(procfsCpuFile);
++      in = new BufferedReader(fReader);
++    } catch (FileNotFoundException f) {
++      // shouldn't happen....
++      return;
++    }
++    Matcher mat = null;
++    try {
++      numProcessors = 0;
++      String str = in.readLine();
++      while (str != null) {
++        mat = PROCESSOR_FORMAT.matcher(str);
++        if (mat.find()) {
++          numProcessors++;
++        }
++        mat = FREQUENCY_FORMAT.matcher(str);
++        if (mat.find()) {
++          cpuFrequency = (long)(Double.parseDouble(mat.group(1)) * 1000); // kHz
++        }
++        str = in.readLine();
++      }
++    } catch (IOException io) {
++      LOG.warn("Error reading the stream " + io);
++    } finally {
++      // Close the streams
++      try {
++        fReader.close();
++        try {
++          in.close();
++        } catch (IOException i) {
++          LOG.warn("Error closing the stream " + in);
++        }
++      } catch (IOException i) {
++        LOG.warn("Error closing the stream " + fReader);
++      }
++    }
++    readCpuInfoFile = true;
++  }
++
++  /**
++   * Read /proc/stat file, parse and calculate cumulative CPU
++   */
++  private void readProcStatFile() {
++    // Read "/proc/stat" file
++    BufferedReader in = null;
++    FileReader fReader = null;
++    try {
++      fReader = new FileReader(procfsStatFile);
++      in = new BufferedReader(fReader);
++    } catch (FileNotFoundException f) {
++      // shouldn't happen....
++      return;
++    }
++
++    Matcher mat = null;
++    try {
++      String str = in.readLine();
++      while (str != null) {
++        mat = CPU_TIME_FORMAT.matcher(str);
++        if (mat.find()) {
++          long uTime = Long.parseLong(mat.group(1));
++          long nTime = Long.parseLong(mat.group(2));
++          long sTime = Long.parseLong(mat.group(3));
++          cumulativeCpuTime = uTime + nTime + sTime; // milliseconds
++          break;
++        }
++        str = in.readLine();
++      }
++      cumulativeCpuTime *= jiffyLengthInMillis;
++    } catch (IOException io) {
++      LOG.warn("Error reading the stream " + io);
++    } finally {
++      // Close the streams
++      try {
++        fReader.close();
++        try {
++          in.close();
++        } catch (IOException i) {
++          LOG.warn("Error closing the stream " + in);
++        }
++      } catch (IOException i) {
++        LOG.warn("Error closing the stream " + fReader);
++      }
++    }
++  }
++
++  /** {@inheritDoc} */
++  @Override
++  public long getPhysicalMemorySize() {
++    readProcMemInfoFile();
++    return ramSize * 1024;
++  }
++
++  /** {@inheritDoc} */
++  @Override
++  public long getVirtualMemorySize() {
++    readProcMemInfoFile();
++    return (ramSize + swapSize) * 1024;
++  }
++
++  /** {@inheritDoc} */
++  @Override
++  public long getAvailablePhysicalMemorySize() {
++    readProcMemInfoFile(true);
++    return (ramSizeFree + inactiveSize) * 1024;
++  }
++
++  /** {@inheritDoc} */
++  @Override
++  public long getAvailableVirtualMemorySize() {
++    readProcMemInfoFile(true);
++    return (ramSizeFree + swapSizeFree + inactiveSize) * 1024;
++  }
++
++  /** {@inheritDoc} */
++  @Override
++  public int getNumProcessors() {
++    readProcCpuInfoFile();
++    return numProcessors;
++  }
++
++  /** {@inheritDoc} */
++  @Override
++  public long getCpuFrequency() {
++    readProcCpuInfoFile();
++    return cpuFrequency;
++  }
++
++  /** {@inheritDoc} */
++  @Override
++  public long getCumulativeCpuTime() {
++    readProcStatFile();
++    return cumulativeCpuTime;
++  }
++
++  /** {@inheritDoc} */
++  @Override
++  public float getCpuUsage() {
++    readProcStatFile();
++    sampleTime = getCurrentTime();
++    if (lastSampleTime == UNAVAILABLE ||
++        lastSampleTime > sampleTime) {
++      // lastSampleTime > sampleTime may happen when the system time is changed
++      lastSampleTime = sampleTime;
++      lastCumulativeCpuTime = cumulativeCpuTime;
++      return cpuUsage;
++    }
++    // When lastSampleTime is sufficiently old, update cpuUsage.
++    // Also take a sample of the current time and cumulative CPU time for the
++    // use of the next calculation.
++    final long MINIMUM_UPDATE_INTERVAL = 10 * jiffyLengthInMillis;
++    if (sampleTime > lastSampleTime + MINIMUM_UPDATE_INTERVAL) {
++	    cpuUsage = (float)(cumulativeCpuTime - lastCumulativeCpuTime) * 100F /
++	               ((float)(sampleTime - lastSampleTime) * getNumProcessors());
++	    lastSampleTime = sampleTime;
++      lastCumulativeCpuTime = cumulativeCpuTime;
++    }
++    return cpuUsage;
++  }
++
++  /**
++   * Test the {@link LinuxResourceCalculatorPlugin}
++   *
++   * @param args
++   */
++  public static void main(String[] args) {
++    LinuxResourceCalculatorPlugin plugin = new LinuxResourceCalculatorPlugin();
++    System.out.println("Physical memory Size (bytes) : "
++        + plugin.getPhysicalMemorySize());
++    System.out.println("Total Virtual memory Size (bytes) : "
++        + plugin.getVirtualMemorySize());
++    System.out.println("Available Physical memory Size (bytes) : "
++        + plugin.getAvailablePhysicalMemorySize());
++    System.out.println("Total Available Virtual memory Size (bytes) : "
++        + plugin.getAvailableVirtualMemorySize());
++    System.out.println("Number of Processors : " + plugin.getNumProcessors());
++    System.out.println("CPU frequency (kHz) : " + plugin.getCpuFrequency());
++    System.out.println("Cumulative CPU time (ms) : " +
++            plugin.getCumulativeCpuTime());
++    try {
++      // Sleep so we can compute the CPU usage
++      Thread.sleep(500L);
++    } catch (InterruptedException e) {
++      // do nothing
++    }
++    System.out.println("CPU usage % : " + plugin.getCpuUsage());
++  }
++
++  @Override
++  public ProcResourceValues getProcResourceValues() {
++    pTree = pTree.getProcessTree();
++    long cpuTime = pTree.getCumulativeCpuTime();
++    long pMem = pTree.getCumulativeRssmem();
++    long vMem = pTree.getCumulativeVmem();
++    return new ProcResourceValues(cpuTime, pMem, vMem);
++  }
++}
+diff --git a/src/mapred/org/apache/hadoop/util/MemoryCalculatorPlugin.java b/src/mapred/org/apache/hadoop/util/MemoryCalculatorPlugin.java
+new file mode 100644
+index 0000000..a767b66
+--- /dev/null
++++ b/src/mapred/org/apache/hadoop/util/MemoryCalculatorPlugin.java
+@@ -0,0 +1,74 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.util;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.conf.Configured;
++
++/**
++ * Plugin to calculate virtual and physical memories on the system.
++ * 
++ */
++public abstract class MemoryCalculatorPlugin extends Configured {
++
++  /**
++   * Obtain the total size of the virtual memory present in the system.
++   * 
++   * @return virtual memory size in bytes.
++   */
++  public abstract long getVirtualMemorySize();
++
++  /**
++   * Obtain the total size of the physical memory present in the system.
++   * 
++   * @return physical memory size bytes.
++   */
++  public abstract long getPhysicalMemorySize();
++
++  /**
++   * Get the MemoryCalculatorPlugin from the class name and configure it. If
++   * class name is null, this method will try and return a memory calculator
++   * plugin available for this system.
++   * 
++   * @param clazz class-name
++   * @param conf configure the plugin with this.
++   * @return MemoryCalculatorPlugin
++   */
++  public static MemoryCalculatorPlugin getMemoryCalculatorPlugin(
++      Class<? extends MemoryCalculatorPlugin> clazz, Configuration conf) {
++
++    if (clazz != null) {
++      return ReflectionUtils.newInstance(clazz, conf);
++    }
++
++    // No class given, try a os specific class
++    try {
++      String osName = System.getProperty("os.name");
++      if (osName.startsWith("Linux")) {
++        return new LinuxMemoryCalculatorPlugin();
++      }
++    } catch (SecurityException se) {
++      // Failed to get Operating System name.
++      return null;
++    }
++
++    // Not supported on this system.
++    return null;
++  }
++}
+\ No newline at end of file
+diff --git a/src/mapred/org/apache/hadoop/util/PluginDispatcher.java b/src/mapred/org/apache/hadoop/util/PluginDispatcher.java
+new file mode 100644
+index 0000000..abbd8ac
+--- /dev/null
++++ b/src/mapred/org/apache/hadoop/util/PluginDispatcher.java
+@@ -0,0 +1,135 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.util;
++
++import org.apache.commons.logging.*;
++
++import org.apache.hadoop.conf.Configuration;
++
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.Collections;
++import java.util.List;
++import java.util.concurrent.Executor;
++import java.util.concurrent.Executors;
++
++/**
++ * Provides convenience functions for dispatching calls through
++ * to plugins registered with a class. Classes that wish to provide
++ * plugin interfaces should use this class to load the plugin list
++ * from the Configuration and to dispatch calls to the loaded instances.
++ *
++ * Calls dispatched through this class are performed on a second thread
++ * so as to not block execution of the plugged service.
++ */
++public class PluginDispatcher<T extends ServicePlugin> {
++  public static final Log LOG = LogFactory.getLog(PluginDispatcher.class.getName());
++
++  private final List<T> plugins;
++  private Executor executor;
++
++  /**
++   * Load a PluginDispatcher from the given Configuration. The start()
++   * callback will not be automatically called.
++   *
++   * @param conf the Configuration from which to load
++   * @param key the configuration key that lists class names to instantiate
++   * @param clazz the class or interface from which plugins must extend
++   */
++  public static <X extends ServicePlugin> PluginDispatcher<X> createFromConfiguration(
++    Configuration conf, String key, Class<X> clazz) {
++    List<X> plugins = new ArrayList<X>();
++    try {
++      plugins.addAll(conf.getInstances(key, clazz));
++    } catch (Throwable t) {
++      LOG.warn("Unable to load "+key+" plugins");
++    }
++    return new PluginDispatcher<X>(plugins);
++  }
++
++  PluginDispatcher(Collection<T> plugins) {
++    this.plugins = Collections.synchronizedList(new ArrayList<T>(plugins));
++    executor = Executors.newSingleThreadExecutor();
++  }
++
++  PluginDispatcher(Collection<T> plugins, Executor executor) {
++    this.plugins = Collections.synchronizedList(new ArrayList<T>(plugins));
++    this.executor = executor;
++  }
++
++  /**
++   * Dispatch a call to all active plugins.
++   *
++   * Exceptions will be caught and logged at WARN level.
++   *
++   * @param callback a function which will run once for each plugin, with
++   * that plugin as the argument
++   */
++  public void dispatchCall(final SingleArgumentRunnable<T> callback) {
++    executor.execute(new Runnable() {
++      public void run() {
++        for (T plugin : plugins) {
++          try {
++            callback.run(plugin);
++          } catch (Throwable t) {
++            LOG.warn("Uncaught exception dispatching to plugin " + plugin, t);
++          }
++        }
++      }});
++  }
++
++  /**
++   * Dispatches the start(...) hook common to all ServicePlugins. This
++   * also automatically removes any plugin that throws an exception while
++   * attempting to start.
++   *
++   * @param plugPoint passed to ServicePlugin.start()
++   */
++  public void dispatchStart(final Object plugPoint) {
++    dispatchCall(
++      new SingleArgumentRunnable<T>() {
++        public void run(T p) {
++          try {
++            p.start(plugPoint);
++          } catch (Throwable t) {
++            LOG.error("ServicePlugin " + p + " could not be started. " +
++                      "Removing from future callbacks.", t);
++            plugins.remove(p);
++          }
++        }
++      });
++  }
++
++  /**
++   * Convenience function for dispatching the stop() hook common to all
++   * ServicePlugins.
++   */
++  public void dispatchStop() {
++    dispatchCall(
++      new SingleArgumentRunnable<T>() {
++        public void run(T p) {
++          try {
++            p.stop();
++          } catch (Throwable t) {
++            LOG.warn("ServicePlugin " + p + " could not be stopped", t);
++          }
++        }
++      });
++  }
++}
+diff --git a/src/mapred/org/apache/hadoop/util/ProcessTree.java b/src/mapred/org/apache/hadoop/util/ProcessTree.java
+new file mode 100644
+index 0000000..bb54ac5
+--- /dev/null
++++ b/src/mapred/org/apache/hadoop/util/ProcessTree.java
+@@ -0,0 +1,218 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.util;
++
++import java.io.IOException;
++import java.util.Arrays;
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++
++import org.apache.hadoop.util.Shell.ExitCodeException;
++import org.apache.hadoop.util.Shell.ShellCommandExecutor;
++
++/** 
++ * Process tree related operations
++ */
++public class ProcessTree {
++
++  private static final Log LOG = LogFactory.getLog(ProcessTree.class);
++  
++  /**
++   * The constants for the signals.
++   */
++  public static enum Signal {
++    QUIT(3), KILL(9), TERM(15);
++    private int value;
++    private Signal(int value) {
++      this.value = value;
++    }
++    public int getValue() {
++      return value;
++    }
++  }
++
++  public static final boolean isSetsidAvailable = isSetsidSupported();
++  private static boolean isSetsidSupported() {
++    ShellCommandExecutor shexec = null;
++    boolean setsidSupported = true;
++    try {
++      String[] args = {"setsid", "bash", "-c", "echo $$"};
++      shexec = new ShellCommandExecutor(args);
++      shexec.execute();
++    } catch (IOException ioe) {
++      LOG.warn("setsid is not available on this machine. So not using it.");
++      setsidSupported = false;
++    } finally { // handle the exit code
++      LOG.info("setsid exited with exit code " + shexec.getExitCode());
++    }
++    return setsidSupported;
++  }
++
++  /**
++   * Kills the process(OR process group) by sending the signal SIGKILL
++   * in the current thread
++   * @param pid Process id(OR process group id) of to-be-deleted-process
++   * @param isProcessGroup Is pid a process group id of to-be-deleted-processes
++   * @param sleepTimeBeforeSigKill wait time before sending SIGKILL after
++   *  sending SIGTERM
++   */
++  private static void sigKillInCurrentThread(String pid, boolean isProcessGroup,
++      long sleepTimeBeforeSigKill) {
++    // Kill the subprocesses of root process(even if the root process is not
++    // alive) if process group is to be killed.
++    if (isProcessGroup || ProcessTree.isAlive(pid)) {
++      try {
++        // Sleep for some time before sending SIGKILL
++        Thread.sleep(sleepTimeBeforeSigKill);
++      } catch (InterruptedException i) {
++        LOG.warn("Thread sleep is interrupted.");
++      }
++      if(isProcessGroup) {
++        killProcessGroup(pid, Signal.KILL);
++      } else {
++        killProcess(pid, Signal.KILL);
++      }
++    }  
++  }
++  
++  /**
++   * Sends signal to process, forcefully terminating the process.
++   * 
++   * @param pid process id
++   * @param signal the signal number to send
++   */
++  public static void killProcess(String pid, Signal signal) {
++
++    //If process tree is not alive then return immediately.
++    if(!ProcessTree.isAlive(pid)) {
++      return;
++    }
++    String[] args = { "kill", "-" + signal.getValue(), pid };
++    ShellCommandExecutor shexec = new ShellCommandExecutor(args);
++    try {
++      shexec.execute();
++    } catch (IOException e) {
++      LOG.warn("Error sending signal " + signal + " to process "+ pid + " ."+ 
++          StringUtils.stringifyException(e));
++    } finally {
++      LOG.info("Killing process " + pid + " with signal " + signal + 
++               ". Exit code " + shexec.getExitCode());
++    }
++  }
++
++  /**
++   * Sends signal to all process belonging to same process group,
++   * forcefully terminating the process group.
++   * 
++   * @param pgrpId process group id
++   * @param signal the signal number to send
++   */
++  public static void killProcessGroup(String pgrpId, Signal signal) {
++
++    //If process tree is not alive then return immediately.
++    if(!ProcessTree.isProcessGroupAlive(pgrpId)) {
++      return;
++    }
++
++    String[] args = { "kill", "-" + signal.getValue() , "-"+pgrpId };
++    ShellCommandExecutor shexec = new ShellCommandExecutor(args);
++    try {
++      shexec.execute();
++    } catch (IOException e) {
++      LOG.warn("Error sending signal " + signal + " to process group "+ 
++               pgrpId + " ."+ 
++          StringUtils.stringifyException(e));
++    } finally {
++      LOG.info("Killing process group" + pgrpId + " with signal " + signal + 
++               ". Exit code " + shexec.getExitCode());
++    }
++  }
++  
++  /**
++   * Is the process with PID pid still alive?
++   * This method assumes that isAlive is called on a pid that was alive not
++   * too long ago, and hence assumes no chance of pid-wrapping-around.
++   * 
++   * @param pid pid of the process to check.
++   * @return true if process is alive.
++   */
++  public static boolean isAlive(String pid) {
++    ShellCommandExecutor shexec = null;
++    try {
++      String[] args = { "kill", "-0", pid };
++      shexec = new ShellCommandExecutor(args);
++      shexec.execute();
++    } catch (ExitCodeException ee) {
++      return false;
++    } catch (IOException ioe) {
++      LOG.warn("Error executing shell command "
++          + Arrays.toString(shexec.getExecString()) + ioe);
++      return false;
++    }
++    return (shexec.getExitCode() == 0 ? true : false);
++  }
++  
++  /**
++   * Is the process group with  still alive?
++   * 
++   * This method assumes that isAlive is called on a pid that was alive not
++   * too long ago, and hence assumes no chance of pid-wrapping-around.
++   * 
++   * @param pgrpId process group id
++   * @return true if any of process in group is alive.
++   */
++  public static boolean isProcessGroupAlive(String pgrpId) {
++    ShellCommandExecutor shexec = null;
++    try {
++      String[] args = { "kill", "-0", "-"+pgrpId };
++      shexec = new ShellCommandExecutor(args);
++      shexec.execute();
++    } catch (ExitCodeException ee) {
++      return false;
++    } catch (IOException ioe) {
++      LOG.warn("Error executing shell command "
++          + Arrays.toString(shexec.getExecString()) + ioe);
++      return false;
++    }
++    return (shexec.getExitCode() == 0 ? true : false);
++  }
++  
++
++  /**
++   * Helper thread class that kills process-tree with SIGKILL in background
++   */
++  static class SigKillThread extends Thread {
++    private String pid = null;
++    private boolean isProcessGroup = false;
++
++    private final long sleepTimeBeforeSigKill;
++
++    private SigKillThread(String pid, boolean isProcessGroup, long interval) {
++      this.pid = pid;
++      this.isProcessGroup = isProcessGroup;
++      this.setName(this.getClass().getName() + "-" + pid);
++      sleepTimeBeforeSigKill = interval;
++    }
++
++    public void run() {
++      sigKillInCurrentThread(pid, isProcessGroup, sleepTimeBeforeSigKill);
++    }
++  }
++}
+diff --git a/src/mapred/org/apache/hadoop/util/ProcfsBasedProcessTree.java b/src/mapred/org/apache/hadoop/util/ProcfsBasedProcessTree.java
+new file mode 100644
+index 0000000..49d340f
+--- /dev/null
++++ b/src/mapred/org/apache/hadoop/util/ProcfsBasedProcessTree.java
+@@ -0,0 +1,602 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.util;
++
++import java.io.BufferedReader;
++import java.io.File;
++import java.io.FileNotFoundException;
++import java.io.FileReader;
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Map;
++import java.util.HashMap;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++import java.util.LinkedList;
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.util.Shell.ShellCommandExecutor;
++
++/**
++ * A Proc file-system based ProcessTree. Works only on Linux.
++ */
++public class ProcfsBasedProcessTree extends ProcessTree {
++
++  static final Log LOG = LogFactory
++      .getLog(ProcfsBasedProcessTree.class);
++
++  private static final String PROCFS = "/proc/";
++  private static final Pattern PROCFS_STAT_FILE_FORMAT = Pattern .compile(
++    "^([0-9-]+)\\s([^\\s]+)\\s[^\\s]\\s([0-9-]+)\\s([0-9-]+)\\s([0-9-]+)\\s" +
++    "([0-9-]+\\s){7}([0-9]+)\\s([0-9]+)\\s([0-9-]+\\s){7}([0-9]+)\\s([0-9]+)" +
++    "(\\s[0-9-]+){15}");
++
++  static final String PROCFS_STAT_FILE = "stat";
++  static final String PROCFS_CMDLINE_FILE = "cmdline";
++  public static final long PAGE_SIZE;
++  static {
++    ShellCommandExecutor shellExecutor =
++            new ShellCommandExecutor(new String[]{"getconf",  "PAGESIZE"});
++    long pageSize = -1;
++    try {
++      shellExecutor.execute();
++      pageSize = Long.parseLong(shellExecutor.getOutput().replace("\n", ""));
++    } catch (IOException e) {
++      LOG.error(StringUtils.stringifyException(e));
++    } finally {
++      PAGE_SIZE = pageSize;
++    }
++  }
++  public static final long JIFFY_LENGTH_IN_MILLIS; // in millisecond
++  static {
++    ShellCommandExecutor shellExecutor =
++            new ShellCommandExecutor(new String[]{"getconf",  "CLK_TCK"});
++    long jiffiesPerSecond = -1;
++    try {
++      shellExecutor.execute();
++      jiffiesPerSecond = Long.parseLong(shellExecutor.getOutput().replace("\n", ""));
++    } catch (IOException e) {
++      LOG.error(StringUtils.stringifyException(e));
++    } finally {
++      JIFFY_LENGTH_IN_MILLIS = jiffiesPerSecond != -1 ?
++                     Math.round(1000D / jiffiesPerSecond) : -1;
++    }
++  }
++
++  // to enable testing, using this variable which can be configured
++  // to a test directory.
++  private String procfsDir;
++  
++  private Integer pid = -1;
++  private Long cpuTime = 0L;
++
++  private Map<Integer, ProcessInfo> processTree = new HashMap<Integer, ProcessInfo>();
++
++  public ProcfsBasedProcessTree(String pid) {
++    this(pid, false);
++  }
++  
++  public ProcfsBasedProcessTree(String pid, boolean setsidUsed) {
++    this(pid,PROCFS);
++  }
++
++  public ProcfsBasedProcessTree(String pid, String procfsDir) {
++    this.pid = getValidPID(pid);
++    this.procfsDir = procfsDir;
++  }
++  
++  /**
++   * Checks if the ProcfsBasedProcessTree is available on this system.
++   * 
++   * @return true if ProcfsBasedProcessTree is available. False otherwise.
++   */
++  public static boolean isAvailable() {
++    try {
++      String osName = System.getProperty("os.name");
++      if (!osName.startsWith("Linux")) {
++        LOG.info("ProcfsBasedProcessTree currently is supported only on "
++            + "Linux.");
++        return false;
++      }
++    } catch (SecurityException se) {
++      LOG.warn("Failed to get Operating System name. " + se);
++      return false;
++    }
++    return true;
++  }
++
++  /**
++   * Get the process-tree with latest state. If the root-process is not alive,
++   * an empty tree will be returned.
++   * 
++   * @return the process-tree with latest state.
++   */
++  public ProcfsBasedProcessTree getProcessTree() {
++    if (pid != -1) {
++      // Get the list of processes
++      List<Integer> processList = getProcessList();
++
++      Map<Integer, ProcessInfo> allProcessInfo = new HashMap<Integer, ProcessInfo>();
++      
++      // cache the processTree to get the age for processes
++      Map<Integer, ProcessInfo> oldProcs = 
++              new HashMap<Integer, ProcessInfo>(processTree);
++      processTree.clear();
++
++      ProcessInfo me = null;
++      for (Integer proc : processList) {
++        // Get information for each process
++        ProcessInfo pInfo = new ProcessInfo(proc);
++        if (constructProcessInfo(pInfo, procfsDir) != null) {
++          allProcessInfo.put(proc, pInfo);
++          if (proc.equals(this.pid)) {
++            me = pInfo; // cache 'me'
++            processTree.put(proc, pInfo);
++          }
++        }
++      }
++
++      if (me == null) {
++        return this; 
++      }
++
++      // Add each process to its parent.
++      for (Map.Entry<Integer, ProcessInfo> entry : allProcessInfo.entrySet()) {
++        Integer pID = entry.getKey();
++        if (pID != 1) {
++          ProcessInfo pInfo = entry.getValue();
++          ProcessInfo parentPInfo = allProcessInfo.get(pInfo.getPpid());
++          if (parentPInfo != null) {
++            parentPInfo.addChild(pInfo);
++          }
++        }
++      }
++
++      // now start constructing the process-tree
++      LinkedList<ProcessInfo> pInfoQueue = new LinkedList<ProcessInfo>();
++      pInfoQueue.addAll(me.getChildren());
++      while (!pInfoQueue.isEmpty()) {
++        ProcessInfo pInfo = pInfoQueue.remove();
++        if (!processTree.containsKey(pInfo.getPid())) {
++          processTree.put(pInfo.getPid(), pInfo);
++        }
++        pInfoQueue.addAll(pInfo.getChildren());
++      }
++
++      // update age values and compute the number of jiffies since last update
++      for (Map.Entry<Integer, ProcessInfo> procs : processTree.entrySet()) {
++        ProcessInfo oldInfo = oldProcs.get(procs.getKey());
++        if (procs.getValue() != null) {
++          procs.getValue().updateJiffy(oldInfo);
++          if (oldInfo != null) {
++            procs.getValue().updateAge(oldInfo);  
++          }
++        }
++      }
++
++      if (LOG.isDebugEnabled()) {
++        // Log.debug the ProcfsBasedProcessTree
++        LOG.debug(this.toString());
++      }
++    }
++    return this;
++  }
++
++  /**
++   * Is the root-process alive?
++   * 
++   * @return true if the root-process is alive, false otherwise.
++   */
++  public boolean isAlive() {
++    if (pid == -1) {
++      return false;
++    } else {
++      return isAlive(pid.toString());
++    }
++  }
++
++  /**
++   * Is any of the subprocesses in the process-tree alive?
++   * 
++   * @return true if any of the processes in the process-tree is
++   *           alive, false otherwise.
++   */
++  public boolean isAnyProcessInTreeAlive() {
++    for (Integer pId : processTree.keySet()) {
++      if (isAlive(pId.toString())) {
++        return true;
++      }
++    }
++    return false;
++  }
++
++  private static final String PROCESSTREE_DUMP_FORMAT =
++      "\t|- %d %d %d %d %s %d %d %d %d %s\n";
++
++  /**
++   * Get a dump of the process-tree.
++   * 
++   * @return a string concatenating the dump of information of all the processes
++   *         in the process-tree
++   */
++  public String getProcessTreeDump() {
++    StringBuilder ret = new StringBuilder();
++    // The header.
++    ret.append(String.format("\t|- PID PPID PGRPID SESSID CMD_NAME "
++        + "USER_MODE_TIME(MILLIS) SYSTEM_TIME(MILLIS) VMEM_USAGE(BYTES) "
++        + "RSSMEM_USAGE(PAGES) FULL_CMD_LINE\n"));
++    for (ProcessInfo p : processTree.values()) {
++      if (p != null) {
++        ret.append(String.format(PROCESSTREE_DUMP_FORMAT, p.getPid(), p
++            .getPpid(), p.getPgrpId(), p.getSessionId(), p.getName(), p
++            .getUtime(), p.getStime(), p.getVmem(), p.getRssmemPage(), p
++            .getCmdLine(procfsDir)));
++      }
++    }
++    return ret.toString();
++  }
++
++  /**
++   * Get the cumulative virtual memory used by all the processes in the
++   * process-tree.
++   * 
++   * @return cumulative virtual memory used by the process-tree in bytes.
++   */
++  public long getCumulativeVmem() {
++    // include all processes.. all processes will be older than 0.
++    return getCumulativeVmem(0);
++  }
++
++  /**
++   * Get the cumulative resident set size (rss) memory used by all the processes
++   * in the process-tree.
++   *
++   * @return cumulative rss memory used by the process-tree in bytes. return 0
++   *         if it cannot be calculated
++   */
++  public long getCumulativeRssmem() {
++    // include all processes.. all processes will be older than 0.
++    return getCumulativeRssmem(0);
++  }
++
++  /**
++   * Get the cumulative virtual memory used by all the processes in the
++   * process-tree that are older than the passed in age.
++   * 
++   * @param olderThanAge processes above this age are included in the
++   *                      memory addition
++   * @return cumulative virtual memory used by the process-tree in bytes,
++   *          for processes older than this age.
++   */
++  public long getCumulativeVmem(int olderThanAge) {
++    long total = 0;
++    for (ProcessInfo p : processTree.values()) {
++      if ((p != null) && (p.getAge() > olderThanAge)) {
++        total += p.getVmem();
++      }
++    }
++    return total;
++  }
++
++  /**
++   * Get the cumulative resident set size (rss) memory used by all the processes
++   * in the process-tree that are older than the passed in age.
++   *
++   * @param olderThanAge processes above this age are included in the
++   *                      memory addition
++   * @return cumulative rss memory used by the process-tree in bytes,
++   *          for processes older than this age. return 0 if it cannot be
++   *          calculated
++   */
++  public long getCumulativeRssmem(int olderThanAge) {
++    if (PAGE_SIZE < 0) {
++      return 0;
++    }
++    long totalPages = 0;
++    for (ProcessInfo p : processTree.values()) {
++      if ((p != null) && (p.getAge() > olderThanAge)) {
++        totalPages += p.getRssmemPage();
++      }
++    }
++    return totalPages * PAGE_SIZE; // convert # pages to byte
++  }
++
++  /**
++   * Get the CPU time in millisecond used by all the processes in the
++   * process-tree since the process-tree created
++   *
++   * @return cumulative CPU time in millisecond since the process-tree created
++   *         return 0 if it cannot be calculated
++   */
++  public long getCumulativeCpuTime() {
++    if (JIFFY_LENGTH_IN_MILLIS < 0) {
++      return 0;
++    }
++    long incJiffies = 0;
++    for (ProcessInfo p : processTree.values()) {
++      if (p != null) {
++        incJiffies += p.dtime;
++      }
++    }
++    cpuTime += incJiffies * JIFFY_LENGTH_IN_MILLIS;
++    return cpuTime;
++  }
++
++  private static Integer getValidPID(String pid) {
++    Integer retPid = -1;
++    try {
++      retPid = Integer.parseInt((String) pid);
++      if (retPid <= 0) {
++        retPid = -1;
++      }
++    } catch (NumberFormatException nfe) {
++      retPid = -1;
++    }
++    return retPid;
++  }
++
++  /**
++   * Get the list of all processes in the system.
++   */
++  private List<Integer> getProcessList() {
++    String[] processDirs = (new File(procfsDir)).list();
++    List<Integer> processList = new ArrayList<Integer>();
++
++    if (processDirs != null) {
++      for (String dir : processDirs) {
++        try {
++          int pd = Integer.parseInt(dir);
++          if ((new File(procfsDir, dir)).isDirectory()) {
++            processList.add(Integer.valueOf(pd));
++          }
++        } catch (NumberFormatException n) {
++          // skip this directory
++        } catch (SecurityException s) {
++          // skip this process
++        }
++      }
++    }
++    return processList;
++  }
++
++  /**
++   * Construct the ProcessInfo using the process' PID and procfs rooted at the
++   * specified directory and return the same. It is provided mainly to assist
++   * testing purposes.
++   * 
++   * Returns null on failing to read from procfs,
++   *
++   * @param pinfo ProcessInfo that needs to be updated
++   * @param procfsDir root of the proc file system
++   * @return updated ProcessInfo, null on errors.
++   */
++  private static ProcessInfo constructProcessInfo(ProcessInfo pinfo, 
++                                                    String procfsDir) {
++    ProcessInfo ret = null;
++    // Read "procfsDir/<pid>/stat" file
++    BufferedReader in = null;
++    FileReader fReader = null;
++    try {
++      File pidDir = new File(procfsDir, String.valueOf(pinfo.getPid()));
++      fReader = new FileReader(new File(pidDir, PROCFS_STAT_FILE));
++      in = new BufferedReader(fReader);
++    } catch (FileNotFoundException f) {
++      // The process vanished in the interim!
++      return ret;
++    }
++
++    ret = pinfo;
++    try {
++      String str = in.readLine(); // only one line
++      Matcher m = PROCFS_STAT_FILE_FORMAT.matcher(str);
++      boolean mat = m.find();
++      if (mat) {
++        // Set (name) (ppid) (pgrpId) (session) (utime) (stime) (vsize) (rss)
++         pinfo.updateProcessInfo(m.group(2), Integer.parseInt(m.group(3)),
++                 Integer.parseInt(m.group(4)), Integer.parseInt(m.group(5)),
++                 Long.parseLong(m.group(7)), Long.parseLong(m.group(8)),
++                 Long.parseLong(m.group(10)), Long.parseLong(m.group(11)));
++      }
++    } catch (IOException io) {
++      LOG.warn("Error reading the stream " + io);
++      ret = null;
++    } finally {
++      // Close the streams
++      try {
++        fReader.close();
++        try {
++          in.close();
++        } catch (IOException i) {
++          LOG.warn("Error closing the stream " + in);
++        }
++      } catch (IOException i) {
++        LOG.warn("Error closing the stream " + fReader);
++      }
++    }
++
++    return ret;
++  }
++  
++  /**
++   * Returns a string printing PIDs of process present in the
++   * ProcfsBasedProcessTree. Output format : [pid pid ..]
++   */
++  public String toString() {
++    StringBuffer pTree = new StringBuffer("[ ");
++    for (Integer p : processTree.keySet()) {
++      pTree.append(p);
++      pTree.append(" ");
++    }
++    return pTree.substring(0, pTree.length()) + "]";
++  }
++
++  /**
++   * 
++   * Class containing information of a process.
++   * 
++   */
++  private static class ProcessInfo {
++    private Integer pid; // process-id
++    private String name; // command name
++    private Integer pgrpId; // process group-id
++    private Integer ppid; // parent process-id
++    private Integer sessionId; // session-id
++    private Long vmem; // virtual memory usage
++    private Long rssmemPage; // rss memory usage in # of pages
++    private Long utime = 0L; // # of jiffies in user mode
++    private Long stime = 0L; // # of jiffies in kernel mode
++    // how many times has this process been seen alive
++    private int age; 
++
++    // # of jiffies used since last update:
++    private Long dtime = 0L;
++    // dtime = (utime + stime) - (utimeOld + stimeOld)
++    // We need this to compute the cumulative CPU time
++    // because the subprocess may finish earlier than root process
++
++    private List<ProcessInfo> children = new ArrayList<ProcessInfo>(); // list of children
++
++    public ProcessInfo(int pid) {
++      this.pid = Integer.valueOf(pid);
++      // seeing this the first time.
++      this.age = 1;
++    }
++
++    public Integer getPid() {
++      return pid;
++    }
++
++    public String getName() {
++      return name;
++    }
++
++    public Integer getPgrpId() {
++      return pgrpId;
++    }
++
++    public Integer getPpid() {
++      return ppid;
++    }
++
++    public Integer getSessionId() {
++      return sessionId;
++    }
++
++    public Long getVmem() {
++      return vmem;
++    }
++
++    public Long getUtime() {
++      return utime;
++    }
++
++    public Long getStime() {
++      return stime;
++    }
++
++    public Long getDtime() {
++      return dtime;
++    }
++
++    public Long getRssmemPage() { // get rss # of pages
++      return rssmemPage;
++    }
++
++    public int getAge() {
++      return age;
++    }
++    
++    public void updateProcessInfo(String name, Integer ppid, Integer pgrpId,
++        Integer sessionId, Long utime, Long stime, Long vmem, Long rssmem) {
++      this.name = name;
++      this.ppid = ppid;
++      this.pgrpId = pgrpId;
++      this.sessionId = sessionId;
++      this.utime = utime;
++      this.stime = stime;
++      this.vmem = vmem;
++      this.rssmemPage = rssmem;
++    }
++
++    public void updateJiffy(ProcessInfo oldInfo) {
++      this.dtime = (oldInfo == null ? this.utime + this.stime
++              : (this.utime + this.stime) - (oldInfo.utime + oldInfo.stime));
++    }
++
++    public void updateAge(ProcessInfo oldInfo) {
++      this.age = oldInfo.age + 1;
++    }
++    
++    public boolean addChild(ProcessInfo p) {
++      return children.add(p);
++    }
++
++    public List<ProcessInfo> getChildren() {
++      return children;
++    }
++
++    public String getCmdLine(String procfsDir) {
++      String ret = "N/A";
++      if (pid == null) {
++        return ret;
++      }
++      BufferedReader in = null;
++      FileReader fReader = null;
++      try {
++        fReader =
++            new FileReader(new File(new File(procfsDir, pid.toString()),
++                PROCFS_CMDLINE_FILE));
++      } catch (FileNotFoundException f) {
++        // The process vanished in the interim!
++        return ret;
++      }
++
++      in = new BufferedReader(fReader);
++
++      try {
++        ret = in.readLine(); // only one line
++        ret = ret.replace('\0', ' '); // Replace each null char with a space
++        if (ret.equals("")) {
++          // The cmdline might be empty because the process is swapped out or is
++          // a zombie.
++          ret = "N/A";
++        }
++      } catch (IOException io) {
++        LOG.warn("Error reading the stream " + io);
++        ret = "N/A";
++      } finally {
++        // Close the streams
++        try {
++          fReader.close();
++          try {
++            in.close();
++          } catch (IOException i) {
++            LOG.warn("Error closing the stream " + in);
++          }
++        } catch (IOException i) {
++          LOG.warn("Error closing the stream " + fReader);
++        }
++      }
++
++      return ret;
++    }
++  }
++}
+diff --git a/src/mapred/org/apache/hadoop/util/ResourceCalculatorPlugin.java b/src/mapred/org/apache/hadoop/util/ResourceCalculatorPlugin.java
+new file mode 100644
+index 0000000..d6f1c42
+--- /dev/null
++++ b/src/mapred/org/apache/hadoop/util/ResourceCalculatorPlugin.java
+@@ -0,0 +1,159 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.util;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.conf.Configured;
++import org.apache.hadoop.util.ReflectionUtils;
++
++/**
++ * Plugin to calculate resource information on the system.
++ * 
++ */
++public abstract class ResourceCalculatorPlugin extends Configured {
++
++  /**
++   * Obtain the total size of the virtual memory present in the system.
++   * 
++   * @return virtual memory size in bytes.
++   */
++  public abstract long getVirtualMemorySize();
++
++  /**
++   * Obtain the total size of the physical memory present in the system.
++   * 
++   * @return physical memory size bytes.
++   */
++  public abstract long getPhysicalMemorySize();
++
++  /**
++   * Obtain the total size of the available virtual memory present
++   * in the system.
++   *
++   * @return available virtual memory size in bytes.
++   */
++  public abstract long getAvailableVirtualMemorySize();
++
++  /**
++   * Obtain the total size of the available physical memory present
++   * in the system.
++   *
++   * @return available physical memory size bytes.
++   */
++  public abstract long getAvailablePhysicalMemorySize();
++
++  /**
++   * Obtain the total number of processors present on the system.
++   *
++   * @return number of processors
++   */
++  public abstract int getNumProcessors();
++
++  /**
++   * Obtain the CPU frequency of on the system.
++   *
++   * @return CPU frequency in kHz
++   */
++  public abstract long getCpuFrequency();
++
++  /**
++   * Obtain the cumulative CPU time since the system is on.
++   *
++   * @return cumulative CPU time in milliseconds
++   */
++  public abstract long getCumulativeCpuTime();
++
++  /**
++   * Obtain the CPU usage % of the machine. Return -1 if it is unavailable
++   *
++   * @return CPU usage in %
++   */
++  public abstract float getCpuUsage();
++
++  /**
++   * Obtain resource status used by current process tree.
++   */
++  public abstract ProcResourceValues getProcResourceValues();
++
++  public static class ProcResourceValues {
++    private final long cumulativeCpuTime;
++    private final long physicalMemorySize;
++    private final long virtualMemorySize;
++    public ProcResourceValues(long cumulativeCpuTime, long physicalMemorySize,
++                              long virtualMemorySize) {
++      this.cumulativeCpuTime = cumulativeCpuTime;
++      this.physicalMemorySize = physicalMemorySize;
++      this.virtualMemorySize = virtualMemorySize;
++    }
++    /**
++     * Obtain the physical memory size used by current process tree.
++     * @return physical memory size in bytes.
++     */
++    public long getPhysicalMemorySize() {
++      return physicalMemorySize;
++    }
++
++    /**
++     * Obtain the virtual memory size used by a current process tree.
++     * @return virtual memory size in bytes.
++     */
++    public long getVirtualMemorySize() {
++      return virtualMemorySize;
++    }
++
++    /**
++     * Obtain the cumulative CPU time used by a current process tree.
++     * @return cumulative CPU time in milliseconds
++     */
++    public long getCumulativeCpuTime() {
++      return cumulativeCpuTime;
++    }
++  }
++
++  /**
++   * Get the ResourceCalculatorPlugin from the class name and configure it. If
++   * class name is null, this method will try and return a memory calculator
++   * plugin available for this system.
++   * 
++   * @param clazz class-name
++   * @param conf configure the plugin with this.
++   * @return ResourceCalculatorPlugin
++   */
++  public static ResourceCalculatorPlugin getResourceCalculatorPlugin(
++      Class<? extends ResourceCalculatorPlugin> clazz, Configuration conf) {
++
++    if (clazz != null) {
++      return ReflectionUtils.newInstance(clazz, conf);
++    }
++
++    // No class given, try a os specific class
++    try {
++      String osName = System.getProperty("os.name");
++      if (osName.startsWith("Linux")) {
++        return new LinuxResourceCalculatorPlugin();
++      }
++    } catch (SecurityException se) {
++      // Failed to get Operating System name.
++      return null;
++    }
++
++    // Not supported on this system.
++    return null;
++  }
++}
+diff --git a/src/mapred/org/apache/hadoop/util/SingleArgumentRunnable.java b/src/mapred/org/apache/hadoop/util/SingleArgumentRunnable.java
+new file mode 100644
+index 0000000..0c5e445
+--- /dev/null
++++ b/src/mapred/org/apache/hadoop/util/SingleArgumentRunnable.java
+@@ -0,0 +1,25 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.util;
++
++/**
++ * Simple interface for a Runnable that takes a single argument.
++ */
++public interface SingleArgumentRunnable<T> {
++  public void run(T arg);
++}
+\ No newline at end of file
+-- 
+1.7.0.4
+

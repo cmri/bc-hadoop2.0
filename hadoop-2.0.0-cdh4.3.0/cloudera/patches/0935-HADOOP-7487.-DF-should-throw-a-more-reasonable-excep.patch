@@ -1,0 +1,298 @@
+From a3c6e3539b70f38782bf1de53b9d75045ccc3a6c Mon Sep 17 00:00:00 2001
+From: Aaron Twining Myers <atm@apache.org>
+Date: Tue, 26 Feb 2013 01:37:28 +0000
+Subject: [PATCH 0935/1357] HADOOP-7487. DF should throw a more reasonable exception when mount cannot be determined. Contributed by Andrew Wang.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1449992 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit c936078f062a50ebb8a9eb76ee5bad06684bd4cd)
+---
+ .../src/main/java/org/apache/hadoop/fs/DF.java     |  111 ++++++++++++++------
+ .../org/apache/hadoop/fs/TestDFVariations.java     |   84 ++++++++++++++-
+ 2 files changed, 159 insertions(+), 36 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/DF.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/DF.java
+index 9949834..d66dfdb 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/DF.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/DF.java
+@@ -17,19 +17,22 @@
+  */
+ package org.apache.hadoop.fs;
+ 
++import java.io.BufferedReader;
+ import java.io.File;
++import java.io.FileNotFoundException;
+ import java.io.IOException;
+-import java.io.BufferedReader;
+-
++import java.util.ArrayList;
+ import java.util.EnumSet;
++import java.util.NoSuchElementException;
+ import java.util.StringTokenizer;
+ 
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.classification.InterfaceStability;
+ import org.apache.hadoop.conf.Configuration;
+-import org.apache.hadoop.fs.CommonConfigurationKeys;
+ import org.apache.hadoop.util.Shell;
+ 
++import com.google.common.annotations.VisibleForTesting;
++
+ /** Filesystem disk space usage statistics.
+  * Uses the unix 'df' program to get mount points, and java.io.File for
+  * space utilization. Tested on Linux, FreeBSD, Cygwin. */
+@@ -44,6 +47,8 @@ public class DF extends Shell {
+   private final File dirFile;
+   private String filesystem;
+   private String mount;
++  
++  private ArrayList<String> output;
+ 
+   enum OSType {
+     OS_TYPE_UNIX("UNIX"),
+@@ -84,6 +89,7 @@ public class DF extends Shell {
+     super(dfInterval);
+     this.dirPath = path.getCanonicalPath();
+     this.dirFile = new File(this.dirPath);
++    this.output = new ArrayList<String>();
+   }
+ 
+   protected OSType getOSType() {
+@@ -127,7 +133,21 @@ public class DF extends Shell {
+ 
+   /** @return the filesystem mount point for the indicated volume */
+   public String getMount() throws IOException {
++    // Abort early if specified path does not exist
++    if (!dirFile.exists()) {
++      throw new FileNotFoundException("Specified path " + dirFile.getPath()
++          + "does not exist");
++    }
+     run();
++    // Skip parsing if df was not successful
++    if (getExitCode() != 0) {
++      StringBuffer sb = new StringBuffer("df could not be run successfully: ");
++      for (String line: output) {
++        sb.append(line);
++      }
++      throw new IOException(sb.toString());
++    }
++    parseOutput();
+     return mount;
+   }
+   
+@@ -151,46 +171,71 @@ public class DF extends Shell {
+ 
+   @Override
+   protected void parseExecResult(BufferedReader lines) throws IOException {
+-    lines.readLine();                         // skip headings
+-  
++    output.clear();
+     String line = lines.readLine();
+-    if (line == null) {
+-      throw new IOException( "Expecting a line not the end of stream" );
++    while (line != null) {
++      output.add(line);
++      line = lines.readLine();
++    }
++  }
++  
++  @VisibleForTesting
++  protected void parseOutput() throws IOException {
++    if (output.size() < 2) {
++      StringBuffer sb = new StringBuffer("Fewer lines of output than expected");
++      if (output.size() > 0) {
++        sb.append(": " + output.get(0));
++      }
++      throw new IOException(sb.toString());
+     }
++    
++    String line = output.get(1);
+     StringTokenizer tokens =
+       new StringTokenizer(line, " \t\n\r\f%");
+     
+-    this.filesystem = tokens.nextToken();
++    try {
++      this.filesystem = tokens.nextToken();
++    } catch (NoSuchElementException e) {
++      throw new IOException("Unexpected empty line");
++    }
+     if (!tokens.hasMoreTokens()) {            // for long filesystem name
+-      line = lines.readLine();
+-      if (line == null) {
+-        throw new IOException( "Expecting a line not the end of stream" );
++      if (output.size() > 2) {
++        line = output.get(2);
++      } else {
++        throw new IOException("Expecting additional output after line: "
++            + line);
+       }
+       tokens = new StringTokenizer(line, " \t\n\r\f%");
+     }
+ 
+-    switch(getOSType()) {
+-      case OS_TYPE_AIX:
+-        Long.parseLong(tokens.nextToken()); // capacity
+-        Long.parseLong(tokens.nextToken()); // available
+-        Integer.parseInt(tokens.nextToken()); // pct used
+-        tokens.nextToken();
+-        tokens.nextToken();
+-        this.mount = tokens.nextToken();
+-        break;
+-
+-      case OS_TYPE_WIN:
+-      case OS_TYPE_SOLARIS:
+-      case OS_TYPE_MAC:
+-      case OS_TYPE_UNIX:
+-      default:
+-        Long.parseLong(tokens.nextToken()); // capacity
+-        Long.parseLong(tokens.nextToken()); // used
+-        Long.parseLong(tokens.nextToken()); // available
+-        Integer.parseInt(tokens.nextToken()); // pct used
+-        this.mount = tokens.nextToken();
+-        break;
+-   }
++    try {
++      switch(getOSType()) {
++        case OS_TYPE_AIX:
++          Long.parseLong(tokens.nextToken()); // capacity
++          Long.parseLong(tokens.nextToken()); // available
++          Integer.parseInt(tokens.nextToken()); // pct used
++          tokens.nextToken();
++          tokens.nextToken();
++          this.mount = tokens.nextToken();
++          break;
++
++        case OS_TYPE_WIN:
++        case OS_TYPE_SOLARIS:
++        case OS_TYPE_MAC:
++        case OS_TYPE_UNIX:
++        default:
++          Long.parseLong(tokens.nextToken()); // capacity
++          Long.parseLong(tokens.nextToken()); // used
++          Long.parseLong(tokens.nextToken()); // available
++          Integer.parseInt(tokens.nextToken()); // pct used
++          this.mount = tokens.nextToken();
++          break;
++     }
++    } catch (NoSuchElementException e) {
++      throw new IOException("Could not parse line: " + line);
++    } catch (NumberFormatException e) {
++      throw new IOException("Could not parse line: " + line);
++    }
+   }
+ 
+   public static void main(String[] args) throws Exception {
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/TestDFVariations.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/TestDFVariations.java
+index b5bd65b..f6cdf74 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/TestDFVariations.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/TestDFVariations.java
+@@ -17,13 +17,22 @@
+ */
+ package org.apache.hadoop.fs;
+ 
+-import junit.framework.TestCase;
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.fail;
+ 
++import java.io.BufferedReader;
+ import java.io.File;
++import java.io.FileNotFoundException;
+ import java.io.IOException;
++import java.io.StringReader;
+ import java.util.EnumSet;
++import java.util.Random;
+ 
+-public class TestDFVariations extends TestCase {
++import org.apache.hadoop.test.GenericTestUtils;
++import org.apache.hadoop.util.Shell;
++import org.junit.Test;
++
++public class TestDFVariations {
+ 
+   public static class XXDF extends DF {
+     private final String osName;
+@@ -48,12 +57,81 @@ public class TestDFVariations extends TestCase {
+     }
+   }
+ 
++  @Test(timeout=5000)
+   public void testOSParsing() throws Exception {
+     for (DF.OSType ost : EnumSet.allOf(DF.OSType.class)) {
+       XXDF df = new XXDF(ost.getId());
+       assertEquals(ost.getId() + " mount", "/foo/bar", df.getMount());
+     }
+   }
+-
++  
++  @Test(timeout=5000)
++  public void testDFInvalidPath() throws Exception {
++    // Generate a path that doesn't exist
++    Random random = new Random(0xDEADBEEFl);
++    File file = null;
++    byte[] bytes = new byte[64];
++    while (file == null) {
++      random.nextBytes(bytes);
++      final String invalid = new String("/" + bytes);
++      final File invalidFile = new File(invalid);
++      if (!invalidFile.exists()) {
++        file = invalidFile;
++      }
++    }
++    DF df = new DF(file, 0l);
++    try {
++      df.getMount();
++    } catch (FileNotFoundException e) {
++      // expected, since path does not exist
++      GenericTestUtils.assertExceptionContains(file.getName(), e);
++    }
++  }
++  
++  @Test(timeout=5000)
++  public void testDFMalformedOutput() throws Exception {
++    DF df = new DF(new File("/"), 0l);
++    BufferedReader reader = new BufferedReader(new StringReader(
++        "Filesystem     1K-blocks     Used Available Use% Mounted on\n" +
++        "/dev/sda5       19222656 10597036   7649060  59% /"));
++    df.parseExecResult(reader);
++    df.parseOutput();
++    
++    reader = new BufferedReader(new StringReader(
++        "Filesystem     1K-blocks     Used Available Use% Mounted on"));
++    df.parseExecResult(reader);
++    try {
++      df.parseOutput();
++      fail("Expected exception with missing line!");
++    } catch (IOException e) {
++      GenericTestUtils.assertExceptionContains(
++          "Fewer lines of output than expected", e);
++      System.out.println(e.toString());
++    }
++    
++    reader = new BufferedReader(new StringReader(
++        "Filesystem     1K-blocks     Used Available Use% Mounted on\n" +
++        " "));
++    df.parseExecResult(reader);
++    try {
++      df.parseOutput();
++      fail("Expected exception with empty line!");
++    } catch (IOException e) {
++      GenericTestUtils.assertExceptionContains("Unexpected empty line", e);
++      System.out.println(e.toString());
++    }
++    
++    reader = new BufferedReader(new StringReader(
++        "Filesystem     1K-blocks     Used Available Use% Mounted on\n" +
++        "       19222656 10597036   7649060  59% /"));
++    df.parseExecResult(reader);
++    try {
++      df.parseOutput();
++      fail("Expected exception with missing field!");
++    } catch (IOException e) {
++      GenericTestUtils.assertExceptionContains("Could not parse line: ", e);
++      System.out.println(e.toString());
++    }
++  }
+ }
+ 
+-- 
+1.7.0.4
+

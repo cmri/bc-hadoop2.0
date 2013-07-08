@@ -1,0 +1,245 @@
+From beb1d66824f87f0863635a890728ccd5b0013fea Mon Sep 17 00:00:00 2001
+From: Aaron Twining Myers <atm@apache.org>
+Date: Wed, 27 Mar 2013 21:52:52 +0000
+Subject: [PATCH 0991/1357] HADOOP-9125. LdapGroupsMapping threw CommunicationException after some idle time. Contributed by Kai Zheng.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/branch-2@1461864 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit b14e045d8abb84465f07452f60cb40d20c12e4d8)
+---
+ .../apache/hadoop/security/LdapGroupsMapping.java  |   78 ++++++++++++++------
+ .../hadoop/security/TestLdapGroupsMapping.java     |   59 +++++++++++----
+ 2 files changed, 99 insertions(+), 38 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/LdapGroupsMapping.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/LdapGroupsMapping.java
+index bcccb19..eda7115 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/LdapGroupsMapping.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/LdapGroupsMapping.java
+@@ -24,6 +24,7 @@ import java.util.ArrayList;
+ import java.util.Hashtable;
+ import java.util.List;
+ 
++import javax.naming.CommunicationException;
+ import javax.naming.Context;
+ import javax.naming.NamingEnumeration;
+ import javax.naming.NamingException;
+@@ -166,6 +167,8 @@ public class LdapGroupsMapping
+   private String groupMemberAttr;
+   private String groupNameAttr;
+ 
++  public static int RECONNECT_RETRY_COUNT = 3;
++  
+   /**
+    * Returns list of groups for a user.
+    * 
+@@ -178,34 +181,63 @@ public class LdapGroupsMapping
+    */
+   @Override
+   public synchronized List<String> getGroups(String user) throws IOException {
++    List<String> emptyResults = new ArrayList<String>();
++    /*
++     * Normal garbage collection takes care of removing Context instances when they are no longer in use. 
++     * Connections used by Context instances being garbage collected will be closed automatically.
++     * So in case connection is closed and gets CommunicationException, retry some times with new new DirContext/connection. 
++     */
++    try {
++      return doGetGroups(user);
++    } catch (CommunicationException e) {
++      LOG.warn("Connection is closed, will try to reconnect");
++    } catch (NamingException e) {
++      LOG.warn("Exception trying to get groups for user " + user, e);
++      return emptyResults;
++    }
++
++    int retryCount = 0;
++    while (retryCount ++ < RECONNECT_RETRY_COUNT) {
++      //reset ctx so that new DirContext can be created with new connection
++      this.ctx = null;
++      
++      try {
++        return doGetGroups(user);
++      } catch (CommunicationException e) {
++        LOG.warn("Connection being closed, reconnecting failed, retryCount = " + retryCount);
++      } catch (NamingException e) {
++        LOG.warn("Exception trying to get groups for user " + user, e);
++        return emptyResults;
++      }
++    }
++    
++    return emptyResults;
++  }
++  
++  List<String> doGetGroups(String user) throws NamingException {
+     List<String> groups = new ArrayList<String>();
+ 
+-    try {
+-      DirContext ctx = getDirContext();
+-
+-      // Search for the user. We'll only ever need to look at the first result
+-      NamingEnumeration<SearchResult> results = ctx.search(baseDN,
+-                                                           userSearchFilter,
+-                                                           new Object[]{user},
+-                                                           SEARCH_CONTROLS);
+-      if (results.hasMoreElements()) {
+-        SearchResult result = results.nextElement();
+-        String userDn = result.getNameInNamespace();
+-
+-        NamingEnumeration<SearchResult> groupResults =
++    DirContext ctx = getDirContext();
++
++    // Search for the user. We'll only ever need to look at the first result
++    NamingEnumeration<SearchResult> results = ctx.search(baseDN,
++        userSearchFilter,
++        new Object[]{user},
++        SEARCH_CONTROLS);
++    if (results.hasMoreElements()) {
++      SearchResult result = results.nextElement();
++      String userDn = result.getNameInNamespace();
++
++      NamingEnumeration<SearchResult> groupResults =
+           ctx.search(baseDN,
+-                     "(&" + groupSearchFilter + "(" + groupMemberAttr + "={0}))",
+-                     new Object[]{userDn},
+-                     SEARCH_CONTROLS);
+-        while (groupResults.hasMoreElements()) {
+-          SearchResult groupResult = groupResults.nextElement();
+-          Attribute groupName = groupResult.getAttributes().get(groupNameAttr);
+-          groups.add(groupName.get().toString());
+-        }
++              "(&" + groupSearchFilter + "(" + groupMemberAttr + "={0}))",
++              new Object[]{userDn},
++              SEARCH_CONTROLS);
++      while (groupResults.hasMoreElements()) {
++        SearchResult groupResult = groupResults.nextElement();
++        Attribute groupName = groupResult.getAttributes().get(groupNameAttr);
++        groups.add(groupName.get().toString());
+       }
+-    } catch (NamingException e) {
+-      LOG.warn("Exception trying to get groups for user " + user, e);
+-      return new ArrayList<String>();
+     }
+ 
+     return groups;
+@@ -236,7 +268,7 @@ public class LdapGroupsMapping
+ 
+     return ctx;
+   }
+-
++  
+   /**
+    * Caches groups, no need to do that for this provider
+    */
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/security/TestLdapGroupsMapping.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/security/TestLdapGroupsMapping.java
+index 19ac7b6..331e288 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/security/TestLdapGroupsMapping.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/security/TestLdapGroupsMapping.java
+@@ -26,6 +26,7 @@ import java.io.Writer;
+ import java.util.Arrays;
+ import java.util.List;
+ 
++import javax.naming.CommunicationException;
+ import javax.naming.NamingEnumeration;
+ import javax.naming.NamingException;
+ import javax.naming.directory.Attribute;
+@@ -46,21 +47,15 @@ public class TestLdapGroupsMapping {
+   private DirContext mockContext;
+   
+   private LdapGroupsMapping mappingSpy = spy(new LdapGroupsMapping());
++  private NamingEnumeration mockUserNamingEnum = mock(NamingEnumeration.class);
++  private NamingEnumeration mockGroupNamingEnum = mock(NamingEnumeration.class);
++  private String[] testGroups = new String[] {"group1", "group2"};
+   
+   @Before
+   public void setupMocks() throws NamingException {
+     mockContext = mock(DirContext.class);
+     doReturn(mockContext).when(mappingSpy).getDirContext();
+-    
+-    NamingEnumeration mockUserNamingEnum = mock(NamingEnumeration.class);
+-    NamingEnumeration mockGroupNamingEnum = mock(NamingEnumeration.class);
+-    
+-    // The search functionality of the mock context is reused, so we will
+-    // return the user NamingEnumeration first, and then the group
+-    when(mockContext.search(anyString(), anyString(), any(Object[].class),
+-        any(SearchControls.class)))
+-        .thenReturn(mockUserNamingEnum, mockGroupNamingEnum);
+-    
++            
+     SearchResult mockUserResult = mock(SearchResult.class);
+     // We only ever call hasMoreElements once for the user NamingEnum, so 
+     // we can just have one return value
+@@ -76,23 +71,57 @@ public class TestLdapGroupsMapping {
+     
+     // Define the attribute for the name of the first group
+     Attribute group1Attr = new BasicAttribute("cn");
+-    group1Attr.add("group1");
++    group1Attr.add(testGroups[0]);
+     Attributes group1Attrs = new BasicAttributes();
+     group1Attrs.put(group1Attr);
+     
+     // Define the attribute for the name of the second group
+     Attribute group2Attr = new BasicAttribute("cn");
+-    group2Attr.add("group2");
++    group2Attr.add(testGroups[1]);
+     Attributes group2Attrs = new BasicAttributes();
+     group2Attrs.put(group2Attr);
+     
+     // This search result gets reused, so return group1, then group2
+     when(mockGroupResult.getAttributes()).thenReturn(group1Attrs, group2Attrs);
+-    
+   }
+   
+   @Test
+   public void testGetGroups() throws IOException, NamingException {
++    // The search functionality of the mock context is reused, so we will
++    // return the user NamingEnumeration first, and then the group
++    when(mockContext.search(anyString(), anyString(), any(Object[].class),
++        any(SearchControls.class)))
++        .thenReturn(mockUserNamingEnum, mockGroupNamingEnum);
++    
++    doTestGetGroups(Arrays.asList(testGroups), 2);
++  }
++
++  @Test
++  public void testGetGroupsWithConnectionClosed() throws IOException, NamingException {
++    // The case mocks connection is closed/gc-ed, so the first search call throws CommunicationException,
++    // then after reconnected return the user NamingEnumeration first, and then the group
++    when(mockContext.search(anyString(), anyString(), any(Object[].class),
++        any(SearchControls.class)))
++        .thenThrow(new CommunicationException("Connection is closed"))
++        .thenReturn(mockUserNamingEnum, mockGroupNamingEnum);
++    
++    // Although connection is down but after reconnected it still should retrieve the result groups
++    doTestGetGroups(Arrays.asList(testGroups), 1 + 2); // 1 is the first failure call 
++  }
++
++  @Test
++  public void testGetGroupsWithLdapDown() throws IOException, NamingException {
++    // This mocks the case where Ldap server is down, and always throws CommunicationException 
++    when(mockContext.search(anyString(), anyString(), any(Object[].class),
++        any(SearchControls.class)))
++        .thenThrow(new CommunicationException("Connection is closed"));
++    
++    // Ldap server is down, no groups should be retrieved
++    doTestGetGroups(Arrays.asList(new String[] {}), 
++        1 + LdapGroupsMapping.RECONNECT_RETRY_COUNT); // 1 is the first normal call
++  }
++  
++  private void doTestGetGroups(List<String> expectedGroups, int searchTimes) throws IOException, NamingException {  
+     Configuration conf = new Configuration();
+     // Set this, so we don't throw an exception
+     conf.set(LdapGroupsMapping.LDAP_URL_KEY, "ldap://test");
+@@ -102,10 +131,10 @@ public class TestLdapGroupsMapping {
+     // regardless of input
+     List<String> groups = mappingSpy.getGroups("some_user");
+     
+-    Assert.assertEquals(Arrays.asList("group1", "group2"), groups);
++    Assert.assertEquals(expectedGroups, groups);
+     
+     // We should have searched for a user, and then two groups
+-    verify(mockContext, times(2)).search(anyString(),
++    verify(mockContext, times(searchTimes)).search(anyString(),
+                                          anyString(),
+                                          any(Object[].class),
+                                          any(SearchControls.class));
+-- 
+1.7.0.4
+

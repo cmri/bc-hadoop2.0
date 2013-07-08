@@ -1,0 +1,110 @@
+From 348dddba849f44537e7f29f0773c8adb31a33d96 Mon Sep 17 00:00:00 2001
+From: Thomas White <tomwhite@apache.org>
+Date: Tue, 15 Jan 2013 17:09:48 +0000
+Subject: [PATCH 0869/1357] YARN-336. Fair scheduler FIFO scheduling within a queue only allows 1 app at a time. Contributed by Sandy Ryza.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1433526 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 5bc9d5a75efecbf420f6fe8889fa488baa9e6e8f)
+---
+ .../scheduler/fair/AppSchedulable.java             |    2 +-
+ .../scheduler/fair/FSLeafQueue.java                |    5 ++-
+ .../scheduler/fair/FairScheduler.java              |    4 ++
+ .../scheduler/fair/TestFairScheduler.java          |   40 ++++++++++++++++++++
+ 4 files changed, 49 insertions(+), 2 deletions(-)
+
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/AppSchedulable.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/AppSchedulable.java
+index 94c86dd..3fa99a0 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/AppSchedulable.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/AppSchedulable.java
+@@ -275,7 +275,7 @@ public class AppSchedulable extends Schedulable {
+       // The desired container won't fit here, so reserve
+       reserve(application, priority, node, container, reserved);
+ 
+-      return Resources.none();
++      return FairScheduler.CONTAINER_RESERVED;
+     }
+   }
+ 
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSLeafQueue.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSLeafQueue.java
+index 1b466a6..db6edea 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSLeafQueue.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSLeafQueue.java
+@@ -178,7 +178,10 @@ public class FSLeafQueue extends FSQueue {
+       Collections.sort(appScheds, comparator);
+       for (AppSchedulable sched: appScheds) {
+         if (sched.getRunnable()) {
+-          return sched.assignContainer(node, reserved);
++          Resource assignedResource = sched.assignContainer(node, reserved);
++          if (!assignedResource.equals(Resources.none())) {
++            return assignedResource;
++          }
+         }
+       }
+ 
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
+index ddbe39c..80ea41b 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
+@@ -110,6 +110,10 @@ public class FairScheduler implements ResourceScheduler {
+   private Clock clock;
+ 
+   private static final Log LOG = LogFactory.getLog(FairScheduler.class);
++  
++  // Value that container assignment methods return when a container is
++  // reserved
++  public static final Resource CONTAINER_RESERVED = Resources.createResource(-1);
+ 
+   // How often fair shares are re-calculated (ms)
+   protected long UPDATE_INTERVAL = 500;
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
+index 61f39f1..bc37494 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
+@@ -1319,4 +1319,44 @@ public class TestFairScheduler {
+     // should assign rack local
+     assertEquals(2, scheduler.applications.get(appId).getLiveContainers().size());
+   }
++  
++  @Test
++  public void testFifoWithinQueue() throws Exception {
++    RMNode node1 = MockNodes.newNodeInfo(1, Resources.createResource(3072));
++    NodeAddedSchedulerEvent nodeEvent1 = new NodeAddedSchedulerEvent(node1);
++    scheduler.handle(nodeEvent1);
++    
++    // Even if submitted at exact same time, apps will be deterministically
++    // ordered by name.
++    ApplicationAttemptId attId1 = createSchedulingRequest(1024, "queue1",
++        "user1", 2);
++    ApplicationAttemptId attId2 = createSchedulingRequest(1024, "queue1",
++        "user1", 2);
++    FSSchedulerApp app1 = scheduler.applications.get(attId1);
++    FSSchedulerApp app2 = scheduler.applications.get(attId2);
++    
++    FSLeafQueue queue1 = scheduler.getQueueManager().getLeafQueue("queue1");
++    queue1.setSchedulingMode(SchedulingMode.FIFO);
++    
++    scheduler.update();
++
++    // First two containers should go to app 1, third should go to app 2.
++    // Because tests set assignmultiple to false, each heartbeat assigns a single
++    // container.
++    
++    NodeUpdateSchedulerEvent updateEvent = new NodeUpdateSchedulerEvent(node1,
++      new ArrayList<ContainerStatus>(), new ArrayList<ContainerStatus>());
++
++    scheduler.handle(updateEvent);
++    assertEquals(1, app1.getLiveContainers().size());
++    assertEquals(0, app2.getLiveContainers().size());
++    
++    scheduler.handle(updateEvent);
++    assertEquals(2, app1.getLiveContainers().size());
++    assertEquals(0, app2.getLiveContainers().size());
++    
++    scheduler.handle(updateEvent);
++    assertEquals(2, app1.getLiveContainers().size());
++    assertEquals(1, app2.getLiveContainers().size());
++  }
+ }
+-- 
+1.7.0.4
+

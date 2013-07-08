@@ -1,0 +1,153 @@
+From 39819f4657b2905ad1627c299f2e7ab3b24dabfa Mon Sep 17 00:00:00 2001
+From: Eli Collins <eli@apache.org>
+Date: Mon, 11 Jun 2012 21:20:28 +0000
+Subject: [PATCH 0110/1357] HADOOP-8491. Check for short writes when using FileChannel#write and related methods. Contributed by Colin Patrick McCabe
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1349019 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit a92b49c6143b7d5b23e21ce117a9413435662754)
+---
+ .../main/java/org/apache/hadoop/io/IOUtils.java    |   34 +++++++++++++++
+ .../java/org/apache/hadoop/io/TestIOUtils.java     |   44 +++++++++++++++++++-
+ .../server/namenode/EditLogFileOutputStream.java   |    4 +-
+ 3 files changed, 79 insertions(+), 3 deletions(-)
+
+diff --git a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/IOUtils.java b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/IOUtils.java
+index f5875d8..65d8855 100644
+--- a/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/IOUtils.java
++++ b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/IOUtils.java
+@@ -20,6 +20,9 @@ package org.apache.hadoop.io;
+ 
+ import java.io.*;
+ import java.net.Socket;
++import java.nio.ByteBuffer;
++import java.nio.channels.FileChannel;
++import java.nio.channels.WritableByteChannel;
+ 
+ import org.apache.commons.logging.Log;
+ 
+@@ -245,4 +248,35 @@ public class IOUtils {
+     public void write(int b) throws IOException {
+     }
+   }  
++  
++  /**
++   * Write a ByteBuffer to a WritableByteChannel, handling short writes.
++   * 
++   * @param bc               The WritableByteChannel to write to.
++   * @param buf              The input buffer
++   * @param offset           The offset in the file to start writing at.
++   * @throws IOException     On I/O error.
++   */
++  public static void writeFully(WritableByteChannel bc, ByteBuffer buf)
++      throws IOException {
++    do {
++      bc.write(buf);
++    } while (buf.remaining() > 0);
++  }
++
++  /**
++   * Write a ByteBuffer to a FileChannel at a given offset, 
++   * handling short writes.
++   * 
++   * @param fc               The FileChannel to write to.
++   * @param buf              The input buffer
++   * @param offset           The offset in the file to start writing at.
++   * @throws IOException     On I/O error.
++   */
++  public static void writeFully(FileChannel fc, ByteBuffer buf,
++      long offset) throws IOException {
++    do {
++      offset += fc.write(buf, offset);
++    } while (buf.remaining() > 0);
++  }
+ }
+diff --git a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/TestIOUtils.java b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/TestIOUtils.java
+index d4f5057..60c0703 100644
+--- a/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/TestIOUtils.java
++++ b/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/TestIOUtils.java
+@@ -21,9 +21,13 @@ package org.apache.hadoop.io;
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.fail;
+ 
++import java.io.File;
+ import java.io.IOException;
+ import java.io.InputStream;
+ import java.io.OutputStream;
++import java.io.RandomAccessFile;
++import java.nio.ByteBuffer;
++import java.nio.channels.FileChannel;
+ 
+ import org.junit.Test;
+ import org.mockito.Mockito;
+@@ -32,7 +36,8 @@ import org.mockito.Mockito;
+  * Test cases for IOUtils.java
+  */
+ public class TestIOUtils {
+-
++  private static final String TEST_FILE_NAME = "test_file";
++  
+   @Test
+   public void testCopyBytesShouldCloseStreamsWhenCloseIsTrue() throws Exception {
+     InputStream inputStream = Mockito.mock(InputStream.class);
+@@ -110,4 +115,41 @@ public class TestIOUtils {
+     Mockito.verify(outputStream, Mockito.atLeastOnce()).close();
+   }
+   
++  @Test
++  public void testWriteFully() throws IOException {
++    final int INPUT_BUFFER_LEN = 10000;
++    final int HALFWAY = 1 + (INPUT_BUFFER_LEN / 2);
++    byte[] input = new byte[INPUT_BUFFER_LEN];
++    for (int i = 0; i < input.length; i++) {
++      input[i] = (byte)(i & 0xff);
++    }
++    byte[] output = new byte[input.length];
++    
++    try {
++      RandomAccessFile raf = new RandomAccessFile(TEST_FILE_NAME, "rw");
++      FileChannel fc = raf.getChannel();
++      ByteBuffer buf = ByteBuffer.wrap(input);
++      IOUtils.writeFully(fc, buf);
++      raf.seek(0);
++      raf.read(output);
++      for (int i = 0; i < input.length; i++) {
++        assertEquals(input[i], output[i]);
++      }
++      buf.rewind();
++      IOUtils.writeFully(fc, buf, HALFWAY);
++      for (int i = 0; i < HALFWAY; i++) {
++        assertEquals(input[i], output[i]);
++      }
++      raf.seek(0);
++      raf.read(output);
++      for (int i = HALFWAY; i < input.length; i++) {
++        assertEquals(input[i - HALFWAY], output[i]);
++      }
++    } finally {
++      File f = new File(TEST_FILE_NAME);
++      if (f.exists()) {
++        f.delete();
++      }
++    }
++  }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogFileOutputStream.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogFileOutputStream.java
+index dd8102e..08a560c 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogFileOutputStream.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogFileOutputStream.java
+@@ -206,10 +206,10 @@ public class EditLogFileOutputStream extends EditLogOutputStream {
+             + fc.size());
+       }
+       fill.position(0);
+-      int written = fc.write(fill, position);
++      IOUtils.writeFully(fc, fill, position);
+       if(FSNamesystem.LOG.isDebugEnabled()) {
+         FSNamesystem.LOG.debug("Edit log size is now " + fc.size() +
+-            " written " + written + " bytes " + " at offset " + position);
++            " written " + fill.capacity() + " bytes " + " at offset " + position);
+       }
+     }
+   }
+-- 
+1.7.0.4
+

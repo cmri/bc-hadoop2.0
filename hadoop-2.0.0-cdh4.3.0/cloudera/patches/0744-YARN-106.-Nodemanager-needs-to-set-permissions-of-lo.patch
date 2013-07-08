@@ -1,0 +1,237 @@
+From 187837e1763cf0fa560d4b2ca5c4f6ffc54745e2 Mon Sep 17 00:00:00 2001
+From: Robert Joseph Evans <bobby@apache.org>
+Date: Fri, 28 Sep 2012 20:50:44 +0000
+Subject: [PATCH 0744/1357] YARN-106. Nodemanager needs to set permissions of local directories (jlowe via bobby)
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1391649 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit c89a1a41f162b54b28bdc3a7f6f4c576d042be91)
+---
+ .../server/nodemanager/DirectoryCollection.java    |   48 +++++++++++++++++++-
+ .../nodemanager/LocalDirsHandlerService.java       |   30 +++++++++---
+ .../nodemanager/TestDirectoryCollection.java       |   39 ++++++++++++++++
+ .../nodemanager/webapp/TestContainerLogsPage.java  |    5 +-
+ 4 files changed, 112 insertions(+), 10 deletions(-)
+
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/DirectoryCollection.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/DirectoryCollection.java
+index 9971567..10362d2 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/DirectoryCollection.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/DirectoryCollection.java
+@@ -19,12 +19,17 @@
+ package org.apache.hadoop.yarn.server.nodemanager;
+ 
+ import java.io.File;
+-import java.util.concurrent.CopyOnWriteArrayList;
++import java.io.FileNotFoundException;
++import java.io.IOException;
+ import java.util.Collections;
+ import java.util.List;
++import java.util.concurrent.CopyOnWriteArrayList;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.fs.FileContext;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.fs.permission.FsPermission;
+ import org.apache.hadoop.util.DiskChecker;
+ import org.apache.hadoop.util.DiskChecker.DiskErrorException;
+ 
+@@ -66,6 +71,31 @@ class DirectoryCollection {
+   }
+ 
+   /**
++   * Create any non-existent directories and parent directories, updating the
++   * list of valid directories if necessary.
++   * @param localFs local file system to use
++   * @param perm absolute permissions to use for any directories created
++   * @return true if there were no errors, false if at least one error occurred
++   */
++  synchronized boolean createNonExistentDirs(FileContext localFs,
++      FsPermission perm) {
++    boolean failed = false;
++    for (final String dir : localDirs) {
++      try {
++        createDir(localFs, new Path(dir), perm);
++      } catch (IOException e) {
++        LOG.warn("Unable to create directory " + dir + " error " +
++            e.getMessage() + ", removing from the list of valid directories.");
++        localDirs.remove(dir);
++        failedDirs.add(dir);
++        numFailures++;
++        failed = true;
++      }
++    }
++    return !failed;
++  }
++
++  /**
+    * Check the health of current set of local directories, updating the list
+    * of valid directories if necessary.
+    * @return <em>true</em> if there is a new disk-failure identified in
+@@ -86,4 +116,20 @@ class DirectoryCollection {
+     }
+     return numFailures > oldNumFailures;
+   }
++
++  private void createDir(FileContext localFs, Path dir, FsPermission perm)
++      throws IOException {
++    if (dir == null) {
++      return;
++    }
++    try {
++      localFs.getFileStatus(dir);
++    } catch (FileNotFoundException e) {
++      createDir(localFs, dir.getParent(), perm);
++      localFs.mkdir(dir, perm, false);
++      if (!perm.equals(perm.applyUMask(localFs.getUMask()))) {
++        localFs.setPermission(dir, perm);
++      }
++    }
++  }
+ }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/LocalDirsHandlerService.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/LocalDirsHandlerService.java
+index 4e07b70..0c7e01d 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/LocalDirsHandlerService.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/LocalDirsHandlerService.java
+@@ -26,9 +26,12 @@ import java.util.TimerTask;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileContext;
+ import org.apache.hadoop.fs.LocalDirAllocator;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.fs.permission.FsPermission;
+ import org.apache.hadoop.util.StringUtils;
++import org.apache.hadoop.yarn.YarnException;
+ import org.apache.hadoop.yarn.conf.YarnConfiguration;
+ import org.apache.hadoop.yarn.service.AbstractService;
+ 
+@@ -120,6 +123,19 @@ public class LocalDirsHandlerService extends AbstractService {
+     lastDisksCheckTime = System.currentTimeMillis();
+     super.init(conf);
+ 
++    FileContext localFs;
++    try {
++      localFs = FileContext.getLocalFSFileContext(config);
++    } catch (IOException e) {
++      throw new YarnException("Unable to get the local filesystem", e);
++    }
++    FsPermission perm = new FsPermission((short)0755);
++    boolean createSucceeded = localDirs.createNonExistentDirs(localFs, perm);
++    createSucceeded &= logDirs.createNonExistentDirs(localFs, perm);
++    if (!createSucceeded) {
++      updateDirsAfterFailure();
++    }
++
+     // Check the disk health immediately to weed out bad directories
+     // before other init code attempts to use them.
+     checkDirs();
+@@ -229,7 +245,8 @@ public class LocalDirsHandlerService extends AbstractService {
+    * Set good local dirs and good log dirs in the configuration so that the
+    * LocalDirAllocator objects will use this updated configuration only.
+    */
+-  private void updateDirsInConfiguration() {
++  private void updateDirsAfterFailure() {
++    LOG.info("Disk(s) failed. " + getDisksHealthReport());
+     Configuration conf = getConfig();
+     List<String> localDirs = getLocalDirs();
+     conf.setStrings(YarnConfiguration.NM_LOCAL_DIRS,
+@@ -237,6 +254,10 @@ public class LocalDirsHandlerService extends AbstractService {
+     List<String> logDirs = getLogDirs();
+     conf.setStrings(YarnConfiguration.NM_LOG_DIRS,
+                       logDirs.toArray(new String[logDirs.size()]));
++    if (!areDisksHealthy()) {
++      // Just log.
++      LOG.error("Most of the disks failed. " + getDisksHealthReport());
++    }
+   }
+ 
+   private void checkDirs() {
+@@ -249,12 +270,7 @@ public class LocalDirsHandlerService extends AbstractService {
+       }
+ 
+       if (newFailure) {
+-        LOG.info("Disk(s) failed. " + getDisksHealthReport());
+-        updateDirsInConfiguration();
+-        if (!areDisksHealthy()) {
+-          // Just log.
+-          LOG.error("Most of the disks failed. " + getDisksHealthReport());
+-        }
++        updateDirsAfterFailure();
+       }
+       lastDisksCheckTime = System.currentTimeMillis();
+   }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/TestDirectoryCollection.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/TestDirectoryCollection.java
+index 9f6fcf7..4ab61c9 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/TestDirectoryCollection.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/TestDirectoryCollection.java
+@@ -23,7 +23,13 @@ import java.io.IOException;
+ import java.util.List;
+ import java.util.ListIterator;
+ 
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.CommonConfigurationKeys;
++import org.apache.hadoop.fs.FileContext;
++import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.fs.FileUtil;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.fs.permission.FsPermission;
+ import org.junit.AfterClass;
+ import org.junit.Assert;
+ import org.junit.BeforeClass;
+@@ -65,4 +71,37 @@ public class TestDirectoryCollection {
+     // Verify no ConcurrentModification is thrown
+     li.next();
+   }
++
++  @Test
++  public void testCreateDirectories() throws IOException {
++    Configuration conf = new Configuration();
++    conf.set(CommonConfigurationKeys.FS_PERMISSIONS_UMASK_KEY, "077");
++    FileContext localFs = FileContext.getLocalFSFileContext(conf);
++
++    String dirA = new File(testDir, "dirA").getPath();
++    String dirB = new File(dirA, "dirB").getPath();
++    String dirC = new File(testDir, "dirC").getPath();
++    Path pathC = new Path(dirC);
++    FsPermission permDirC = new FsPermission((short)0710);
++
++    localFs.mkdir(pathC, null, true);
++    localFs.setPermission(pathC, permDirC);
++
++    String[] dirs = { dirA, dirB, dirC };
++    DirectoryCollection dc = new DirectoryCollection(dirs);
++    FsPermission defaultPerm = FsPermission.getDefault()
++        .applyUMask(new FsPermission((short)FsPermission.DEFAULT_UMASK));
++    boolean createResult = dc.createNonExistentDirs(localFs, defaultPerm);
++    Assert.assertTrue(createResult);
++
++    FileStatus status = localFs.getFileStatus(new Path(dirA));
++    Assert.assertEquals("local dir parent not created with proper permissions",
++        defaultPerm, status.getPermission());
++    status = localFs.getFileStatus(new Path(dirB));
++    Assert.assertEquals("local dir not created with proper permissions",
++        defaultPerm, status.getPermission());
++    status = localFs.getFileStatus(pathC);
++    Assert.assertEquals("existing local directory permissions modified",
++        permDirC, status.getPermission());
++  }
+ }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/webapp/TestContainerLogsPage.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/webapp/TestContainerLogsPage.java
+index 28985f5..eeeb31b 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/webapp/TestContainerLogsPage.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/webapp/TestContainerLogsPage.java
+@@ -43,8 +43,9 @@ public class TestContainerLogsPage {
+ 
+   @Test
+   public void testContainerLogDirs() throws IOException {
+-    String logdirwithFile = "file:///target/"
+-        + TestNMWebServer.class.getSimpleName() + "LogDir";
++    String absLogDir = new File("target",
++        TestNMWebServer.class.getSimpleName() + "LogDir").getAbsolutePath();
++    String logdirwithFile = "file://" + absLogDir;
+     Configuration conf = new Configuration();
+     conf.set(YarnConfiguration.NM_LOG_DIRS, logdirwithFile);
+     NodeHealthCheckerService healthChecker = new NodeHealthCheckerService();
+-- 
+1.7.0.4
+

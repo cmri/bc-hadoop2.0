@@ -1,0 +1,271 @@
+From a9ef4818a23b473a27fde283946318c369d56bb4 Mon Sep 17 00:00:00 2001
+From: Sandy Ryza <sandy@cloudera.com>
+Date: Thu, 4 Oct 2012 17:46:43 -0700
+Subject: [PATCH 0566/1357] Fix NodeManager to verify the application's user-name.
+
+    git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1390825 13f79535-47bb-0310-9956-ffa450edef68
+---
+ .../yarn/security/ContainerTokenIdentifier.java    |   10 +++++-
+ .../security/ContainerTokenSecretManager.java      |   10 +++--
+ .../containermanager/ContainerManagerImpl.java     |   10 +++++-
+ .../yarn/server/resourcemanager/RMAppManager.java  |   12 +++---
+ .../scheduler/capacity/LeafQueue.java              |    2 +-
+ .../scheduler/fair/AppSchedulable.java             |    2 +-
+ .../scheduler/fifo/FifoScheduler.java              |    2 +-
+ .../yarn/server/TestContainerManagerSecurity.java  |   36 +++++++++++++++++---
+ 8 files changed, 64 insertions(+), 20 deletions(-)
+
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/security/ContainerTokenIdentifier.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/security/ContainerTokenIdentifier.java
+index eb88576..5557369 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/security/ContainerTokenIdentifier.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/security/ContainerTokenIdentifier.java
+@@ -48,13 +48,15 @@ public class ContainerTokenIdentifier extends TokenIdentifier {
+ 
+   private ContainerId containerId;
+   private String nmHostAddr;
++  private String appSubmitter;
+   private Resource resource;
+   private long expiryTimeStamp;
+ 
+   public ContainerTokenIdentifier(ContainerId containerID, String hostName,
+-      Resource r, long expiryTimeStamp) {
++      String appSubmitter, Resource r, long expiryTimeStamp) {
+     this.containerId = containerID;
+     this.nmHostAddr = hostName;
++    this.appSubmitter = appSubmitter;
+     this.resource = r;
+     this.expiryTimeStamp = expiryTimeStamp;
+   }
+@@ -68,6 +70,10 @@ public class ContainerTokenIdentifier extends TokenIdentifier {
+   public ContainerId getContainerID() {
+     return this.containerId;
+   }
++  
++  public String getApplicationSubmitter() {
++	  return this.appSubmitter;
++  }
+ 
+   public String getNmHostAddress() {
+     return this.nmHostAddr;
+@@ -92,6 +98,7 @@ public class ContainerTokenIdentifier extends TokenIdentifier {
+     out.writeInt(applicationAttemptId.getAttemptId());
+     out.writeInt(this.containerId.getId());
+     out.writeUTF(this.nmHostAddr);
++    out.writeUTF(this.appSubmitter);
+     out.writeInt(this.resource.getMemory());
+     out.writeLong(this.expiryTimeStamp);
+   }
+@@ -105,6 +112,7 @@ public class ContainerTokenIdentifier extends TokenIdentifier {
+     this.containerId = BuilderUtils.newContainerId(applicationAttemptId, in
+         .readInt());
+     this.nmHostAddr = in.readUTF();
++    this.appSubmitter = in.readUTF();
+     this.resource = BuilderUtils.newResource(in.readInt());
+     this.expiryTimeStamp = in.readLong();
+   }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-common/src/main/java/org/apache/hadoop/yarn/server/security/ContainerTokenSecretManager.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-common/src/main/java/org/apache/hadoop/yarn/server/security/ContainerTokenSecretManager.java
+index 3a041c4..27a30b7 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-common/src/main/java/org/apache/hadoop/yarn/server/security/ContainerTokenSecretManager.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-common/src/main/java/org/apache/hadoop/yarn/server/security/ContainerTokenSecretManager.java
+@@ -59,13 +59,13 @@ public class ContainerTokenSecretManager extends
+   }
+ 
+   public ContainerToken createContainerToken(ContainerId containerId,
+-      NodeId nodeId, Resource capability) {
++      NodeId nodeId, String appSubmitter, Resource capability) {
+     try {
+       long expiryTimeStamp =
+           System.currentTimeMillis() + containerTokenExpiryInterval;
+       ContainerTokenIdentifier tokenIdentifier =
+           new ContainerTokenIdentifier(containerId, nodeId.toString(),
+-            capability, expiryTimeStamp);
++            appSubmitter, capability, expiryTimeStamp);
+       return BuilderUtils.newContainerToken(nodeId,
+         ByteBuffer.wrap(this.createPassword(tokenIdentifier)), tokenIdentifier);
+     } catch (IllegalArgumentException e) {
+@@ -96,7 +96,8 @@ public class ContainerTokenSecretManager extends
+   @Override
+   public byte[] createPassword(ContainerTokenIdentifier identifier) {
+     LOG.debug("Creating password for " + identifier.getContainerID()
+-        + " to be run on NM " + identifier.getNmHostAddress() + " "
++        + " for user " + identifier.getUser() + " to be run on NM "
++        + identifier.getNmHostAddress() + " "
+         + this.secretkeys.get(identifier.getNmHostAddress()));
+     return createPassword(identifier.getBytes(),
+         this.secretkeys.get(identifier.getNmHostAddress()));
+@@ -106,7 +107,8 @@ public class ContainerTokenSecretManager extends
+   public byte[] retrievePassword(ContainerTokenIdentifier identifier)
+       throws org.apache.hadoop.security.token.SecretManager.InvalidToken {
+     LOG.debug("Retrieving password for " + identifier.getContainerID()
+-        + " to be run on NM " + identifier.getNmHostAddress());
++            + " for user " + identifier.getUser() + " to be run on NM "
++            + identifier.getNmHostAddress());
+     return createPassword(identifier.getBytes(),
+         this.secretkeys.get(identifier.getNmHostAddress()));
+   }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/ContainerManagerImpl.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/ContainerManagerImpl.java
+index 8ec4c5e..e3bb375 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/ContainerManagerImpl.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/ContainerManagerImpl.java
+@@ -323,7 +323,15 @@ public class ContainerManagerImpl extends CompositeService implements
+             .append("\nContainerTokenIdentifier cannot be null! Null found for "
+                 + containerIDStr);
+       } else {
+-
++        
++        // Is the container coming in with correct user-name?
++        if (!tokenId.getApplicationSubmitter().equals(launchContext.getUser())) {
++          unauthorized = true;
++          messageBuilder.append("\n Expected user-name "
++              + tokenId.getApplicationSubmitter() + " but found "
++              + launchContext.getUser());
++        }
++        
+         // Ensure the token is not expired. 
+         // Token expiry is not checked for stopContainer/getContainerStatus
+         if (tokenId.getExpiryTimeStamp() < System.currentTimeMillis()) {
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMAppManager.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMAppManager.java
+index ad28d6c..8f631b0 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMAppManager.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMAppManager.java
+@@ -231,7 +231,6 @@ public class RMAppManager implements EventHandler<RMAppManagerEvent> {
+     RMApp application = null;
+     try {
+       String clientTokenStr = null;
+-      String user = UserGroupInformation.getCurrentUser().getShortUserName();
+       if (UserGroupInformation.isSecurityEnabled()) {
+         Token<ClientTokenIdentifier> clientToken = new 
+             Token<ClientTokenIdentifier>(
+@@ -256,11 +255,12 @@ public class RMAppManager implements EventHandler<RMAppManagerEvent> {
+           submissionContext);
+ 
+       // Create RMApp
+-      application = new RMAppImpl(applicationId, rmContext,
+-          this.conf, submissionContext.getApplicationName(), user,
+-          submissionContext.getQueue(), submissionContext, clientTokenStr,
+-          appStore, this.scheduler,
+-          this.masterService, submitTime);
++      application =
++          new RMAppImpl(applicationId, rmContext, this.conf,
++            submissionContext.getApplicationName(),
++            submissionContext.getUser(), submissionContext.getQueue(),
++            submissionContext, clientTokenStr, appStore, this.scheduler,
++            this.masterService, submitTime);
+ 
+       // Sanity check - duplicate?
+       if (rmContext.getRMApps().putIfAbsent(applicationId, application) != 
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/LeafQueue.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/LeafQueue.java
+index cac1a52..6ea685e 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/LeafQueue.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/LeafQueue.java
+@@ -1197,7 +1197,7 @@ public class LeafQueue implements CSQueue {
+     if (UserGroupInformation.isSecurityEnabled()) {
+       containerToken =
+           containerTokenSecretManager.createContainerToken(containerId, nodeId,
+-            capability);
++            application.getUser(), capability);
+       if (containerToken == null) {
+         return null; // Try again later.
+       }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/AppSchedulable.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/AppSchedulable.java
+index 7eb3be2..831750b 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/AppSchedulable.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/AppSchedulable.java
+@@ -161,7 +161,7 @@ public class AppSchedulable extends Schedulable {
+     if (UserGroupInformation.isSecurityEnabled()) {
+       containerToken =
+           containerTokenSecretManager.createContainerToken(containerId, nodeId,
+-            capability);
++            application.getUser(), capability);
+       if (containerToken == null) {
+         return null; // Try again later.
+       }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/FifoScheduler.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/FifoScheduler.java
+index f06207b..8ac281c 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/FifoScheduler.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/FifoScheduler.java
+@@ -544,7 +544,7 @@ public class FifoScheduler implements ResourceScheduler, Configurable {
+         if (UserGroupInformation.isSecurityEnabled()) {
+           containerToken =
+               containerTokenSecretManager.createContainerToken(containerId,
+-                nodeId, capability);
++                nodeId, application.getUser(), capability);
+           if (containerToken == null) {
+             return i; // Try again later.
+           }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-tests/src/test/java/org/apache/hadoop/yarn/server/TestContainerManagerSecurity.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-tests/src/test/java/org/apache/hadoop/yarn/server/TestContainerManagerSecurity.java
+index 1d731cf..5c09f7e 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-tests/src/test/java/org/apache/hadoop/yarn/server/TestContainerManagerSecurity.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-tests/src/test/java/org/apache/hadoop/yarn/server/TestContainerManagerSecurity.java
+@@ -218,9 +218,10 @@ public class TestContainerManagerSecurity {
+ 
+     // Malice user modifies the resource amount
+     Resource modifiedResource = BuilderUtils.newResource(2048);
+-    ContainerTokenIdentifier modifiedIdentifier = new ContainerTokenIdentifier(
+-        dummyIdentifier.getContainerID(), dummyIdentifier.getNmHostAddress(),
+-        modifiedResource, Long.MAX_VALUE);
++    ContainerTokenIdentifier modifiedIdentifier = 
++        new ContainerTokenIdentifier(dummyIdentifier.getContainerID(),
++          dummyIdentifier.getNmHostAddress(), "testUser", modifiedResource,
++          Long.MAX_VALUE);
+     Token<ContainerTokenIdentifier> modifiedToken = new Token<ContainerTokenIdentifier>(
+         modifiedIdentifier.getBytes(), containerToken.getPassword().array(),
+         new Text(containerToken.getKind()), new Text(containerToken
+@@ -319,12 +320,14 @@ public class TestContainerManagerSecurity {
+ 
+         callWithIllegalContainerID(client, tokenId);
+         callWithIllegalResource(client, tokenId);
++        callWithIllegalUserName(client, tokenId);
+ 
+         return client;
+       }
+     });
+     
+-    /////////// End of testing for illegal containerIDs and illegal Resources
++    // ///////// End of testing for illegal containerIDs, illegal Resources and
++    // illegal users
+ 
+     /////////// Test calls with expired tokens
+     RPC.stopProxy(client);
+@@ -333,7 +336,7 @@ public class TestContainerManagerSecurity {
+ 
+     final ContainerTokenIdentifier newTokenId =
+         new ContainerTokenIdentifier(tokenId.getContainerID(),
+-          tokenId.getNmHostAddress(), tokenId.getResource(),
++          tokenId.getNmHostAddress(), "testUser", tokenId.getResource(),
+           System.currentTimeMillis() - 1);
+     byte[] passowrd =
+         resourceManager.getContainerTokenSecretManager().createPassword(
+@@ -562,6 +565,29 @@ public class TestContainerManagerSecurity {
+               + " but found " + context.getResource().toString()));
+     }
+   }
++  
++  void callWithIllegalUserName(ContainerManager client,
++      ContainerTokenIdentifier tokenId) {
++    StartContainerRequest request = recordFactory
++        .newRecordInstance(StartContainerRequest.class);
++    // Authenticated but unauthorized, due to wrong resource
++    ContainerLaunchContext context =
++        createContainerLaunchContextForTest(tokenId);
++    context.setUser("Saruman"); // Set a different user-name.
++    request.setContainerLaunchContext(context);
++    try {
++      client.startContainer(request);
++      fail("Connection initiation with unauthorized "
++          + "access is expected to fail.");
++    } catch (YarnRemoteException e) {
++      LOG.info("Got exception : ", e);
++      Assert.assertTrue(e.getMessage().contains(
++          "Unauthorized request to start container. "));
++      Assert.assertTrue(e.getMessage().contains(
++        "Expected user-name " + tokenId.getApplicationSubmitter()
++            + " but found " + context.getUser()));
++    }
++  }
+ 
+   private ContainerLaunchContext createContainerLaunchContextForTest(
+       ContainerTokenIdentifier tokenId) {
+-- 
+1.7.0.4
+

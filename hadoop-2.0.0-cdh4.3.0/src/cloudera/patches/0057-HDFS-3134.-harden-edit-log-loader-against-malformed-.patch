@@ -1,0 +1,200 @@
+From f0a4936da6163c246a4a40f407fcf3fc6e04986c Mon Sep 17 00:00:00 2001
+From: Eli Collins <eli@apache.org>
+Date: Thu, 10 May 2012 23:13:02 +0000
+Subject: [PATCH 0057/1357] HDFS-3134. harden edit log loader against malformed or malicious input. Contributed by Colin Patrick McCabe
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1336943 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 32ddd1b6485412870485114c13d4f5c55db4548a)
+---
+ .../security/token/block/BlockTokenIdentifier.java |    3 +-
+ .../hadoop/hdfs/server/namenode/FSEditLogOp.java   |   31 ++++++++-
+ .../hadoop/hdfs/server/namenode/TestEditLog.java   |   72 ++++++++++++++++++++
+ 3 files changed, 103 insertions(+), 3 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/security/token/block/BlockTokenIdentifier.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/security/token/block/BlockTokenIdentifier.java
+index c1fd3f9..62f2d76 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/security/token/block/BlockTokenIdentifier.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/security/token/block/BlockTokenIdentifier.java
+@@ -148,7 +148,8 @@ public class BlockTokenIdentifier extends TokenIdentifier {
+     userId = WritableUtils.readString(in);
+     blockPoolId = WritableUtils.readString(in);
+     blockId = WritableUtils.readVLong(in);
+-    int length = WritableUtils.readVInt(in);
++    int length = WritableUtils.readVIntInRange(in, 0,
++        AccessMode.class.getEnumConstants().length);
+     for (int i = 0; i < length; i++) {
+       modes.add(WritableUtils.readEnum(in, AccessMode.class));
+     }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLogOp.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLogOp.java
+index 98c25c0..2eadd4b 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLogOp.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLogOp.java
+@@ -204,6 +204,10 @@ public abstract class FSEditLogOp {
+     }
+ 
+     <T extends AddCloseOp> T setBlocks(Block[] blocks) {
++      if (blocks.length > MAX_BLOCKS) {
++        throw new RuntimeException("Can't have more than " + MAX_BLOCKS +
++            " in an AddCloseOp.");
++      }
+       this.blocks = blocks;
+       return (T)this;
+     }
+@@ -297,10 +301,18 @@ public abstract class FSEditLogOp {
+       }
+     }
+ 
++    static final public int MAX_BLOCKS = 1024 * 1024 * 64;
++    
+     private static Block[] readBlocks(
+         DataInputStream in,
+         int logVersion) throws IOException {
+       int numBlocks = in.readInt();
++      if (numBlocks < 0) {
++        throw new IOException("invalid negative number of blocks");
++      } else if (numBlocks > MAX_BLOCKS) {
++        throw new IOException("invalid number of blocks: " + numBlocks +
++            ".  The maximum number of blocks per file is " + MAX_BLOCKS);
++      }
+       Block[] blocks = new Block[numBlocks];
+       for (int i = 0; i < numBlocks; i++) {
+         Block blk = new Block();
+@@ -580,6 +592,7 @@ public abstract class FSEditLogOp {
+     String trg;
+     String[] srcs;
+     long timestamp;
++    final static public int MAX_CONCAT_SRC = 1024 * 1024;
+ 
+     private ConcatDeleteOp() {
+       super(OP_CONCAT_DELETE);
+@@ -595,7 +608,12 @@ public abstract class FSEditLogOp {
+     }
+ 
+     ConcatDeleteOp setSources(String[] srcs) {
++      if (srcs.length > MAX_CONCAT_SRC) {
++        throw new RuntimeException("ConcatDeleteOp can only have " +
++            MAX_CONCAT_SRC + " sources at most.");
++      }
+       this.srcs = srcs;
++
+       return this;
+     }
+ 
+@@ -625,8 +643,8 @@ public abstract class FSEditLogOp {
+       if (!LayoutVersion.supports(Feature.EDITLOG_OP_OPTIMIZATION, logVersion)) {
+         this.length = in.readInt();
+         if (length < 3) { // trg, srcs.., timestamp
+-          throw new IOException("Incorrect data format. "
+-              + "Concat delete operation.");
++          throw new IOException("Incorrect data format " +
++              "for ConcatDeleteOp.");
+         }
+       }
+       this.trg = FSImageSerialization.readString(in);
+@@ -636,6 +654,15 @@ public abstract class FSEditLogOp {
+       } else {
+         srcSize = this.length - 1 - 1; // trg and timestamp
+       }
++      if (srcSize < 0) {
++          throw new IOException("Incorrect data format. "
++              + "ConcatDeleteOp cannot have a negative number of data " +
++              " sources.");
++      } else if (srcSize > MAX_CONCAT_SRC) {
++          throw new IOException("Incorrect data format. "
++              + "ConcatDeleteOp can have at most " + MAX_CONCAT_SRC +
++              " sources, but we tried to have " + (length - 3) + " sources.");
++      }
+       this.srcs = new String [srcSize];
+       for(int i=0; i<srcSize;i++) {
+         srcs[i]= FSImageSerialization.readString(in);
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestEditLog.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestEditLog.java
+index 6af352f..085b510 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestEditLog.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestEditLog.java
+@@ -29,6 +29,7 @@ import java.util.Arrays;
+ import java.util.concurrent.Callable;
+ import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.Executors;
++import java.util.Random;
+ import java.util.regex.Matcher;
+ import java.util.regex.Pattern;
+ 
+@@ -1156,4 +1157,75 @@ public class TestEditLog extends TestCase {
+           "No non-corrupt logs for txid " + startGapTxId, ioe);
+     }
+   }
++
++  /**
++   * Test that we can read from a byte stream without crashing.
++   *
++   */
++  static void validateNoCrash(byte garbage[]) throws IOException {
++    final String TEST_LOG_NAME = "test_edit_log";
++
++    EditLogFileOutputStream elfos = null;
++    File file = null;
++    EditLogFileInputStream elfis = null;
++    try {
++      file = new File(TEST_LOG_NAME);
++      elfos = new EditLogFileOutputStream(file, 0);
++      elfos.create();
++      elfos.writeRaw(garbage, 0, garbage.length);
++      elfos.setReadyToFlush();
++      elfos.flushAndSync();
++      elfos.close();
++      elfos = null;
++      file = new File(TEST_LOG_NAME);
++      elfis = new EditLogFileInputStream(file);
++
++      // verify that we can read everything without killing the JVM or
++      // throwing an exception other than IOException
++      try {
++        while (true) {
++          FSEditLogOp op = elfis.readOp();
++          if (op == null)
++            break;
++        }
++      } catch (IOException e) {
++      } catch (Throwable t) {
++        StringWriter sw = new StringWriter();
++        t.printStackTrace(new PrintWriter(sw));
++        fail("caught non-IOException throwable with message " +
++            t.getMessage() + "\nstack trace\n" + sw.toString());
++      }
++    } finally {
++      if ((elfos != null) && (elfos.isOpen()))
++        elfos.close();
++      if (elfis != null)
++        elfis.close();
++    }
++  }
++
++  static byte[][] invalidSequenecs = null;
++
++  /**
++   * "Fuzz" test for the edit log.
++   *
++   * This tests that we can read random garbage from the edit log without
++   * crashing the JVM or throwing an unchecked exception.
++   */
++  @Test
++  public void testFuzzSequences() throws IOException {
++    final int MAX_GARBAGE_LENGTH = 512;
++    final int MAX_INVALID_SEQ = 5000;
++    // The seed to use for our random number generator.  When given the same
++    // seed, Java.util.Random will always produce the same sequence of values.
++    // This is important because it means that the test is deterministic and
++    // repeatable on any machine.
++    final int RANDOM_SEED = 123;
++
++    Random r = new Random(RANDOM_SEED);
++    for (int i = 0; i < MAX_INVALID_SEQ; i++) {
++      byte[] garbage = new byte[r.nextInt(MAX_GARBAGE_LENGTH)];
++      r.nextBytes(garbage);
++      validateNoCrash(garbage);
++    }
++  }
+ }
+-- 
+1.7.0.4
+

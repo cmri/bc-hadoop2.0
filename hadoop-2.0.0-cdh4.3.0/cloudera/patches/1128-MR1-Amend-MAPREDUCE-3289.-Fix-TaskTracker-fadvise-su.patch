@@ -1,0 +1,101 @@
+From a16470964965c4ddbcd40dbf1466b875f226609f Mon Sep 17 00:00:00 2001
+From: Todd Lipcon <todd@cloudera.com>
+Date: Mon, 26 Mar 2012 12:39:43 -0700
+Subject: [PATCH 1128/1357] MR1: Amend MAPREDUCE-3289. Fix TaskTracker fadvise support to only readahead a chunk at a time
+
+Reason: previous implementation could cause reduce fetch timeouts when some map output partitions are very large
+Author: Todd Lipcon
+Ref: CDH-5020
+---
+ .../org/apache/hadoop/mapred/TaskTracker.java      |   39 +++++++++++++++-----
+ 1 files changed, 29 insertions(+), 10 deletions(-)
+
+diff --git a/src/mapred/org/apache/hadoop/mapred/TaskTracker.java b/src/mapred/org/apache/hadoop/mapred/TaskTracker.java
+index 99deac7..10290e3 100644
+--- a/src/mapred/org/apache/hadoop/mapred/TaskTracker.java
++++ b/src/mapred/org/apache/hadoop/mapred/TaskTracker.java
+@@ -73,6 +73,8 @@ import org.apache.hadoop.fs.permission.FsPermission;
+ import org.apache.hadoop.http.HttpServer;
+ import org.apache.hadoop.io.IntWritable;
+ import org.apache.hadoop.io.nativeio.NativeIO;
++import org.apache.hadoop.io.ReadaheadPool;
++import org.apache.hadoop.io.ReadaheadPool.ReadaheadRequest;
+ import org.apache.hadoop.io.SecureIOUtils;
+ import org.apache.hadoop.ipc.ProtocolSignature;
+ import org.apache.hadoop.ipc.RPC;
+@@ -375,6 +377,8 @@ public class TaskTracker implements MRConstants, TaskUmbilicalProtocol,
+     "mapreduce.tasktracker.outofband.heartbeat";
+   private volatile boolean oobHeartbeatOnTaskCompletion;
+   private boolean manageOsCacheInShuffle = false;
++  private int readaheadLength;
++  private ReadaheadPool readaheadPool = ReadaheadPool.getInstance();
+ 
+   // Track number of completed tasks to send an out-of-band heartbeat
+   private IntWritable finishedCount = new IntWritable(0);
+@@ -1014,6 +1018,9 @@ public class TaskTracker implements MRConstants, TaskUmbilicalProtocol,
+     manageOsCacheInShuffle = fConf.getBoolean(
+         "mapred.tasktracker.shuffle.fadvise",
+         true);
++    readaheadLength = fConf.getInt(
++        "mapred.tasktracker.shuffle.readahead.bytes",
++        4 * 1024 * 1024);
+   }
+ 
+   private void startJettyBugMonitor() {
+@@ -4040,22 +4047,32 @@ public class TaskTracker implements MRConstants, TaskUmbilicalProtocol,
+          * send it to the reducer.
+          */
+         //open the map-output file
++        String filePath = mapOutputFileName.toUri().getPath();
+         mapOutputIn = SecureIOUtils.openForRead(
+-            new File(mapOutputFileName.toUri().getPath()), runAsUserName, null);
++            new File(filePath), runAsUserName, null);
+ 
+         // readahead if possible
+-        if (tracker.manageOsCacheInShuffle && info.partLength > 0) {
+-          NativeIO.posixFadviseIfPossible(mapOutputIn.getFD(),
+-              info.startOffset, info.partLength, NativeIO.POSIX_FADV_WILLNEED);
+-        }
++        ReadaheadRequest curReadahead = null;
+ 
+         //seek to the correct offset for the reduce
+         mapOutputIn.skip(info.startOffset);
+         long rem = info.partLength;
+-        int len =
+-          mapOutputIn.read(buffer, 0, (int)Math.min(rem, MAX_BYTES_TO_READ));
+-        while (rem > 0 && len >= 0) {
++        long offset = info.startOffset;
++        while (rem > 0) {
++          if (tracker.manageOsCacheInShuffle && tracker.readaheadPool != null) {
++            curReadahead = tracker.readaheadPool.readaheadStream(
++              filePath, mapOutputIn.getFD(),
++              offset, tracker.readaheadLength,
++              info.startOffset + info.partLength,
++              curReadahead);
++          }
++          int len =
++            mapOutputIn.read(buffer, 0, (int)Math.min(rem, MAX_BYTES_TO_READ));
++          if (len < 0) {
++            break;
++          }
+           rem -= len;
++          offset += len;
+           try {
+             shuffleMetrics.outputBytes(len);
+             outStream.write(buffer, 0, len);
+@@ -4065,8 +4082,10 @@ public class TaskTracker implements MRConstants, TaskUmbilicalProtocol,
+             throw ie;
+           }
+           totalRead += len;
+-          len =
+-            mapOutputIn.read(buffer, 0, (int)Math.min(rem, MAX_BYTES_TO_READ));
++        }
++
++        if (curReadahead != null) {
++          curReadahead.cancel();
+         }
+         
+         // drop cache if possible
+-- 
+1.7.0.4
+

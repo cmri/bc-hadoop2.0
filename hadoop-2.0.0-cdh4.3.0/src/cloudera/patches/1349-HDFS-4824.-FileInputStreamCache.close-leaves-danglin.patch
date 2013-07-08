@@ -1,0 +1,111 @@
+From 79b9e7a4ef6f5a1a2823ac9f0b193f67d2482b13 Mon Sep 17 00:00:00 2001
+From: Todd Lipcon <todd@apache.org>
+Date: Fri, 17 May 2013 03:39:18 +0000
+Subject: [PATCH 1349/1357] HDFS-4824. FileInputStreamCache.close leaves dangling reference to FileInputStreamCache.cacheCleaner. Contributed by Colin Patrick McCabe.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1483641 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit b0ce9065f98e5fcd45a30b9b820d0b38135df64b)
+---
+ .../apache/hadoop/hdfs/FileInputStreamCache.java   |   50 ++++++++++++++-----
+ 1 files changed, 37 insertions(+), 13 deletions(-)
+
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/FileInputStreamCache.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/FileInputStreamCache.java
+index 7879fd4..5724621 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/FileInputStreamCache.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/FileInputStreamCache.java
+@@ -17,10 +17,14 @@
+  */
+ package org.apache.hadoop.hdfs;
+ 
++import java.io.Closeable;
+ import java.io.FileInputStream;
++import java.io.IOException;
++import java.lang.ref.WeakReference;
+ import java.util.Iterator;
+ import java.util.List;
+ import java.util.Map.Entry;
++import java.util.concurrent.ScheduledFuture;
+ import java.util.concurrent.ScheduledThreadPoolExecutor;
+ import java.util.concurrent.TimeUnit;
+ 
+@@ -80,17 +84,26 @@ class FileInputStreamCache {
+    * Expiry thread which makes sure that the file descriptors get closed
+    * after a while.
+    */
+-  class CacheCleaner implements Runnable {
++  private static class CacheCleaner implements Runnable, Closeable {
++    private WeakReference<FileInputStreamCache> cacheRef;
++    private ScheduledFuture<?> future;
++    
++    CacheCleaner(FileInputStreamCache cache) {
++      this.cacheRef = new WeakReference<FileInputStreamCache>(cache);
++    }
++    
+     @Override
+     public void run() {
+-      synchronized(FileInputStreamCache.this) {
+-        if (closed) return;
++      FileInputStreamCache cache = cacheRef.get();
++      if (cache == null) return;
++      synchronized(cache) {
++        if (cache.closed) return;
+         long curTime = Time.monotonicNow();
+-        for (Iterator<Entry<Key, Value>> iter = map.entries().iterator();
+-              iter.hasNext();
+-              iter = map.entries().iterator()) {
++        for (Iterator<Entry<Key, Value>> iter =
++                  cache.map.entries().iterator(); iter.hasNext();
++              iter = cache.map.entries().iterator()) {
+           Entry<Key, Value> entry = iter.next();
+-          if (entry.getValue().getTime() + expiryTimeMs >= curTime) {
++          if (entry.getValue().getTime() + cache.expiryTimeMs >= curTime) {
+             break;
+           }
+           entry.getValue().close();
+@@ -98,6 +111,17 @@ class FileInputStreamCache {
+         }
+       }
+     }
++
++    @Override
++    public void close() throws IOException {
++      if (future != null) {
++        future.cancel(false);
++      }
++    }
++    
++    public void setFuture(ScheduledFuture<?> future) {
++      this.future = future;
++    }
+   }
+ 
+   /**
+@@ -189,9 +213,11 @@ class FileInputStreamCache {
+           iter.remove();
+         }
+         if (cacheCleaner == null) {
+-          cacheCleaner = new CacheCleaner();
+-          executor.scheduleAtFixedRate(cacheCleaner, expiryTimeMs, expiryTimeMs, 
+-              TimeUnit.MILLISECONDS);
++          cacheCleaner = new CacheCleaner(this);
++          ScheduledFuture<?> future = 
++              executor.scheduleAtFixedRate(cacheCleaner, expiryTimeMs, expiryTimeMs,
++                  TimeUnit.MILLISECONDS);
++          cacheCleaner.setFuture(future);
+         }
+         map.put(new Key(datanodeID, block), new Value(fis));
+         inserted = true;
+@@ -229,9 +255,7 @@ class FileInputStreamCache {
+   public synchronized void close() {
+     if (closed) return;
+     closed = true;
+-    if (cacheCleaner != null) {
+-      executor.remove(cacheCleaner);
+-    }
++    IOUtils.cleanup(LOG, cacheCleaner);
+     for (Iterator<Entry<Key, Value>> iter = map.entries().iterator();
+           iter.hasNext();) {
+       Entry<Key, Value> entry = iter.next();
+-- 
+1.7.0.4
+
